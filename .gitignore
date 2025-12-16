@@ -1,0 +1,26 @@
+# Binaries
+/gt
+*.exe
+
+# Build
+/dist/
+/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage.out
+*.test
+
+# Local config
+config.toml
+!config.example.toml
