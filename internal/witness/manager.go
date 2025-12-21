@@ -384,7 +384,7 @@ Time: %s
 
 // processShutdownRequests checks mail for lifecycle requests and handles them.
 func (m *Manager) processShutdownRequests(w *Witness) error {
-	// Get witness mailbox via bd mail inbox
+	// Get witness mailbox via gt mail
 	messages, err := m.getWitnessMessages()
 	if err != nil {
 		return fmt.Errorf("getting messages: %w", err)
@@ -477,9 +477,9 @@ Rig: %s
 Time: %s
 `, reason, polecatName, m.rig.Name, time.Now().Format(time.RFC3339))
 
-	// Send via bd mail
+	// Send via gt mail
 	recipient := fmt.Sprintf("%s/%s", m.rig.Name, polecatName)
-	cmd := exec.Command("bd", "mail", "send", recipient,
+	cmd := exec.Command("gt", "mail", "send", recipient,
 		"-s", subject,
 		"-m", body,
 	)
@@ -502,8 +502,8 @@ type WitnessMessage struct {
 
 // getWitnessMessages retrieves unread messages for the witness.
 func (m *Manager) getWitnessMessages() ([]WitnessMessage, error) {
-	// Use bd mail inbox --json
-	cmd := exec.Command("bd", "mail", "inbox", "--json")
+	// Use gt mail inbox --json
+	cmd := exec.Command("gt", "mail", "inbox", "--json")
 	cmd.Dir = m.workDir
 	cmd.Env = append(os.Environ(), "BEADS_AGENT_NAME="+m.rig.Name+"-witness")
 

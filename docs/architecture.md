@@ -114,11 +114,11 @@ Agents communicate via **mail** - messages stored as beads issues with `type=mes
 - **Town beads** (prefix: `gm-`): Mayor inbox, cross-rig coordination, handoffs
 - **Rig beads** (prefix: varies): Rig-local agent communication
 
-Mail commands use `bd mail` under the hood:
+Mail commands use beads issues with type=message:
 ```bash
-gt mail send mayor/ -s "Subject" -m "Body"   # Uses bd mail send
-gt mail inbox                                  # Uses bd mail inbox
-gt mail read gm-abc                           # Uses bd mail read
+gt mail send mayor/ -s "Subject" -m "Body"   # Creates message issue
+gt mail inbox                                  # Lists message issues
+gt mail read gm-abc                           # Shows message issue
 ```
 
 ```mermaid
@@ -248,7 +248,7 @@ Gas Town uses a **two-level beads architecture**. This is critical to understand
 Mail is routed to the correct beads database based on recipient address. The `Router` (in `internal/mail/router.go`) handles this:
 
 ```
-Sender → Router.Send() → resolveBeadsDir(recipient) → bd mail send with BEADS_DIR
+Sender → Router.Send() → resolveBeadsDir(recipient) → creates message issue in target beads
 ```
 
 **Routing logic (`resolveBeadsDir`):**

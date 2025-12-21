@@ -32,7 +32,7 @@ func (d *Daemon) ProcessLifecycleRequests() {
 
 	output, err := cmd.Output()
 	if err != nil {
-		// bd mail might not be available or inbox empty
+		// gt mail might not be available or inbox empty
 		return
 	}
 

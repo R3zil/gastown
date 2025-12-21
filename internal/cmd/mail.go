@@ -63,7 +63,7 @@ Message types:
   notification  - Informational (default)
   reply         - Response to message
 
-Priority levels (compatible with bd mail send):
+Priority levels:
   0 - urgent/critical
   1 - high
   2 - normal (default)
