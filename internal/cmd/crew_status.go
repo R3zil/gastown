@@ -31,6 +31,18 @@ type CrewStatusItem struct {
 }
 
 func runCrewStatus(cmd *cobra.Command, args []string) error {
+	// Parse rig/name format before getting manager (e.g., "beads/emma" -> rig=beads, name=emma)
+	var targetName string
+	if len(args) > 0 {
+		targetName = args[0]
+		if rig, crewName, ok := parseRigSlashName(targetName); ok {
+			if crewRig == "" {
+				crewRig = rig
+			}
+			targetName = crewName
+		}
+	}
+
 	crewMgr, r, err := getCrewManager(crewRig)
 	if err != nil {
 		return err
@@ -38,13 +50,12 @@ func runCrewStatus(cmd *cobra.Command, args []string) error {
 
 	var workers []*crew.CrewWorker
 
-	if len(args) > 0 {
+	if targetName != "" {
 		// Specific worker
-		name := args[0]
-		worker, err := crewMgr.Get(name)
+		worker, err := crewMgr.Get(targetName)
 		if err != nil {
 			if err == crew.ErrCrewNotFound {
-				return fmt.Errorf("crew workspace '%s' not found", name)
+				return fmt.Errorf("crew workspace '%s' not found", targetName)
 			}
 			return fmt.Errorf("getting crew worker: %w", err)
 		}

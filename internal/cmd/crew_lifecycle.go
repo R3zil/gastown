@@ -15,6 +15,13 @@ import (
 
 func runCrewRemove(cmd *cobra.Command, args []string) error {
 	name := args[0]
+	// Parse rig/name format (e.g., "beads/emma" -> rig=beads, name=emma)
+	if rig, crewName, ok := parseRigSlashName(name); ok {
+		if crewRig == "" {
+			crewRig = rig
+		}
+		name = crewName
+	}
 
 	crewMgr, r, err := getCrewManager(crewRig)
 	if err != nil {
@@ -59,6 +66,13 @@ func runCrewRemove(cmd *cobra.Command, args []string) error {
 
 func runCrewRefresh(cmd *cobra.Command, args []string) error {
 	name := args[0]
+	// Parse rig/name format (e.g., "beads/emma" -> rig=beads, name=emma)
+	if rig, crewName, ok := parseRigSlashName(name); ok {
+		if crewRig == "" {
+			crewRig = rig
+		}
+		name = crewName
+	}
 
 	crewMgr, r, err := getCrewManager(crewRig)
 	if err != nil {
@@ -143,6 +157,13 @@ func runCrewRefresh(cmd *cobra.Command, args []string) error {
 
 func runCrewRestart(cmd *cobra.Command, args []string) error {
 	name := args[0]
+	// Parse rig/name format (e.g., "beads/emma" -> rig=beads, name=emma)
+	if rig, crewName, ok := parseRigSlashName(name); ok {
+		if crewRig == "" {
+			crewRig = rig
+		}
+		name = crewName
+	}
 
 	crewMgr, r, err := getCrewManager(crewRig)
 	if err != nil {

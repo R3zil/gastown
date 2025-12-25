@@ -14,6 +14,14 @@ import (
 func runCrewRename(cmd *cobra.Command, args []string) error {
 	oldName := args[0]
 	newName := args[1]
+	// Parse rig/name format for oldName (e.g., "beads/emma" -> rig=beads, name=emma)
+	if rig, crewName, ok := parseRigSlashName(oldName); ok {
+		if crewRig == "" {
+			crewRig = rig
+		}
+		oldName = crewName
+	}
+	// Note: newName is just the new name, no rig prefix expected
 
 	crewMgr, r, err := getCrewManager(crewRig)
 	if err != nil {
@@ -59,6 +67,10 @@ func runCrewPristine(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 {
 		// Specific worker
 		name := args[0]
+		// Parse rig/name format (e.g., "beads/emma" -> rig=beads, name=emma)
+		if _, crewName, ok := parseRigSlashName(name); ok {
+			name = crewName
+		}
 		worker, err := crewMgr.Get(name)
 		if err != nil {
 			if err == crew.ErrCrewNotFound {

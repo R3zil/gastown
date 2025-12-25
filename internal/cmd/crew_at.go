@@ -19,6 +19,13 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 	// Determine crew name: from arg, or auto-detect from cwd
 	if len(args) > 0 {
 		name = args[0]
+		// Parse rig/name format (e.g., "beads/emma" -> rig=beads, name=emma)
+		if rig, crewName, ok := parseRigSlashName(name); ok {
+			if crewRig == "" {
+				crewRig = rig
+			}
+			name = crewName
+		}
 	} else {
 		// Try to detect from current directory
 		detected, err := detectCrewFromCwd()

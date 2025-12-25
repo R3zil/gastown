@@ -69,6 +69,21 @@ func crewSessionName(rigName, crewName string) string {
 	return fmt.Sprintf("gt-%s-crew-%s", rigName, crewName)
 }
 
+// parseRigSlashName parses "rig/name" format into separate rig and name parts.
+// Returns (rig, name, true) if the format matches, or ("", original, false) if not.
+// Examples:
+//   - "beads/emma" -> ("beads", "emma", true)
+//   - "emma" -> ("", "emma", false)
+//   - "beads/crew/emma" -> ("beads", "crew/emma", true) - only first slash splits
+func parseRigSlashName(input string) (rig, name string, ok bool) {
+	// Only split on first slash to handle edge cases
+	idx := strings.Index(input, "/")
+	if idx == -1 {
+		return "", input, false
+	}
+	return input[:idx], input[idx+1:], true
+}
+
 // crewDetection holds the result of detecting crew workspace from cwd.
 type crewDetection struct {
 	rigName  string
