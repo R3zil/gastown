@@ -7,17 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
-
-// safeIDPattern validates that an ID only contains safe characters for SQL queries.
-// Issue IDs should only contain alphanumeric characters, hyphens, and underscores.
-var safeIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // Convoy command flags
 var (
@@ -92,23 +87,6 @@ Examples:
 	RunE: runConvoyList,
 }
 
-var convoyNotifyCmd = &cobra.Command{
-	Use:   "notify <convoy-id>",
-	Short: "Send completion notification for a convoy",
-	Long: `Send the completion notification for a convoy.
-
-If the convoy was created with --notify, sends mail to that address.
-Otherwise does nothing (convoy had no notification configured).
-
-This is typically called by the convoy-cleanup formula when a convoy
-completes. It can also be called manually to resend a notification.
-
-Examples:
-  gt convoy notify hq-abc123`,
-	Args: cobra.ExactArgs(1),
-	RunE: runConvoyNotify,
-}
-
 func init() {
 	// Create flags
 	convoyCreateCmd.Flags().StringVar(&convoyMolecule, "molecule", "", "Associated molecule ID")
@@ -125,7 +103,6 @@ func init() {
 	convoyCmd.AddCommand(convoyCreateCmd)
 	convoyCmd.AddCommand(convoyStatusCmd)
 	convoyCmd.AddCommand(convoyListCmd)
-	convoyCmd.AddCommand(convoyNotifyCmd)
 
 	rootCmd.AddCommand(convoyCmd)
 }
@@ -187,16 +164,6 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 	convoyID := created.ID
 	if convoyID == "" {
 		return fmt.Errorf("convoy created but no ID returned")
-	}
-
-	// Store notify address in slot if specified (for convoy-cleanup to read)
-	if convoyNotify != "" {
-		slotArgs := []string{"slot", "set", convoyID, "notify", convoyNotify}
-		slotCmd := exec.Command("bd", slotArgs...)
-		slotCmd.Dir = townBeads
-		if err := slotCmd.Run(); err != nil {
-			style.PrintWarning("couldn't set notify slot: %v", err)
-		}
 	}
 
 	// Add 'tracks' relations for each tracked issue
@@ -441,95 +408,6 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runConvoyNotify(cmd *cobra.Command, args []string) error {
-	convoyID := args[0]
-
-	townBeads, err := getTownBeadsDir()
-	if err != nil {
-		return err
-	}
-
-	// Get convoy details
-	showArgs := []string{"show", convoyID, "--json"}
-	showCmd := exec.Command("bd", showArgs...)
-	showCmd.Dir = townBeads
-	var stdout bytes.Buffer
-	showCmd.Stdout = &stdout
-
-	if err := showCmd.Run(); err != nil {
-		return fmt.Errorf("convoy '%s' not found", convoyID)
-	}
-
-	// Parse convoy data
-	var convoys []struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Status      string `json:"status"`
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
-		return fmt.Errorf("parsing convoy data: %w", err)
-	}
-
-	if len(convoys) == 0 {
-		return fmt.Errorf("convoy '%s' not found", convoyID)
-	}
-
-	convoy := convoys[0]
-
-	// Get notify address from slot
-	slotArgs := []string{"slot", "get", convoyID, "notify"}
-	slotCmd := exec.Command("bd", slotArgs...)
-	slotCmd.Dir = townBeads
-	var slotStdout bytes.Buffer
-	slotCmd.Stdout = &slotStdout
-
-	if err := slotCmd.Run(); err != nil {
-		// No notify slot means no notification configured
-		fmt.Printf("%s No notification configured for convoy %s\n", style.Dim.Render("○"), convoyID)
-		return nil
-	}
-
-	notifyAddr := strings.TrimSpace(slotStdout.String())
-	if notifyAddr == "" {
-		fmt.Printf("%s No notification configured for convoy %s\n", style.Dim.Render("○"), convoyID)
-		return nil
-	}
-
-	// Get tracked issue stats
-	tracked := getTrackedIssues(townBeads, convoyID)
-	completed := 0
-	for _, t := range tracked {
-		if t.Status == "closed" {
-			completed++
-		}
-	}
-
-	// Build notification message
-	subject := fmt.Sprintf("Convoy complete: %s", convoy.Title)
-	body := fmt.Sprintf(`Convoy %s has completed.
-
-Title: %s
-Status: %s
-Tracked: %d issues (%d completed)
-
-View details: bd show %s`,
-		convoyID, convoy.Title, convoy.Status, len(tracked), completed, convoyID)
-
-	// Send mail notification
-	mailArgs := []string{"mail", "send", notifyAddr, "-s", subject, "-m", body}
-	mailCmd := exec.Command("gt", mailArgs...)
-	mailCmd.Stdout = os.Stdout
-	mailCmd.Stderr = os.Stderr
-
-	if err := mailCmd.Run(); err != nil {
-		return fmt.Errorf("sending notification to %s: %w", notifyAddr, err)
-	}
-
-	fmt.Printf("%s Notification sent to %s\n", style.Bold.Render("✓"), notifyAddr)
-	return nil
-}
-
 func formatConvoyStatus(status string) string {
 	switch status {
 	case "open":
@@ -555,15 +433,9 @@ type trackedIssueInfo struct {
 // getTrackedIssues queries SQLite directly to get issues tracked by a convoy.
 // This is needed because bd dep list doesn't properly show cross-rig external dependencies.
 func getTrackedIssues(townBeads, convoyID string) []trackedIssueInfo {
-	// Validate convoyID to prevent SQL injection
-	if !safeIDPattern.MatchString(convoyID) {
-		return nil
-	}
-
 	dbPath := filepath.Join(townBeads, "beads.db")
 
 	// Query tracked dependencies from SQLite
-	// Note: convoyID is validated above to only contain safe characters
 	queryCmd := exec.Command("sqlite3", "-json", dbPath,
 		fmt.Sprintf(`SELECT depends_on_id, type FROM dependencies WHERE issue_id = '%s' AND type = 'tracks'`, convoyID))
 
