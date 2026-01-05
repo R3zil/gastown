@@ -323,7 +323,7 @@ Deacon, Witness, and Refinery run continuous patrol loops using wisps:
 |-------|-----------------|----------------|
 | **Deacon** | `mol-deacon-patrol` | Agent lifecycle, plugin execution, health checks |
 | **Witness** | `mol-witness-patrol` | Monitor polecats, nudge stuck workers |
-| **Refinery** | `mol-refinery-patrol` | Process merge queue, review PRs |
+| **Refinery** | `mol-refinery-patrol` | Process merge queue, review MRs |
 
 ```
 1. bd mol wisp mol-<role>-patrol
