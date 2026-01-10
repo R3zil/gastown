@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/agent"
@@ -16,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // Common errors
@@ -99,7 +101,9 @@ func (m *Manager) witnessDir() string {
 // Start starts the witness.
 // If foreground is true, only updates state (no tmux session - deprecated).
 // Otherwise, spawns a Claude agent in a tmux session.
-func (m *Manager) Start(foreground bool) error {
+// agentOverride optionally specifies a different agent alias to use.
+// envOverrides are KEY=VALUE pairs that override all other env var sources.
+func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []string) error {
 	w, err := m.loadState()
 	if err != nil {
 		return err
@@ -152,21 +156,25 @@ func (m *Manager) Start(foreground bool) error {
 		return fmt.Errorf("ensuring Claude settings: %w", err)
 	}
 
-	// Build startup command first
-	// Pass m.rig.Path so rig agent settings are honored (not town-level defaults)
-	bdActor := fmt.Sprintf("%s/witness", m.rig.Name)
-	command := config.BuildAgentStartupCommand("witness", bdActor, m.rig.Path, "")
-	runtimeConfig := config.LoadRuntimeConfig(m.rig.Path)
-
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	if err := t.NewSessionWithCommand(sessionID, witnessDir, command); err != nil {
+	// Create new tmux session
+	if err := t.NewSession(sessionID, witnessDir); err != nil {
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
 
+	// Apply Gas Town theming (non-fatal: theming failure doesn't affect operation)
+	theme := tmux.AssignTheme(m.rig.Name)
+	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "witness", "witness")
+
+	roleConfig, err := m.roleConfig()
+	if err != nil {
+		_ = t.KillSession(sessionID)
+		return err
+	}
+
+	townRoot := m.townRoot()
+
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
-	townRoot := filepath.Dir(m.rig.Path)
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:     "witness",
 		Rig:      m.rig.Name,
@@ -176,10 +184,16 @@ func (m *Manager) Start(foreground bool) error {
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
 	}
-
-	// Apply Gas Town theming (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.AssignTheme(m.rig.Name)
-	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "witness", "witness")
+	// Apply role config env vars if present (non-fatal).
+	for key, value := range roleConfigEnvVars(roleConfig, townRoot, m.rig.Name) {
+		_ = t.SetEnvironment(sessionID, key, value)
+	}
+	// Apply CLI env overrides (highest priority, non-fatal).
+	for _, override := range envOverrides {
+		if key, value, ok := strings.Cut(override, "="); ok {
+			_ = t.SetEnvironment(sessionID, key, value)
+		}
+	}
 
 	// Update state to running
 	now := time.Now()
@@ -192,8 +206,28 @@ func (m *Manager) Start(foreground bool) error {
 		return fmt.Errorf("saving state: %w", err)
 	}
 
-	// Wait for runtime to start and show its prompt (non-fatal)
-	if err := t.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout); err != nil {
+	// Launch Claude directly (no shell respawn loop)
+	// Restarts are handled by daemon via LIFECYCLE mail or deacon health-scan
+	// NOTE: No gt prime injection needed - SessionStart hook handles it automatically
+	// Export GT_ROLE and BD_ACTOR in the command since tmux SetEnvironment only affects new panes
+	// Pass m.rig.Path so rig agent settings are honored (not town-level defaults)
+	command, err := buildWitnessStartCommand(m.rig.Path, m.rig.Name, townRoot, agentOverride, roleConfig)
+	if err != nil {
+		_ = t.KillSession(sessionID)
+		return err
+	}
+	// Wait for shell to be ready before sending keys (prevents "can't find pane" under load)
+	if err := t.WaitForShellReady(sessionID, 5*time.Second); err != nil {
+		_ = t.KillSession(sessionID)
+		return fmt.Errorf("waiting for shell: %w", err)
+	}
+	if err := t.SendKeys(sessionID, command); err != nil {
+		_ = t.KillSession(sessionID) // best-effort cleanup
+		return fmt.Errorf("starting Claude agent: %w", err)
+	}
+
+	// Wait for Claude to start (non-fatal).
+	if err := t.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
 		// Non-fatal - try to continue anyway
 	}
 
@@ -217,6 +251,51 @@ func (m *Manager) Start(foreground bool) error {
 	_ = t.NudgeSession(sessionID, session.PropulsionNudgeForRole("witness", witnessDir)) // Non-fatal
 
 	return nil
+}
+
+func (m *Manager) roleConfig() (*beads.RoleConfig, error) {
+	beadsPath := m.rig.BeadsPath()
+	beadsDir := beads.ResolveBeadsDir(beadsPath)
+	bd := beads.NewWithBeadsDir(beadsPath, beadsDir)
+	roleConfig, err := bd.GetRoleConfig(beads.RoleBeadIDTown("witness"))
+	if err != nil {
+		return nil, fmt.Errorf("loading witness role config: %w", err)
+	}
+	return roleConfig, nil
+}
+
+func (m *Manager) townRoot() string {
+	townRoot, err := workspace.Find(m.rig.Path)
+	if err != nil || townRoot == "" {
+		return m.rig.Path
+	}
+	return townRoot
+}
+
+func roleConfigEnvVars(roleConfig *beads.RoleConfig, townRoot, rigName string) map[string]string {
+	if roleConfig == nil || len(roleConfig.EnvVars) == 0 {
+		return nil
+	}
+	expanded := make(map[string]string, len(roleConfig.EnvVars))
+	for key, value := range roleConfig.EnvVars {
+		expanded[key] = beads.ExpandRolePattern(value, townRoot, rigName, "", "witness")
+	}
+	return expanded
+}
+
+func buildWitnessStartCommand(rigPath, rigName, townRoot, agentOverride string, roleConfig *beads.RoleConfig) (string, error) {
+	if agentOverride != "" {
+		roleConfig = nil
+	}
+	if roleConfig != nil && roleConfig.StartCommand != "" {
+		return beads.ExpandRolePattern(roleConfig.StartCommand, townRoot, rigName, "", "witness"), nil
+	}
+	bdActor := fmt.Sprintf("%s/witness", rigName)
+	command, err := config.BuildAgentStartupCommandWithAgentOverride("witness", bdActor, rigPath, "", agentOverride)
+	if err != nil {
+		return "", fmt.Errorf("building startup command: %w", err)
+	}
+	return command, nil
 }
 
 // Stop stops the witness.
