@@ -1,0 +1,28 @@
+{
+  "type": "town-settings",
+  "version": 1,
+  "default_agent": "claude",
+  "agents": {
+    "claude-haiku": {
+      "command": "claude",
+      "args": [
+        "--model",
+        "haiku"
+      ]
+    },
+    "claude-opus": {
+      "command": "claude",
+      "args": [
+        "--model",
+        "opus"
+      ]
+    },
+    "claude-sonnet": {
+      "command": "claude",
+      "args": [
+        "--model",
+        "sonnet"
+      ]
+    }
+  }
+}
