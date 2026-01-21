@@ -44,8 +44,8 @@ type Issue struct {
 
 	// Agent bead slots (type=agent only)
 	HookBead   string `json:"hook_bead,omitempty"`   // Current work attached to agent's hook
-	RoleBead   string `json:"role_bead,omitempty"`   // Role definition bead (shared)
 	AgentState string `json:"agent_state,omitempty"` // Agent lifecycle state (spawning, working, done, stuck)
+	// Note: role_bead field removed - role definitions are now config-based
 
 	// Counts from list output
 	DependencyCount int `json:"dependency_count,omitempty"`
@@ -114,6 +114,11 @@ type Beads struct {
 	workDir  string
 	beadsDir string // Optional BEADS_DIR override for cross-database access
 	isolated bool   // If true, suppress inherited beads env vars (for test isolation)
+
+	// Lazy-cached town root for routing resolution.
+	// Populated on first call to getTownRoot() to avoid filesystem walk on every operation.
+	townRoot     string
+	searchedRoot bool
 }
 
 // New creates a new Beads wrapper for the given directory.
@@ -142,6 +147,26 @@ func (b *Beads) getActor() string {
 		return ""
 	}
 	return os.Getenv("BD_ACTOR")
+}
+
+// getTownRoot returns the Gas Town root directory, using lazy caching.
+// The town root is found by walking up from workDir looking for mayor/town.json.
+// Returns empty string if not in a Gas Town project.
+func (b *Beads) getTownRoot() string {
+	if !b.searchedRoot {
+		b.townRoot = FindTownRoot(b.workDir)
+		b.searchedRoot = true
+	}
+	return b.townRoot
+}
+
+// getResolvedBeadsDir returns the beads directory this wrapper is operating on.
+// This follows any redirects and returns the actual beads directory path.
+func (b *Beads) getResolvedBeadsDir() string {
+	if b.beadsDir != "" {
+		return b.beadsDir
+	}
+	return ResolveBeadsDir(b.workDir)
 }
 
 // Init initializes a new beads database in the working directory.

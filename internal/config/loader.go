@@ -1264,7 +1264,11 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 
 	var cmd string
 	if len(exports) > 0 {
-		cmd = "export " + strings.Join(exports, " ") + " && "
+		// Use 'exec env' instead of 'export ... &&' so the agent process
+		// replaces the shell. This allows WaitForCommand to detect the
+		// running agent via pane_current_command (which shows the direct
+		// process, not child processes).
+		cmd = "exec env " + strings.Join(exports, " ") + " "
 	}
 
 	// Add runtime command
@@ -1353,6 +1357,10 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	if rc.Session != nil && rc.Session.SessionIDEnv != "" {
 		resolvedEnv["GT_SESSION_ID_ENV"] = rc.Session.SessionIDEnv
 	}
+	// Record agent override so handoff can preserve it
+	if agentOverride != "" {
+		resolvedEnv["GT_AGENT"] = agentOverride
+	}
 
 	// Build environment export prefix
 	var exports []string
@@ -1363,7 +1371,11 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 
 	var cmd string
 	if len(exports) > 0 {
-		cmd = "export " + strings.Join(exports, " ") + " && "
+		// Use 'exec env' instead of 'export ... &&' so the agent process
+		// replaces the shell. This allows WaitForCommand to detect the
+		// running agent via pane_current_command (which shows the direct
+		// process, not child processes).
+		cmd = "exec env " + strings.Join(exports, " ") + " "
 	}
 
 	if prompt != "" {
@@ -1461,13 +1473,14 @@ func BuildCrewStartupCommandWithAgentOverride(rigName, crewName, rigPath, prompt
 }
 
 // ExpectedPaneCommands returns tmux pane command names that indicate the runtime is running.
-// For example, Claude runs as "node", while most other runtimes report their executable name.
+// Claude can report as "node" (older versions) or "claude" (newer versions).
+// Other runtimes typically report their executable name.
 func ExpectedPaneCommands(rc *RuntimeConfig) []string {
 	if rc == nil || rc.Command == "" {
 		return nil
 	}
 	if filepath.Base(rc.Command) == "claude" {
-		return []string{"node"}
+		return []string{"node", "claude"}
 	}
 	return []string{filepath.Base(rc.Command)}
 }
