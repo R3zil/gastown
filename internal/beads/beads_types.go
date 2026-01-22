@@ -107,6 +107,7 @@ func EnsureCustomTypes(beadsDir string) error {
 	typesList := strings.Join(constants.BeadsCustomTypesList(), ",")
 	cmd := exec.Command("bd", "config", "set", "types.custom", typesList)
 	cmd.Dir = beadsDir
+	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("configure custom types in %s: %s: %w",
 			beadsDir, strings.TrimSpace(string(output)), err)

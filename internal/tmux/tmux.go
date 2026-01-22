@@ -293,6 +293,7 @@ func getAllDescendants(pid string) []string {
 // 3. Send SIGTERM to all descendants (deepest first)
 // 4. Wait 100ms for graceful shutdown
 // 5. Send SIGKILL to any remaining descendants
+// 6. Kill the pane process itself
 //
 // This ensures Claude processes and all their children are properly terminated
 // before respawning the pane.
@@ -322,6 +323,12 @@ func (t *Tmux) KillPaneProcesses(pane string) error {
 	for _, dpid := range descendants {
 		_ = exec.Command("kill", "-KILL", dpid).Run()
 	}
+
+	// Kill the pane process itself (may have called setsid() and detached,
+	// or may have no children like Claude Code)
+	_ = exec.Command("kill", "-TERM", pid).Run()
+	time.Sleep(100 * time.Millisecond)
+	_ = exec.Command("kill", "-KILL", pid).Run()
 
 	return nil
 }

@@ -558,6 +558,17 @@ func (g *Git) Remotes() ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
+// ConfigGet returns the value of a git config key.
+// Returns empty string if the key is not set.
+func (g *Git) ConfigGet(key string) (string, error) {
+	out, err := g.run("config", "--get", key)
+	if err != nil {
+		// git config --get returns exit code 1 if key not found
+		return "", nil
+	}
+	return out, nil
+}
+
 // Merge merges the given branch into the current branch.
 func (g *Git) Merge(branch string) error {
 	_, err := g.run("merge", branch)
@@ -568,6 +579,27 @@ func (g *Git) Merge(branch string) error {
 func (g *Git) MergeNoFF(branch, message string) error {
 	_, err := g.run("merge", "--no-ff", "-m", message, branch)
 	return err
+}
+
+// MergeSquash performs a squash merge of the given branch and commits with the provided message.
+// This stages all changes from the branch without creating a merge commit, then commits them
+// as a single commit with the given message. This eliminates redundant merge commits while
+// preserving the original commit message from the source branch.
+func (g *Git) MergeSquash(branch, message string) error {
+	// Stage all changes from the branch without committing
+	if _, err := g.run("merge", "--squash", branch); err != nil {
+		return err
+	}
+	// Commit the staged changes with the provided message
+	_, err := g.run("commit", "-m", message)
+	return err
+}
+
+// GetBranchCommitMessage returns the commit message of the HEAD commit on the given branch.
+// This is useful for preserving the original conventional commit message (feat:/fix:) when
+// performing squash merges.
+func (g *Git) GetBranchCommitMessage(branch string) (string, error) {
+	return g.run("log", "-1", "--format=%B", branch)
 }
 
 // DeleteRemoteBranch deletes a branch on the remote.
