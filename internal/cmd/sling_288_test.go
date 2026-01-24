@@ -74,10 +74,38 @@ case "$cmd" in
 esac
 exit 0
 `
-	bdPath := filepath.Join(binDir, "bd")
-	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
-		t.Fatalf("write bd stub: %v", err)
-	}
+	bdScriptWindows := `@echo off
+setlocal enableextensions
+echo CMD:%*>>"%BD_LOG%"
+set "cmd=%1"
+set "sub=%2"
+if "%cmd%"=="--no-daemon" (
+  set "cmd=%2"
+  set "sub=%3"
+)
+if "%cmd%"=="show" (
+  echo [{^"title^":^"Fix bug ABC^",^"status^":^"open^",^"assignee^":^"^",^"description^":^"^"}]
+  exit /b 0
+)
+if "%cmd%"=="formula" (
+  echo {^"name^":^"mol-polecat-work^"}
+  exit /b 0
+)
+if "%cmd%"=="cook" exit /b 0
+if "%cmd%"=="mol" (
+  if "%sub%"=="wisp" (
+    echo {^"new_epic_id^":^"gt-wisp-288^"}
+    exit /b 0
+  )
+  if "%sub%"=="bond" (
+    echo {^"root_id^":^"gt-wisp-288^"}
+    exit /b 0
+  )
+)
+if "%cmd%"=="update" exit /b 0
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
 
 	t.Setenv("BD_LOG", logPath)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -160,9 +188,28 @@ case "$cmd" in
 esac
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
-		t.Fatalf("write bd stub: %v", err)
-	}
+	bdScriptWindows := `@echo off
+setlocal enableextensions
+echo CMD:%*>>"%BD_LOG%"
+set "cmd=%1"
+set "sub=%2"
+if "%cmd%"=="--no-daemon" (
+  set "cmd=%2"
+  set "sub=%3"
+)
+if "%cmd%"=="mol" (
+  if "%sub%"=="wisp" (
+    echo {^"new_epic_id^":^"gt-wisp-skip^"}
+    exit /b 0
+  )
+  if "%sub%"=="bond" (
+    echo {^"root_id^":^"gt-wisp-skip^"}
+    exit /b 0
+  )
+)
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
 
 	t.Setenv("BD_LOG", logPath)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -207,9 +254,11 @@ func TestCookFormula(t *testing.T) {
 echo "CMD:$*" >> "${BD_LOG}"
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
-		t.Fatalf("write bd stub: %v", err)
-	}
+	bdScriptWindows := `@echo off
+echo CMD:%*>>"%BD_LOG%"
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
 
 	t.Setenv("BD_LOG", logPath)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -336,9 +385,29 @@ case "$cmd" in
 esac
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
-		t.Fatalf("write bd: %v", err)
-	}
+	bdScriptWindows := `@echo off
+setlocal enableextensions
+echo CMD:%*>>"%BD_LOG%"
+set "cmd=%1"
+set "sub=%2"
+if "%cmd%"=="--no-daemon" (
+  set "cmd=%2"
+  set "sub=%3"
+)
+if "%cmd%"=="cook" exit /b 0
+if "%cmd%"=="mol" (
+  if "%sub%"=="wisp" (
+    echo {^"new_epic_id^":^"gt-wisp-var^"}
+    exit /b 0
+  )
+  if "%sub%"=="bond" (
+    echo {^"root_id^":^"gt-wisp-var^"}
+    exit /b 0
+  )
+)
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
 
 	t.Setenv("BD_LOG", logPath)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))

@@ -623,6 +623,19 @@ func determineColorClass(ciStatus, mergeable string) string {
 
 // FetchPolecats fetches all running polecat and refinery sessions with activity data.
 func (f *LiveConvoyFetcher) FetchPolecats() ([]PolecatRow, error) {
+	// Load registered rigs to filter sessions
+	rigsConfigPath := filepath.Join(f.townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("loading rigs config: %w", err)
+	}
+
+	// Build set of registered rig names
+	registeredRigs := make(map[string]bool)
+	for rigName := range rigsConfig.Rigs {
+		registeredRigs[rigName] = true
+	}
+
 	// Query all tmux sessions with window_activity for more accurate timing
 	cmd := exec.Command("tmux", "list-sessions", "-F", "#{session_name}|#{window_activity}")
 	var stdout bytes.Buffer
@@ -662,6 +675,11 @@ func (f *LiveConvoyFetcher) FetchPolecats() ([]PolecatRow, error) {
 		}
 		rig := nameParts[1]
 		polecat := nameParts[2]
+
+		// Skip rigs not registered in this workspace
+		if !registeredRigs[rig] {
+			continue
+		}
 
 		// Skip non-worker sessions (witness, mayor, deacon, boot)
 		// Note: refinery is included to show idle/processing status

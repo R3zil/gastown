@@ -85,7 +85,7 @@ func runHooksInstall(cmd *cobra.Command, args []string) error {
 	// Install to each target
 	installed := 0
 	for _, target := range targets {
-		if err := installHookTo(target, hookName, hookDef, installDryRun); err != nil {
+		if err := installHookTo(target, hookDef, installDryRun); err != nil {
 			fmt.Printf("%s Failed to install to %s: %v\n", style.Error.Render("Error:"), target, err)
 			continue
 		}
@@ -189,7 +189,7 @@ func determineTargets(townRoot, role string, allRigs bool, allowedRoles []string
 }
 
 // installHookTo installs a hook to a specific worktree.
-func installHookTo(worktreePath, hookName string, hookDef HookDefinition, dryRun bool) error {
+func installHookTo(worktreePath string, hookDef HookDefinition, dryRun bool) error {
 	settingsPath := filepath.Join(worktreePath, ".claude", "settings.json")
 
 	// Load existing settings or create new

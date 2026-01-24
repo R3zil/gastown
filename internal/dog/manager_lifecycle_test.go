@@ -79,24 +79,20 @@ func TestNewManager_PathConstruction(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		townRoot       string
-		wantKennelPath string
+		name     string
+		townRoot string
 	}{
 		{
-			name:           "standard path",
-			townRoot:       "/home/user/gt",
-			wantKennelPath: "/home/user/gt/deacon/dogs",
+			name:     "standard path",
+			townRoot: "/home/user/gt",
 		},
 		{
-			name:           "path with trailing slash",
-			townRoot:       "/tmp/town/",
-			wantKennelPath: "/tmp/town/deacon/dogs",
+			name:     "path with trailing slash",
+			townRoot: "/tmp/town/",
 		},
 		{
-			name:           "nested path",
-			townRoot:       "/a/b/c/d/e",
-			wantKennelPath: "/a/b/c/d/e/deacon/dogs",
+			name:     "nested path",
+			townRoot: "/a/b/c/d/e",
 		},
 	}
 
@@ -107,8 +103,9 @@ func TestNewManager_PathConstruction(t *testing.T) {
 			if m.townRoot != tt.townRoot {
 				t.Errorf("townRoot = %q, want %q", m.townRoot, tt.townRoot)
 			}
-			if m.kennelPath != tt.wantKennelPath {
-				t.Errorf("kennelPath = %q, want %q", m.kennelPath, tt.wantKennelPath)
+			wantKennelPath := filepath.Join(tt.townRoot, "deacon", "dogs")
+			if m.kennelPath != wantKennelPath {
+				t.Errorf("kennelPath = %q, want %q", m.kennelPath, wantKennelPath)
 			}
 			if m.rigsConfig != rigsConfig {
 				t.Error("rigsConfig not properly stored")
