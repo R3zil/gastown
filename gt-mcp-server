@@ -1,0 +1,65 @@
+export PATH="$HOME/go/bin:$PATH" && export BEADS_DIR="$HOME/gt/.beads" && gt mail send mayor -s "NEW EPIC: GT MCP Server HTTP Transport for Multi-Tenant Production" -m "## Epic Request: HTTP/SSE Transport for gt-mcp-server
+
+### Background
+The gt-mcp-server currently only supports STDIO transport, which works for local Claude Desktop usage but cannot be deployed in production (GKE) or accessed remotely (e.g., from mobile).
+
+### Goal
+Add HTTP/SSE transport to gt-mcp-server enabling:
+1. **Production deployment** - Run in GKE as containerized service
+2. **Remote access** - Access GT instance from phone/browser via Conducktor
+3. **Multi-tenant architecture** - Each user gets isolated GT instance with HTTP endpoint
+
+### Technical Requirements
+
+#### P1: Core HTTP Transport
+- Add SSE (Server-Sent Events) transport alongside existing STDIO
+- Use \`mcp.server.sse.SseServerTransport\` or Streamable HTTP per MCP 2025 spec
+- Add Starlette/FastAPI HTTP server wrapper
+- Support both transports via CLI flag: \`--transport stdio|http\`
+- Default port: 8080, configurable via \`--port\`
+
+#### P1: Authentication
+- Add API key authentication for HTTP transport
+- Support Bearer token in Authorization header
+- Environment variable: \`GT_MCP_API_KEY\`
+- Reject unauthenticated requests with 401
+
+#### P2: Health & Observability  
+- Add \`/health\` endpoint for k8s probes
+- Add \`/metrics\` endpoint (Prometheus format)
+- Structured JSON logging already exists (good)
+
+#### P2: Container Image
+- Create Dockerfile for gt-mcp-server
+- Include gt and bd binaries
+- Include git, tmux dependencies
+- Support GT_ROOT configuration via env var
+
+#### P3: Conducktor Integration
+- Register as Hosted connector in Conducktor catalog
+- Document per-user routing pattern
+- Add to CONNECTOR_INTEGRATION_PROCESS.md
+
+### Files to Modify
+- \`gt-mcp-server/gt_mcp_server/server.py\` - Add HTTP transport
+- \`gt-mcp-server/gt_mcp_server/cli.py\` - Add CLI args for transport/port
+- \`gt-mcp-server/pyproject.toml\` - Add starlette/uvicorn deps
+- \`gt-mcp-server/Dockerfile\` - New file
+- \`gt-mcp-server/tests/test_http_transport.py\` - New tests
+
+### Code Location
+\`~/repos/B2MPC/gt-mcp-server/\` (already pushed to production repo)
+
+### Reference
+- MCP SSE Transport: https://modelcontextprotocol.io/docs/concepts/transports
+- Existing STDIO impl: \`gt_mcp_server/server.py:run()\` method
+- Conducktor connector pattern: \`docs/development/CONNECTOR_INTEGRATION_PROCESS.md\`
+
+### Success Criteria
+1. \`gt-mcp-server --transport http --port 8080\` starts HTTP server
+2. MCP Inspector can connect via HTTP
+3. Authentication rejects invalid tokens
+4. Container image builds and runs
+5. Can access GT tools from Conducktor chat UI
+
+Please create epic with appropriate P1/P2/P3 breakdown and spawn polecats to implement."
