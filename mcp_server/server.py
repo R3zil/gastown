@@ -43,10 +43,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
+# Configuration from environment variables
 GT_ROOT = os.environ.get('GT_ROOT', '/home/gastown/gt')
 INSTANCE_TOKEN = os.environ.get('INSTANCE_TOKEN', '')
 MCP_PORT = int(os.environ.get('MCP_PORT', '8081'))
+MCP_HOST = os.environ.get('MCP_HOST', '0.0.0.0')
+MCP_IDENTITY = os.environ.get('MCP_IDENTITY', 'overseer')
+INSTANCE_TOKEN_FILE = os.environ.get('INSTANCE_TOKEN_FILE', '/tmp/gastown/instance_token')
+
+# Timeout configuration (seconds)
+TIMESTAMP_FRESHNESS = int(os.environ.get('TIMESTAMP_FRESHNESS', '300'))
+MAYOR_STATUS_TIMEOUT = int(os.environ.get('MAYOR_STATUS_TIMEOUT', '5'))
+MAIL_INBOX_TIMEOUT = int(os.environ.get('MAIL_INBOX_TIMEOUT', '10'))
+POLL_INTERVAL = int(os.environ.get('POLL_INTERVAL', '2'))
+NUDGE_TIMEOUT = int(os.environ.get('NUDGE_TIMEOUT', '30'))
+DEFAULT_TASK_TIMEOUT = int(os.environ.get('DEFAULT_TASK_TIMEOUT', '300'))
+MAX_TASK_TIMEOUT = int(os.environ.get('MAX_TASK_TIMEOUT', '600'))
+
+# Server metadata
+SERVER_VERSION = os.environ.get('SERVER_VERSION', '1.0.0')
+PROTOCOL_VERSION = os.environ.get('PROTOCOL_VERSION', '2024-11-05')
 
 # In-memory task tracking
 @dataclass
@@ -84,7 +100,7 @@ TOOLS = [
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds when wait=true (default: 300, max: 600)"
+                    "description": f"Timeout in seconds when wait=true (default: {DEFAULT_TASK_TIMEOUT}, max: {MAX_TASK_TIMEOUT})"
                 }
             },
             "required": ["task"]
@@ -100,11 +116,11 @@ def verify_signature(body: str, signature: str, timestamp: str) -> bool:
         logger.warning("No INSTANCE_TOKEN configured, skipping signature verification")
         return True
 
-    # Check timestamp freshness (within 5 minutes)
+    # Check timestamp freshness
     try:
         ts = int(timestamp)
         now = int(time.time())
-        if abs(now - ts) > 300:
+        if abs(now - ts) > TIMESTAMP_FRESHNESS:
             logger.warning(f"Timestamp too old: {ts} vs {now}")
             return False
     except (ValueError, TypeError):
@@ -131,7 +147,7 @@ async def check_mayor_session_running() -> bool:
             stderr=asyncio.subprocess.PIPE,
             cwd=GT_ROOT
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=MAYOR_STATUS_TIMEOUT)
         output = stdout.decode().lower()
         # gt mayor status returns "running" or similar if active
         return proc.returncode == 0 and 'running' in output
@@ -146,13 +162,13 @@ async def clear_overseer_inbox() -> None:
         # Get all messages in overseer inbox
         proc = await asyncio.create_subprocess_exec(
             'gt', 'mail', 'inbox',
-            '--identity', 'overseer',
+            '--identity', MCP_IDENTITY,
             '--json',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=GT_ROOT
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=MAIL_INBOX_TIMEOUT)
         output = stdout.decode().strip()
 
         if output and output != 'null':
@@ -178,20 +194,19 @@ async def poll_for_reply(task_id: str, thread_id: str, timeout: int) -> Optional
 
     Returns the reply message or None if timeout.
     """
-    poll_interval = 2  # seconds
     elapsed = 0
 
     while elapsed < timeout:
         try:
             proc = await asyncio.create_subprocess_exec(
                 'gt', 'mail', 'inbox',
-                '--identity', 'overseer',
+                '--identity', MCP_IDENTITY,
                 '--json',
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=GT_ROOT
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=MAIL_INBOX_TIMEOUT)
             output = stdout.decode().strip()
 
             if output and output != 'null':
@@ -207,13 +222,13 @@ async def poll_for_reply(task_id: str, thread_id: str, timeout: int) -> Optional
                         logger.info(f"[{task_id}] Received reply from {msg_from}")
                         return msg
 
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+            await asyncio.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
 
         except Exception as e:
             logger.debug(f"[{task_id}] Poll error: {e}")
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+            await asyncio.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
 
     return None
 
@@ -221,7 +236,7 @@ async def poll_for_reply(task_id: str, thread_id: str, timeout: int) -> Optional
 async def execute_via_mayor_chat(
     task: str,
     context: Optional[str] = None,
-    timeout: int = 300
+    timeout: int = DEFAULT_TASK_TIMEOUT
 ) -> Dict[str, Any]:
     """
     Execute task via mail + nudge to Mayor (interactive Mayor session).
@@ -254,7 +269,7 @@ async def execute_via_mayor_chat(
     prompt_with_reply = f"""{prompt}
 
 [MCP Task ID: {task_id}]
-Please reply to overseer when complete with your response."""
+Please reply to {MCP_IDENTITY} when complete with your response."""
 
     logger.info(f"[{task_id}] Sending task to Mayor via nudge: {task[:100]}...")
 
@@ -269,7 +284,7 @@ Please reply to overseer when complete with your response."""
             stderr=asyncio.subprocess.PIPE,
             cwd=GT_ROOT
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=NUDGE_TIMEOUT)
 
         if proc.returncode != 0:
             error = stderr.decode().strip() or stdout.decode().strip()
@@ -369,7 +384,7 @@ Please reply to overseer when complete with your response."""
 async def execute_via_claude_oneshot(
     task: str,
     context: Optional[str] = None,
-    timeout: int = 300
+    timeout: int = DEFAULT_TASK_TIMEOUT
 ) -> Dict[str, Any]:
     """
     Execute task via `claude -p` (one-shot mode).
@@ -479,7 +494,7 @@ async def execute_mayor_task(
     task: str,
     context: Optional[str] = None,
     wait: bool = True,
-    timeout: int = 300
+    timeout: int = DEFAULT_TASK_TIMEOUT
 ) -> Dict[str, Any]:
     """
     Execute a task via the Mayor (Claude Code agent).
@@ -492,7 +507,7 @@ async def execute_mayor_task(
     The Mayor runs in ~/gt/mayor and has full access to Gastown tools (gt, bd).
     """
     # Cap timeout
-    timeout = min(timeout, 600)
+    timeout = min(timeout, MAX_TASK_TIMEOUT)
 
     if not wait:
         # Async mode: start task in background, return immediately
@@ -529,7 +544,7 @@ async def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, An
             task=arguments.get("task", ""),
             context=arguments.get("context"),
             wait=arguments.get("wait", True),
-            timeout=arguments.get("timeout", 300)
+            timeout=arguments.get("timeout", DEFAULT_TASK_TIMEOUT)
         )
     else:
         return {"error": f"Unknown tool: {name}"}
@@ -613,10 +628,10 @@ async def mcp_handler(request: web.Request) -> web.Response:
             "jsonrpc": "2.0",
             "id": request_id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {
                     "name": "gastown-mcp",
-                    "version": "1.0.0"
+                    "version": SERVER_VERSION
                 },
                 "capabilities": {
                     "tools": {}
@@ -659,8 +674,8 @@ def main():
     """Main entry point."""
     # Load instance token from file if not in env
     global INSTANCE_TOKEN
-    if not INSTANCE_TOKEN and os.path.exists('/tmp/gastown/instance_token'):
-        with open('/tmp/gastown/instance_token') as f:
+    if not INSTANCE_TOKEN and os.path.exists(INSTANCE_TOKEN_FILE):
+        with open(INSTANCE_TOKEN_FILE) as f:
             INSTANCE_TOKEN = f.read().strip()
 
     logger.info(f"Starting Gastown MCP Server on port {MCP_PORT}")
@@ -668,7 +683,7 @@ def main():
     logger.info(f"Token configured: {bool(INSTANCE_TOKEN)}")
 
     app = create_app()
-    web.run_app(app, host='0.0.0.0', port=MCP_PORT, print=False)
+    web.run_app(app, host=MCP_HOST, port=MCP_PORT, print=False)
 
 
 if __name__ == '__main__':
