@@ -11,13 +11,31 @@ Single Tool:
 The Mayor handles everything else internally (rigs, convoys, polecats, etc.)
 
 Execution Modes:
-  - Interactive (preferred): Uses `gt mayor chat` when Mayor session is running
-    - Preserves conversation context
+  - Interactive (preferred): Uses gt nudge + mail when Mayor session is running
+    - Sends task via `gt nudge mayor "message"`
+    - Polls `gt mail inbox --identity overseer` for Mayor's reply
+    - Preserves conversation context in Mayor's tmux session
     - Lower latency (no Claude startup)
-    - Stateful conversations
   - One-shot (fallback): Uses `claude -p` when Mayor session is not running
     - Fresh context each call
     - Stateless
+
+Environment Variables:
+  GT_ROOT              - Gastown installation directory (default: /home/gastown/gt)
+  INSTANCE_TOKEN       - HMAC signing token for request verification
+  INSTANCE_TOKEN_FILE  - Path to token file (default: /tmp/gastown/instance_token)
+  MCP_PORT             - Server port (default: 8081)
+  MCP_HOST             - Bind address (default: 0.0.0.0)
+  MCP_IDENTITY         - Mail identity for receiving replies (default: overseer)
+  DEFAULT_TASK_TIMEOUT - Default timeout in seconds (default: 300)
+  MAX_TASK_TIMEOUT     - Maximum timeout in seconds (default: 600)
+  TIMESTAMP_FRESHNESS  - Signature timestamp validity (default: 300)
+  MAYOR_STATUS_TIMEOUT - Mayor status check timeout (default: 5)
+  MAIL_INBOX_TIMEOUT   - Mail inbox command timeout (default: 10)
+  POLL_INTERVAL        - Reply polling interval (default: 2)
+  NUDGE_TIMEOUT        - Nudge command timeout (default: 30)
+  SERVER_VERSION       - MCP server version (default: 1.0.0)
+  PROTOCOL_VERSION     - MCP protocol version (default: 2024-11-05)
 """
 
 import asyncio
