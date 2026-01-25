@@ -1,4 +1,22 @@
 #!/bin/bash
+# Gas Town pre-push hook
+# 1. Blocks pushes to upstream (steveyegge/gastown) - we are a fork
+# 2. Enforces branch naming conventions for agents
+
+# === BLOCK UPSTREAM PUSHES ===
+remote_url="$2"
+if [[ "$remote_url" == *"steveyegge/gastown"* ]]; then
+    echo "ERROR: Pushing to upstream (steveyegge/gastown) is BLOCKED."
+    echo ""
+    echo "This repository is a fork. To sync FROM upstream, use:"
+    echo "  git fetch upstream"
+    echo "  git merge upstream/main"
+    echo ""
+    echo "Push to origin (R3zil/gastown) instead."
+    exit 1
+fi
+
+# === BRANCH NAMING ENFORCEMENT ===
 # Block PRs by preventing pushes to arbitrary feature branches.
 # Gas Town agents push to main (crew) or polecat/* branches (polecats).
 # PRs are for external contributors only.
@@ -6,6 +24,8 @@
 # Allowed patterns:
 #   main, beads-sync  - Direct work branches
 #   polecat/*         - Polecat working branches (Refinery merges these)
+#   feat/*            - Feature branches (for Conducktor integration)
+#   claude/*          - Claude-generated branches
 
 while read local_ref local_sha remote_ref remote_sha; do
   # Skip tags - they're allowed for releases
@@ -16,7 +36,7 @@ while read local_ref local_sha remote_ref remote_sha; do
   branch="${remote_ref#refs/heads/}"
 
   case "$branch" in
-    main|beads-sync|polecat/*)
+    main|beads-sync|polecat/*|feat/*|claude/*)
       # Allowed branches
       ;;
     *)
@@ -31,6 +51,7 @@ while read local_ref local_sha remote_ref remote_sha; do
         echo "Allowed branches:"
         echo "  main        - Crew workers push here directly"
         echo "  polecat/*   - Polecat working branches"
+        echo "  feat/*      - Feature branches"
         echo "  beads-sync  - Beads synchronization"
         echo ""
         echo "Do NOT create PRs. Push to main or let Refinery merge polecat work."
