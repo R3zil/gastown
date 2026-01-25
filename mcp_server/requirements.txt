@@ -1,2 +1,0 @@
-# Gastown MCP Server dependencies
-aiohttp>=3.9.0
