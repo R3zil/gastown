@@ -53,6 +53,7 @@ var beadsExemptCommands = map[string]bool{
 	"install":    true,
 	"tap":        true,
 	"dnd":        true,
+	"krc":        true, // KRC doesn't require beads
 }
 
 // Commands exempt from the town root branch warning.
@@ -209,7 +210,7 @@ func checkStaleBinaryWarning() {
 				info.CommitsBehind, version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
 		}
 		fmt.Fprintf(os.Stderr, "%s %s\n", style.WarningPrefix, msg)
-		fmt.Fprintf(os.Stderr, "    %s Run 'gt install' to update\n", style.ArrowPrefix)
+		fmt.Fprintf(os.Stderr, "    %s Run 'make install' in gastown repo to update\n", style.ArrowPrefix)
 	}
 }
 

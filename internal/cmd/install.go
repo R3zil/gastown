@@ -120,9 +120,13 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("directory is already a Gas Town HQ (use --force to reinitialize)")
 	}
 
-	// Check if inside an existing workspace
-	if existingRoot, _ := workspace.Find(absPath); existingRoot != "" && existingRoot != absPath {
-		style.PrintWarning("Creating HQ inside existing workspace at %s", existingRoot)
+	// Check if inside an existing workspace (e.g., crew worktree, rig directory)
+	if existingRoot, _ := workspace.Find(absPath); existingRoot != "" && existingRoot != absPath && !installForce {
+		return fmt.Errorf("cannot create HQ inside existing Gas Town workspace\n"+
+			"  Current location: %s\n"+
+			"  Town root: %s\n\n"+
+			"Did you mean to update the binary? Run 'make install' in the gastown repo.\n"+
+			"Use --force to override (not recommended).", absPath, existingRoot)
 	}
 
 	// Ensure beads (bd) is available before proceeding
