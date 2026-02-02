@@ -150,8 +150,10 @@ func runSlingFormula(args []string) error {
 				targetAgent = spawnInfo.AgentID()
 				targetPane = spawnInfo.Pane
 
-				// Wake witness and refinery to monitor the new polecat
-				wakeRigAgents(rigName)
+				// Wake witness and refinery to monitor the new polecat (G11: skip if --no-boot)
+				if !slingNoBoot {
+					wakeRigAgents(rigName)
+				}
 			}
 		} else {
 			// Slinging to an existing agent

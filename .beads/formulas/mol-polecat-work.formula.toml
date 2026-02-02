@@ -334,53 +334,80 @@ go build ./...
 **Exit criteria:** All tests pass, new code has appropriate test coverage."""
 
 [[steps]]
-id = "cleanup-workspace"
-title = "Clean up workspace"
+id = "commit-changes"
+title = "Commit all implementation changes"
 needs = ["run-tests"]
 description = """
-Ensure all work is committed and pushed before handoff.
+Ensure ALL implementation work is committed before cleanup.
 
-**CRITICAL: NEVER discard your implementation changes.**
-If you have uncommitted work, you MUST commit it. `gt done` will REJECT
-completion if you have uncommitted changes, and the worktree is nuked after
-`gt done` — any uncommitted work is lost forever.
+**CRITICAL: You MUST commit all changes from implementation.**
+NEVER use `git checkout -- .` or `git restore .` to discard implementation work.
+ALWAYS commit ALL uncommitted changes from your implementation.
 
-**1. Commit ALL uncommitted changes:**
+**1. Check for uncommitted changes:**
 ```bash
 git status
 ```
-If there are ANY modified or untracked files from your implementation:
+
+**2. If there are ANY uncommitted changes, commit them now:**
 ```bash
-git add -A
-git commit -m "fix: <brief description> ({{issue}})"
+git add -A && git commit -m "<type>: <descriptive message> ({{issue}})"
 ```
-NEVER use `git checkout -- .` or `git restore .` to discard implementation work.
-Only discard files you are CERTAIN are temporary artifacts (e.g., `.DS_Store`).
+
+**3. If working tree is already clean, skip.**
+
+**4. VERIFY:**
+```bash
+git status
+```
+Must show "nothing to commit, working tree clean".
+
+**5. Verify you have commits:**
+```bash
+git log origin/main..HEAD --oneline
+```
+If you made changes during implementation, this MUST show at least 1 commit.
+
+**Exit criteria:** All changes committed. Working tree clean."""
+
+[[steps]]
+id = "cleanup-workspace"
+title = "Clean up workspace"
+needs = ["commit-changes"]
+description = """
+Ensure workspace is pristine before handoff.
+
+**IMPORTANT: Do NOT run `git push`. That is `gt done`'s job (next step).**
+**IMPORTANT: Do NOT discard implementation changes. They must already be committed.**
+
+**1. Check for untracked files:**
+```bash
+git status --porcelain
+```
+Should be empty. If not:
+- Add to .gitignore if appropriate
+- Remove if temporary: `rm <file>`
+- Commit if needed: `git add <file> && git commit -m "chore: add <file>"`
 
 **2. Check stash:**
 ```bash
 git stash list
 ```
 Should be empty. If not:
-```bash
-git stash pop && git add -A && git commit -m "chore: unstash work ({{issue}})"
-```
+- Pop and commit: `git stash pop && git add -A && git commit -m "chore: unstash work ({{issue}})"`
+- Or drop if truly garbage: `git stash drop`
 
-**3. Push your branch:**
+**3. Verify clean state and commits:**
 ```bash
-git push -u origin $(git branch --show-current)
-```
-
-**4. Verify commits exist:**
-```bash
-git log origin/main..HEAD   # MUST show at least 1 commit if you made changes
-git status                  # Must be clean
+git status                  # Must show "working tree clean"
+git stash list              # Must be empty
+git log origin/main..HEAD   # Your commits (should show your work)
 ```
 
 If `git log origin/main..HEAD` shows nothing but you DID make changes,
 something went wrong. Do NOT proceed — mail Witness for help.
 
-**Exit criteria:** All work committed, branch pushed, at least 1 commit ahead of main (if changes were made)."""
+**Exit criteria:** Workspace clean, no cruft, all work committed. Do NOT push — `gt done` handles that."""
 
 [[steps]]
 id = "prepare-for-review"

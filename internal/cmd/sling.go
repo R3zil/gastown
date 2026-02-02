@@ -98,6 +98,7 @@ var (
 	slingAgent    string // --agent: override runtime agent for this sling/spawn
 	slingNoConvoy bool   // --no-convoy: skip auto-convoy creation
 	slingNoMerge  bool   // --no-merge: skip merge queue on completion (for upstream PRs/human review)
+	slingNoBoot   bool   // --no-boot: skip waking witness+refinery after dispatch (G11)
 )
 
 func init() {
@@ -116,6 +117,7 @@ func init() {
 	slingCmd.Flags().BoolVar(&slingNoConvoy, "no-convoy", false, "Skip auto-convoy creation for single-issue sling")
 	slingCmd.Flags().BoolVar(&slingHookRawBead, "hook-raw-bead", false, "Hook raw bead without default formula (expert mode)")
 	slingCmd.Flags().BoolVar(&slingNoMerge, "no-merge", false, "Skip merge queue on completion (keep work on feature branch for review)")
+	slingCmd.Flags().BoolVar(&slingNoBoot, "no-boot", false, "Skip waking witness+refinery after polecat dispatch (avoids dolt lock contention)")
 
 	rootCmd.AddCommand(slingCmd)
 }
@@ -265,8 +267,10 @@ func runSling(cmd *cobra.Command, args []string) error {
 				hookWorkDir = spawnInfo.ClonePath // Run bd commands from polecat's worktree
 				hookSetAtomically = true          // Hook was set during spawn (GH #gt-mzyk5)
 
-				// Wake witness and refinery to monitor the new polecat
-				wakeRigAgents(rigName)
+				// Wake witness and refinery to monitor the new polecat (G11: skip if --no-boot)
+				if !slingNoBoot {
+					wakeRigAgents(rigName)
+				}
 			}
 		} else {
 			// Slinging to an existing agent
@@ -297,8 +301,10 @@ func runSling(cmd *cobra.Command, args []string) error {
 						hookWorkDir = spawnInfo.ClonePath
 						hookSetAtomically = true // Hook was set during spawn (GH #gt-mzyk5)
 
-						// Wake witness and refinery to monitor the new polecat
-						wakeRigAgents(rigName)
+						// Wake witness and refinery to monitor the new polecat (G11: skip if --no-boot)
+						if !slingNoBoot {
+							wakeRigAgents(rigName)
+						}
 					} else {
 						return fmt.Errorf("resolving target: %w", err)
 					}

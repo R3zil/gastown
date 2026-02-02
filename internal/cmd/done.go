@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -296,10 +297,23 @@ func runDone(cmd *cobra.Command, args []string) error {
 			// would ever close the issue.
 			if issueID != "" {
 				bd := beads.New(beads.ResolveBeadsDir(cwd))
-				if err := bd.CloseWithReason("Completed with no code changes (already fixed or pushed directly to main)", issueID); err != nil {
-					style.PrintWarning("could not close issue %s: %v (issue may be left HOOKED)", issueID, err)
-				} else {
-					fmt.Printf("%s Issue %s closed (no MR needed)\n", style.Bold.Render("✓"), issueID)
+				closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
+				// G15+A2: Retry bd close with backoff to handle dolt lock contention
+				// from concurrently running agents (witness/refinery spawned by G11).
+				var closeErr error
+				for attempt := 1; attempt <= 3; attempt++ {
+					closeErr = bd.CloseWithReason(closeReason, issueID)
+					if closeErr == nil {
+						fmt.Printf("%s Issue %s closed (no MR needed)\n", style.Bold.Render("✓"), issueID)
+						break
+					}
+					if attempt < 3 {
+						style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
+						time.Sleep(time.Duration(attempt*2) * time.Second)
+					}
+				}
+				if closeErr != nil {
+					style.PrintWarning("could not close issue %s after 3 attempts: %v (issue may be left HOOKED)", issueID, closeErr)
 				}
 			}
 
