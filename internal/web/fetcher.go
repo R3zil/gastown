@@ -90,7 +90,7 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 // FetchConvoys fetches all open convoys with their activity data.
 func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 	// List all open convoy-type issues
-	stdout, err := runBdCmd(f.townBeads, "list", "--type=convoy", "--status=open", "--json")
+	stdout, err := runBdCmd(f.townRoot, "list", "--type=convoy", "--status=open", "--json")
 	if err != nil {
 		return nil, fmt.Errorf("listing convoys: %w", err)
 	}
@@ -203,7 +203,7 @@ type trackedIssueInfo struct {
 // getTrackedIssues fetches tracked issues for a convoy.
 func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) []trackedIssueInfo {
 	// Query tracked dependencies using bd dep list
-	stdout, err := runBdCmd(f.townBeads, "dep", "list", convoyID, "-t", "tracks", "--json")
+	stdout, err := runBdCmd(f.townRoot, "dep", "list", convoyID, "-t", "tracks", "--json")
 	if err != nil {
 		return nil
 	}
@@ -768,7 +768,7 @@ func (f *LiveConvoyFetcher) getAssignedIssuesMap() map[string]assignedIssue {
 	result := make(map[string]assignedIssue)
 
 	// Query all in_progress issues (these are the ones being worked on)
-	stdout, err := runBdCmd(f.townBeads, "list", "--status=in_progress", "--json")
+	stdout, err := runBdCmd(f.townRoot, "list", "--status=in_progress", "--json")
 	if err != nil {
 		return result // Return empty map on error
 	}
@@ -906,7 +906,7 @@ func parseActivityTimestamp(s string) (int64, bool) {
 // FetchMail fetches recent mail messages from the beads database.
 func (f *LiveConvoyFetcher) FetchMail() ([]MailRow, error) {
 	// List all message-type issues (mail)
-	stdout, err := runBdCmd(f.townBeads, "list", "--type=message", "--json", "--limit=50")
+	stdout, err := runBdCmd(f.townRoot, "list", "--type=message", "--json", "--limit=50")
 	if err != nil {
 		return nil, fmt.Errorf("listing mail: %w", err)
 	}
@@ -1147,7 +1147,7 @@ func (f *LiveConvoyFetcher) FetchDogs() ([]DogRow, error) {
 // FetchEscalations returns open escalations needing attention.
 func (f *LiveConvoyFetcher) FetchEscalations() ([]EscalationRow, error) {
 	// List open escalations
-	stdout, err := runBdCmd(f.townBeads, "list", "--label=gt:escalation", "--status=open", "--json")
+	stdout, err := runBdCmd(f.townRoot, "list", "--label=gt:escalation", "--status=open", "--json")
 	if err != nil {
 		return nil, nil // No escalations or bd not available
 	}
@@ -1251,7 +1251,7 @@ func (f *LiveConvoyFetcher) FetchHealth() (*HealthRow, error) {
 // FetchQueues returns work queues and their status.
 func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 	// List queue-type beads
-	stdout, err := runBdCmd(f.townBeads, "list", "--type=queue", "--json")
+	stdout, err := runBdCmd(f.townRoot, "list", "--type=queue", "--json")
 	if err != nil {
 		return nil, nil // No queues or bd not available
 	}
@@ -1385,7 +1385,7 @@ func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 // FetchHooks returns all hooked beads (work pinned to agents).
 func (f *LiveConvoyFetcher) FetchHooks() ([]HookRow, error) {
 	// Query all beads with status=hooked
-	stdout, err := runBdCmd(f.townBeads, "list", "--status=hooked", "--json", "--limit=0")
+	stdout, err := runBdCmd(f.townRoot, "list", "--status=hooked", "--json", "--limit=0")
 	if err != nil {
 		return nil, nil // No hooked beads or bd not available
 	}
@@ -1479,13 +1479,9 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 
 // FetchIssues returns open issues (the backlog).
 func (f *LiveConvoyFetcher) FetchIssues() ([]IssueRow, error) {
-	// Query open issues (excluding internal types like messages, convoys, queues)
-	stdout, err := runBdCmd(f.townBeads, "list", "--status=open", "--json", "--limit=50")
-	if err != nil {
-		return nil, nil // No issues or bd not available
-	}
-
-	var beads []struct {
+	// Query both open AND hooked issues for the Work panel
+	// Open = ready to assign, Hooked = in progress
+	var allBeads []struct {
 		ID        string   `json:"id"`
 		Title     string   `json:"title"`
 		Type      string   `json:"type"`
@@ -1493,9 +1489,38 @@ func (f *LiveConvoyFetcher) FetchIssues() ([]IssueRow, error) {
 		Labels    []string `json:"labels"`
 		CreatedAt string   `json:"created_at"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &beads); err != nil {
-		return nil, fmt.Errorf("parsing issues: %w", err)
+
+	// Fetch open issues
+	if stdout, err := runBdCmd(f.townRoot, "list", "--status=open", "--json", "--limit=50"); err == nil {
+		var openBeads []struct {
+			ID        string   `json:"id"`
+			Title     string   `json:"title"`
+			Type      string   `json:"type"`
+			Priority  int      `json:"priority"`
+			Labels    []string `json:"labels"`
+			CreatedAt string   `json:"created_at"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &openBeads); err == nil {
+			allBeads = append(allBeads, openBeads...)
+		}
 	}
+
+	// Fetch hooked issues (in progress)
+	if stdout, err := runBdCmd(f.townRoot, "list", "--status=hooked", "--json", "--limit=50"); err == nil {
+		var hookedBeads []struct {
+			ID        string   `json:"id"`
+			Title     string   `json:"title"`
+			Type      string   `json:"type"`
+			Priority  int      `json:"priority"`
+			Labels    []string `json:"labels"`
+			CreatedAt string   `json:"created_at"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &hookedBeads); err == nil {
+			allBeads = append(allBeads, hookedBeads...)
+		}
+	}
+
+	beads := allBeads
 
 	var rows []IssueRow
 	for _, bead := range beads {
