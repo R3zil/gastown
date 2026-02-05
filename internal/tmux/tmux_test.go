@@ -831,15 +831,20 @@ func TestSessionSet(t *testing.T) {
 }
 
 func TestCleanupOrphanedSessions(t *testing.T) {
+	// CRITICAL SAFETY: This test calls CleanupOrphanedSessions() which kills ALL
+	// gt-*/hq-* sessions that appear orphaned. This is EXTREMELY DANGEROUS in any
+	// environment with running agents. Require explicit opt-in via environment variable.
+	if os.Getenv("GT_TEST_ALLOW_CLEANUP_TEST") != "1" {
+		t.Skip("Skipping: GT_TEST_ALLOW_CLEANUP_TEST=1 required (this test kills sessions)")
+	}
+
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
 
 	tm := NewTmux()
 
-	// SAFETY: Skip if production GT sessions exist to avoid killing real agents.
-	// This test calls CleanupOrphanedSessions() which kills ALL gt-*/hq-* sessions
-	// that appear orphaned. In a dev environment with running agents, this is destructive.
+	// Additional safety check: Skip if production GT sessions exist.
 	sessions, _ := tm.ListSessions()
 	for _, sess := range sessions {
 		if (strings.HasPrefix(sess, "gt-") || strings.HasPrefix(sess, "hq-")) &&
@@ -919,13 +924,19 @@ func TestCleanupOrphanedSessions(t *testing.T) {
 }
 
 func TestCleanupOrphanedSessions_NoSessions(t *testing.T) {
+	// CRITICAL SAFETY: This test calls CleanupOrphanedSessions() which kills ALL
+	// gt-*/hq-* sessions that appear orphaned. Require explicit opt-in.
+	if os.Getenv("GT_TEST_ALLOW_CLEANUP_TEST") != "1" {
+		t.Skip("Skipping: GT_TEST_ALLOW_CLEANUP_TEST=1 required (this test kills sessions)")
+	}
+
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
 
 	tm := NewTmux()
 
-	// SAFETY: Skip if production GT sessions exist to avoid killing real agents.
+	// Additional safety check: Skip if production GT sessions exist.
 	sessions, _ := tm.ListSessions()
 	for _, sess := range sessions {
 		if strings.HasPrefix(sess, "gt-") || strings.HasPrefix(sess, "hq-") {
