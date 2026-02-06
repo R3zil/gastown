@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -87,7 +86,10 @@ func TestSyncTargetUpdatesExisting(t *testing.T) {
 			},
 		},
 	}
-	data, _ := json.MarshalIndent(existing, "", "  ")
+	data, marshalErr := hooks.MarshalSettings(&existing)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
 	if err := os.WriteFile(targetPath, data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +150,10 @@ func TestSyncTargetUnchanged(t *testing.T) {
 			},
 		},
 	}
-	data, _ := json.MarshalIndent(existing, "", "  ")
+	data, marshalErr := hooks.MarshalSettings(&existing)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
 	if err := os.WriteFile(targetPath, data, 0644); err != nil {
 		t.Fatal(err)
 	}
