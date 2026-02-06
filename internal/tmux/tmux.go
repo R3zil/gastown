@@ -1318,7 +1318,7 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
 
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
-	format := "#{session_name}|#{session_windows}|#{session_created_string}|#{session_attached}|#{session_activity}|#{session_last_attached}"
+	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"
 	out, err := t.run("list-sessions", "-F", format, "-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
 	if err != nil {
 		return nil, err
@@ -1335,10 +1335,17 @@ func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	windows := 0
 	_, _ = fmt.Sscanf(parts[1], "%d", &windows) // non-fatal: defaults to 0 on parse error
 
+	// Convert unix timestamp to formatted string for consumers.
+	created := parts[2]
+	var createdUnix int64
+	if _, err := fmt.Sscanf(created, "%d", &createdUnix); err == nil && createdUnix > 0 {
+		created = time.Unix(createdUnix, 0).Format("2006-01-02 15:04:05")
+	}
+
 	info := &SessionInfo{
 		Name:     parts[0],
 		Windows:  windows,
-		Created:  parts[2],
+		Created:  created,
 		Attached: parts[3] == "1",
 	}
 

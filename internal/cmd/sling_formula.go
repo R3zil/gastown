@@ -155,10 +155,7 @@ func runSlingFormula(args []string) error {
 				targetPane = spawnInfo.Pane
 				formulaWorkDir = spawnInfo.ClonePath // Route bd commands to rig beads
 
-				// Wake witness and refinery to monitor the new polecat (G11: skip if --no-boot)
-				if !slingNoBoot {
-					wakeRigAgents(rigName)
-				}
+				wakeRigAgents(rigName)
 			}
 		} else {
 			// Slinging to an existing agent
