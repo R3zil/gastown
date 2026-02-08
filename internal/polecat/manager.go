@@ -1020,6 +1020,9 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 		// Hard fail — clean up the new worktree since we can't track this polecat
 		_ = repoGit.WorktreeRemove(newClonePath, true)
 		_ = os.RemoveAll(newClonePath)
+		// Remove polecatDir to prevent limbo state where m.exists(name) returns true
+		// but no valid worktree exists. Matches AddWithOptions cleanupOnError behavior.
+		_ = os.RemoveAll(polecatDir)
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
 	}
 
