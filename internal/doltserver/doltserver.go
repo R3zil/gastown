@@ -27,6 +27,7 @@
 package doltserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -793,8 +794,13 @@ func findRigBeadsDir(townRoot, rigName string) string {
 func GetActiveConnectionCount(townRoot string) (int, error) {
 	config := DefaultConfig(townRoot)
 
-	// Use dolt sql-client to query the server
-	cmd := exec.Command("dolt",
+	// Use dolt sql-client to query the server with a timeout to prevent
+	// hanging indefinitely if the Dolt server is unresponsive.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx,
+		"dolt",
 		"sql",
 		"--host", "127.0.0.1",
 		"--port", strconv.Itoa(config.Port),
