@@ -675,25 +675,51 @@ func runImmediateShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) er
 	return nil
 }
 
-// killSessionsInOrder stops sessions in the correct order:
-// 1. Deacon first (so it doesn't restart others)
-// 2. Everything except Mayor
-// 3. Mayor last
+// killSessionsInOrder stops sessions in the correct shutdown order, matching gt down:
+//  1. Polecats and crew (workers - stop before monitors can restart them)
+//  2. Refineries (work processors)
+//  3. Witnesses (monitors - stop before deacon so they can't restart workers)
+//  4. Town sessions: Mayor, Boot, Deacon
+//     Boot monitors Deacon, so must be stopped before Deacon.
+//
 // mayorSession and deaconSession are the dynamic session names for the current town.
 //
 // Returns the count of sessions that were successfully stopped (verified by checking
 // if the session no longer exists after the kill attempt).
 func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSession string) int {
 	stopped := 0
+	bootSession := session.BootSessionName()
 
-	// Helper to check if session is in our list
-	inList := func(sess string) bool {
-		for _, s := range sessions {
-			if s == sess {
-				return true
-			}
+	// Build a set for O(1) lookup of town-level sessions
+	sessionSet := make(map[string]bool, len(sessions))
+	for _, s := range sessions {
+		sessionSet[s] = true
+	}
+
+	// Categorize sessions by type for ordered shutdown.
+	var polecats, refineries, witnesses []string
+	for _, sess := range sessions {
+		// Skip town-level sessions (handled explicitly below)
+		if sess == mayorSession || sess == deaconSession || sess == bootSession {
+			continue
 		}
-		return false
+
+		// Categorize by role (third component of gt-<rig>-<role> pattern)
+		parts := strings.Split(sess, "-")
+		if len(parts) >= 3 {
+			switch parts[2] {
+			case "witness":
+				witnesses = append(witnesses, sess)
+			case "refinery":
+				refineries = append(refineries, sess)
+			default:
+				// Polecats, crew, and any other rig-level sessions
+				polecats = append(polecats, sess)
+			}
+		} else {
+			// Unknown pattern, treat as worker (stop early)
+			polecats = append(polecats, sess)
+		}
 	}
 
 	// Helper to kill a session and verify it was stopped
@@ -718,26 +744,40 @@ func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSe
 		return false
 	}
 
-	// 1. Stop Deacon first
-	if inList(deaconSession) {
-		if killAndVerify(deaconSession) {
-			stopped++
-		}
-	}
-
-	// 2. Stop others (except Mayor)
-	for _, sess := range sessions {
-		if sess == deaconSession || sess == mayorSession {
-			continue
-		}
+	// 1. Stop polecats and crew first (workers)
+	for _, sess := range polecats {
 		if killAndVerify(sess) {
 			stopped++
 		}
 	}
 
-	// 3. Stop Mayor last
-	if inList(mayorSession) {
+	// 2. Stop refineries (work processors)
+	for _, sess := range refineries {
+		if killAndVerify(sess) {
+			stopped++
+		}
+	}
+
+	// 3. Stop witnesses (monitors)
+	for _, sess := range witnesses {
+		if killAndVerify(sess) {
+			stopped++
+		}
+	}
+
+	// 4. Stop town sessions: Mayor, Boot, Deacon (matching TownSessions() order)
+	if sessionSet[mayorSession] {
 		if killAndVerify(mayorSession) {
+			stopped++
+		}
+	}
+	if sessionSet[bootSession] {
+		if killAndVerify(bootSession) {
+			stopped++
+		}
+	}
+	if sessionSet[deaconSession] {
+		if killAndVerify(deaconSession) {
 			stopped++
 		}
 	}
