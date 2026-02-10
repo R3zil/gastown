@@ -795,6 +795,28 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	return info, nil
 }
 
+// getAgentHookBead re-reads the hook_bead for an agent bead from the database.
+// Used for TOCTOU re-verification before taking destructive action on agents.
+// Returns empty string on error or if no hook_bead is set.
+func (d *Daemon) getAgentHookBead(agentBeadID string) string {
+	cmd := exec.Command(d.bdPath, "show", agentBeadID, "--json")
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = os.Environ()
+
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	var issues []struct {
+		HookBead string `json:"hook_bead"`
+	}
+	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
+		return ""
+	}
+	return issues[0].HookBead
+}
+
 // identityToAgentBeadID maps a daemon identity to an agent bead ID.
 // Uses parseIdentity to extract components, then uses beads package helpers.
 func (d *Daemon) identityToAgentBeadID(identity string) string {
@@ -1022,11 +1044,22 @@ func (d *Daemon) checkRigOrphanedWork(rigName string) {
 			continue
 		}
 
+		// TOCTOU guard: re-verify agent state before taking action.
+		// Between the bd list above and now, the agent may have been
+		// restarted or its hook_bead cleared. Re-check both conditions.
+		if d.tmux.IsAgentAlive(sessionName) {
+			continue
+		}
+		currentHookBead := d.getAgentHookBead(agent.ID)
+		if currentHookBead == "" {
+			continue
+		}
+
 		// Session dead but has hooked work = orphaned!
 		d.logger.Printf("Orphaned work detected: agent %s session is dead but has hook_bead=%s",
-			agent.ID, agent.HookBead)
+			agent.ID, currentHookBead)
 
-		d.notifyWitnessOfOrphanedWork(rigName, agent.ID, agent.HookBead)
+		d.notifyWitnessOfOrphanedWork(rigName, agent.ID, currentHookBead)
 	}
 }
 
