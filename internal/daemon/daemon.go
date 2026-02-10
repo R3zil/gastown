@@ -1470,8 +1470,8 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 	// TOCTOU guard: re-verify session is still dead before restarting.
 	// Between the initial check and now, the session may have been restarted
 	// by another heartbeat cycle, witness, or the polecat itself.
-	sessionStillDead, err := d.tmux.HasSession(sessionName)
-	if err == nil && sessionStillDead {
+	sessionRevived, err := d.tmux.HasSession(sessionName)
+	if err == nil && sessionRevived {
 		return // Session came back - no restart needed
 	}
 
