@@ -9,6 +9,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/claude"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/copilot"
 	"github.com/steveyegge/gastown/internal/opencode"
 	"github.com/steveyegge/gastown/internal/templates/commands"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -45,6 +46,12 @@ func EnsureSettingsForRole(settingsDir, workDir, role string, rc *config.Runtime
 		// OpenCode plugins stay in workDir — OpenCode has no --settings equivalent
 		// for path redirection, so it discovers plugins from the working directory.
 		if err := opencode.EnsurePluginAt(workDir, rc.Hooks.Dir, rc.Hooks.SettingsFile); err != nil {
+			return err
+		}
+	case "copilot":
+		// Copilot custom instructions stay in workDir — Copilot has no --settings equivalent
+		// for path redirection, so it discovers instructions from the working directory.
+		if err := copilot.EnsureSettingsAt(workDir, rc.Hooks.Dir, rc.Hooks.SettingsFile); err != nil {
 			return err
 		}
 	}
@@ -87,7 +94,7 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
 	if rc == nil {
 		rc = config.DefaultRuntimeConfig()
 	}
-	if rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none" {
+	if rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none" && !rc.Hooks.Informational {
 		return nil
 	}
 
@@ -169,7 +176,7 @@ func GetStartupFallbackInfo(rc *config.RuntimeConfig) *StartupFallbackInfo {
 		rc = config.DefaultRuntimeConfig()
 	}
 
-	hasHooks := rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none"
+	hasHooks := rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none" && !rc.Hooks.Informational
 	hasPrompt := rc.PromptMode != "none"
 
 	info := &StartupFallbackInfo{}

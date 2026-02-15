@@ -47,7 +47,7 @@ type TownSettings struct {
 	CLITheme string `json:"cli_theme,omitempty"`
 
 	// DefaultAgent is the name of the agent preset to use by default.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent name defined in settings/agents.json.
 	// Default: "claude"
 	DefaultAgent string `json:"default_agent,omitempty"`
@@ -328,7 +328,7 @@ type RigSettings struct {
 	Runtime    *RuntimeConfig    `json:"runtime,omitempty"`     // LLM runtime settings (deprecated: use Agent)
 
 	// Agent selects which agent preset to use for this rig.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent defined in settings/agents.json.
 	// If empty, uses the town's default_agent setting.
 	// Takes precedence over Runtime if both are set.
@@ -419,7 +419,7 @@ type RuntimeSessionConfig struct {
 
 // RuntimeHooksConfig configures runtime hook installation.
 type RuntimeHooksConfig struct {
-	// Provider controls which hook templates to install: "claude", "opencode", or "none".
+	// Provider controls which hook templates to install: "claude", "opencode", "copilot", or "none".
 	Provider string `json:"provider,omitempty"`
 
 	// Dir is the settings directory (e.g., ".claude").
@@ -427,6 +427,12 @@ type RuntimeHooksConfig struct {
 
 	// SettingsFile is the settings file name (e.g., "settings.json").
 	SettingsFile string `json:"settings_file,omitempty"`
+
+	// Informational indicates the hooks provider installs instructions files only,
+	// not executable lifecycle hooks. When true, Gas Town sends startup fallback
+	// commands (gt prime) via nudge since hooks won't run automatically.
+	// Defaults to false (backwards compatible with claude/opencode which have real hooks).
+	Informational bool `json:"informational,omitempty"`
 }
 
 // RuntimeTmuxConfig controls tmux heuristics for detecting runtime readiness.
@@ -583,6 +589,13 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 		rc.Hooks.SettingsFile = defaultHooksFile(rc.Provider)
 	}
 
+	// Set informational flag for providers whose "hooks" are instructions files,
+	// not executable lifecycle hooks. This tells startup fallback logic to send
+	// gt prime via nudge since hooks won't run automatically.
+	if !rc.Hooks.Informational {
+		rc.Hooks.Informational = defaultHooksInformational(rc.Provider)
+	}
+
 	if rc.Tmux == nil {
 		rc.Tmux = &RuntimeTmuxConfig{}
 	}
@@ -616,6 +629,8 @@ func defaultRuntimeCommand(provider string) string {
 		return "codex"
 	case "opencode":
 		return "opencode"
+	case "copilot":
+		return "copilot"
 	case "generic":
 		return ""
 	default:
@@ -652,6 +667,8 @@ func defaultRuntimeArgs(provider string) []string {
 	switch provider {
 	case "claude":
 		return []string{"--dangerously-skip-permissions"}
+	case "copilot":
+		return []string{"--yolo"}
 	default:
 		return nil
 	}
@@ -663,6 +680,8 @@ func defaultPromptMode(provider string) string {
 		return "none"
 	case "opencode":
 		return "none"
+	case "copilot":
+		return "arg"
 	default:
 		return "arg"
 	}
@@ -688,6 +707,8 @@ func defaultHooksProvider(provider string) string {
 		return "claude"
 	case "opencode":
 		return "opencode"
+	case "copilot":
+		return "copilot"
 	default:
 		return "none"
 	}
@@ -699,6 +720,8 @@ func defaultHooksDir(provider string) string {
 		return ".claude"
 	case "opencode":
 		return ".opencode/plugin"
+	case "copilot":
+		return ".copilot"
 	default:
 		return ""
 	}
@@ -712,9 +735,18 @@ func defaultHooksFile(provider string) string {
 		return "settings.json"
 	case "opencode":
 		return "gastown.js"
+	case "copilot":
+		return "copilot-instructions.md"
 	default:
 		return ""
 	}
+}
+
+// defaultHooksInformational returns true for providers whose hooks are instructions
+// files only (not executable lifecycle hooks). For these providers, Gas Town sends
+// startup fallback commands (gt prime) via nudge since hooks won't auto-run.
+func defaultHooksInformational(provider string) bool {
+	return provider == "copilot"
 }
 
 func defaultProcessNames(provider, command string) []string {
@@ -726,6 +758,11 @@ func defaultProcessNames(provider, command string) []string {
 		// tmux pane_current_command may show "node" or "opencode" depending on how invoked.
 		return []string{"opencode", "node"}
 	}
+	if provider == "copilot" {
+		// Copilot CLI reports as "copilot" in tmux pane_current_command
+		// despite being a Node.js application.
+		return []string{"copilot"}
+	}
 	if command != "" {
 		return []string{filepath.Base(command)}
 	}
@@ -735,6 +772,10 @@ func defaultProcessNames(provider, command string) []string {
 func defaultReadyPromptPrefix(provider string) string {
 	if provider == "claude" {
 		// Claude Code uses ❯ (U+276F) as the prompt character
+		return "❯ "
+	}
+	if provider == "copilot" {
+		// Copilot CLI also uses ❯ (U+276F) as the prompt character
 		return "❯ "
 	}
 	return ""
@@ -753,17 +794,20 @@ func defaultReadyDelayMs(provider string) int {
 		// 8000ms provides reliable startup detection across models.
 		return 8000
 	}
+	if provider == "copilot" {
+		// Copilot has prompt prefix detection via ❯ but needs a fallback delay
+		// for startup commands (gt prime) since it doesn't have executable hooks.
+		return 5000
+	}
 	return 0
 }
 
 func defaultInstructionsFile(provider string) string {
-	if provider == "codex" {
-		return "AGENTS.md"
+	// Claude uses CLAUDE.md; all other agents use AGENTS.md.
+	if provider == "claude" {
+		return "CLAUDE.md"
 	}
-	if provider == "opencode" {
-		return "AGENTS.md"
-	}
-	return "CLAUDE.md"
+	return "AGENTS.md"
 }
 
 // quoteForShell quotes a string for safe shell usage.
