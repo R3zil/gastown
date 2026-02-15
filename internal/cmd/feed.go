@@ -154,6 +154,13 @@ func buildFeedArgs() []string {
 		shouldFollow = true
 	}
 
+	// Auto-disable follow when stdout is not a TTY (e.g. agents, pipes),
+	// unless the user explicitly passed --follow. This prevents agents
+	// from blocking on a streaming feed that never terminates.
+	if !term.IsTerminal(int(os.Stdout.Fd())) && !feedFollow {
+		shouldFollow = false
+	}
+
 	if shouldFollow {
 		args = append(args, "--follow")
 	}
