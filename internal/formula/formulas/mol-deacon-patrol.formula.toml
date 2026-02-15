@@ -77,6 +77,27 @@ gt mail archive <message-id>
 Dogs return to idle automatically. The report is informational - no action needed
 unless the dog reports errors that require escalation.
 
+**RECOVERED_BEAD messages** (from Witness):
+When a Witness detects a dead polecat with abandoned work, it resets the bead
+to open status and sends a RECOVERED_BEAD mail. The Deacon auto re-dispatches:
+Subject format: `RECOVERED_BEAD <bead-id>`
+```bash
+# For each RECOVERED_BEAD message:
+gt mail read <id>
+# Extract bead ID from subject
+gt deacon redispatch <bead-id>
+gt mail archive <message-id>
+```
+
+The `redispatch` command handles:
+- Rate-limiting (5-minute cooldown between re-dispatches of same bead)
+- Failure tracking (after 3 failures, escalates to Mayor instead of re-slinging)
+- Auto-detection of target rig from bead prefix
+- Skipping beads that were already claimed by another polecat
+
+Exit codes: 0=dispatched, 2=cooldown, 3=skipped. Non-zero non-error codes are
+informational - archive the message regardless.
+
 Callbacks may spawn new polecats, update issue state, or trigger other actions.
 
 **Hygiene principle**: Archive messages after they're fully processed.
