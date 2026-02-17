@@ -13,6 +13,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/suggest"
@@ -516,6 +517,17 @@ func runSessionRestart(cmd *cobra.Command, args []string) error {
 		if err := polecatMgr.Stop(polecatName, sessionForce); err != nil {
 			return fmt.Errorf("stopping session: %w", err)
 		}
+
+		// Wait for session to fully terminate before starting a new one.
+		// Without this, Start may fail or create a duplicate if the old
+		// session hasn't been cleaned up by tmux yet.
+		for i := 0; i < 10; i++ {
+			still, _ := polecatMgr.IsRunning(polecatName)
+			if !still {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 
 	// Start fresh session
@@ -653,7 +665,7 @@ func runSessionCheck(cmd *cobra.Command, args []string) error {
 				continue
 			}
 			polecatName := entry.Name()
-			sessionName := fmt.Sprintf("gt-%s-%s", r.Name, polecatName)
+			sessionName := session.PolecatSessionName(session.PrefixFor(r.Name), polecatName)
 			totalChecked++
 
 			// Check if session exists

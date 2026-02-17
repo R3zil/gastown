@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,13 +30,15 @@ var (
 	// Reject flags
 	mqRejectReason string
 	mqRejectNotify bool
+	mqRejectStdin  bool // Read reason from stdin
 
 	// List command flags
-	mqListReady  bool
-	mqListStatus string
-	mqListWorker string
-	mqListEpic   string
-	mqListJSON   bool
+	mqListReady   bool
+	mqListStatus  string
+	mqListWorker  string
+	mqListEpic    string
+	mqListJSON    bool
+	mqListVerify  bool
 
 	// Status command flags
 	mqStatusJSON bool
@@ -49,7 +52,9 @@ var (
 	mqIntegrationStatusJSON bool
 
 	// Integration create flags
-	mqIntegrationCreateBranch string
+	mqIntegrationCreateBranch     string
+	mqIntegrationCreateBaseBranch string
+	mqIntegrationCreateForce      bool
 )
 
 var mqCmd = &cobra.Command{
@@ -82,8 +87,8 @@ Auto-detection:
   - Priority: inherited from source issue
 
 Target branch auto-detection:
-  1. If --epic is specified: target integration/<epic>
-  2. If source issue has a parent epic with integration/<epic> branch: target it
+  1. If --epic is specified: target the integration branch for <epic> (using configured template)
+  2. If source issue has a parent epic with an integration branch: target it
   3. Otherwise: target main
 
 This ensures batch work on epics automatically flows to integration branches.
@@ -197,14 +202,18 @@ Creates a branch from main and pushes it to origin. Future MRs for this
 epic's children can target this branch.
 
 Branch naming:
-  Default: integration/<epic-id>
+  Default: integration/<sanitized-title> (e.g., integration/add-user-auth)
   Config:  Set merge_queue.integration_branch_template in rig settings
   Override: Use --branch flag for one-off customization
 
 Template variables:
+  {title}  - Sanitized epic title (e.g., "add-user-authentication")
   {epic}   - Full epic ID (e.g., "RA-123")
   {prefix} - Epic prefix before first hyphen (e.g., "RA")
   {user}   - Git user.name (e.g., "klauern")
+
+If two epics produce the same branch name, a numeric suffix from the
+epic ID is appended automatically (e.g., integration/add-auth-123).
 
 Actions:
   1. Verify epic exists
@@ -214,7 +223,7 @@ Actions:
 
 Examples:
   gt mq integration create gt-auth-epic
-  # Creates integration/gt-auth-epic (default)
+  # Creates integration/add-user-authentication (from epic title)
 
   gt mq integration create RA-123 --branch "klauern/PROJ-1234/{epic}"
   # Creates klauern/PROJ-1234/RA-123`,
@@ -286,11 +295,12 @@ func init() {
 	mqListCmd.Flags().StringVar(&mqListWorker, "worker", "", "Filter by worker name")
 	mqListCmd.Flags().StringVar(&mqListEpic, "epic", "", "Show MRs targeting integration/<epic>")
 	mqListCmd.Flags().BoolVar(&mqListJSON, "json", false, "Output as JSON")
+	mqListCmd.Flags().BoolVar(&mqListVerify, "verify", false, "Verify branches exist in git (shows MISSING for deleted branches)")
 
 	// Reject flags
-	mqRejectCmd.Flags().StringVarP(&mqRejectReason, "reason", "r", "", "Reason for rejection (required)")
+	mqRejectCmd.Flags().StringVarP(&mqRejectReason, "reason", "r", "", "Reason for rejection (required unless --stdin)")
 	mqRejectCmd.Flags().BoolVar(&mqRejectNotify, "notify", false, "Send mail notification to worker")
-	_ = mqRejectCmd.MarkFlagRequired("reason") // cobra flags: error only at runtime if missing
+	mqRejectCmd.Flags().BoolVar(&mqRejectStdin, "stdin", false, "Read reason from stdin (avoids shell quoting issues)")
 
 	// Status flags
 	mqStatusCmd.Flags().BoolVar(&mqStatusJSON, "json", false, "Output as JSON")
@@ -303,7 +313,9 @@ func init() {
 	mqCmd.AddCommand(mqStatusCmd)
 
 	// Integration branch subcommands
-	mqIntegrationCreateCmd.Flags().StringVar(&mqIntegrationCreateBranch, "branch", "", "Override branch name template (supports {epic}, {prefix}, {user})")
+	mqIntegrationCreateCmd.Flags().StringVar(&mqIntegrationCreateBranch, "branch", "", "Override branch name template (supports {title}, {epic}, {prefix}, {user})")
+	mqIntegrationCreateCmd.Flags().StringVar(&mqIntegrationCreateBaseBranch, "base-branch", "", "Create integration branch from this branch instead of main")
+	mqIntegrationCreateCmd.Flags().BoolVar(&mqIntegrationCreateForce, "force", false, "Recreate integration branch even if one already exists")
 	mqIntegrationCmd.AddCommand(mqIntegrationCreateCmd)
 
 	// Integration land flags
@@ -337,11 +349,19 @@ func findCurrentRig(townRoot string) (string, *rig.Rig, error) {
 
 	// The first component of the relative path should be the rig name
 	parts := strings.Split(relPath, string(filepath.Separator))
-	if len(parts) == 0 || parts[0] == "" || parts[0] == "." {
-		return "", nil, fmt.Errorf("not inside a rig directory")
+	rigName := ""
+	if len(parts) > 0 && parts[0] != "" && parts[0] != "." {
+		rigName = parts[0]
 	}
 
-	rigName := parts[0]
+	// When gt is invoked via shell alias (cd ~/gt && gt), cwd is the town
+	// root and relPath is ".". Fall back to GT_RIG env var.
+	if rigName == "" {
+		rigName = os.Getenv("GT_RIG")
+	}
+	if rigName == "" {
+		return "", nil, fmt.Errorf("not inside a rig directory (and GT_RIG not set)")
+	}
 
 	// Load rig manager and get the rig
 	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
@@ -405,6 +425,23 @@ func runMQRetry(cmd *cobra.Command, args []string) error {
 }
 
 func runMQReject(cmd *cobra.Command, args []string) error {
+	// Handle --stdin: read reason from stdin (avoids shell quoting issues)
+	if mqRejectStdin {
+		if mqRejectReason != "" {
+			return fmt.Errorf("cannot use --stdin with --reason/-r")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+		mqRejectReason = strings.TrimRight(string(data), "\n")
+	}
+
+	// Require reason via --reason or --stdin
+	if mqRejectReason == "" {
+		return fmt.Errorf("required flag \"reason\" not set (use --reason/-r or --stdin)")
+	}
+
 	rigName := args[0]
 	mrIDOrBranch := args[1]
 

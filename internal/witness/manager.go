@@ -3,6 +3,7 @@ package witness
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,7 +47,7 @@ func (m *Manager) IsRunning() (bool, error) {
 
 // SessionName returns the tmux session name for this witness.
 func (m *Manager) SessionName() string {
-	return fmt.Sprintf("gt-%s-witness", m.rig.Name)
+	return session.WitnessSessionName(session.PrefixFor(m.rig.Name))
 }
 
 // Status returns information about the witness session.
@@ -116,13 +117,21 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	// Working directory
 	witnessDir := m.witnessDir()
 
-	// Ensure runtime settings exist in witness/ (not witness/rig/) so we don't
-	// write into the source repo. Claude walks up the tree to find settings.
-	witnessParentDir := filepath.Join(m.rig.Path, "witness")
+	// Ensure runtime settings exist in the shared witness parent directory.
+	// Settings are passed to Claude Code via --settings flag.
+	// ResolveRoleAgentConfig is internally serialized (resolveConfigMu in
+	// package config) to prevent concurrent rig starts from corrupting the
+	// global agent registry.
 	townRoot := m.townRoot()
 	runtimeConfig := config.ResolveRoleAgentConfig("witness", townRoot, m.rig.Path)
-	if err := runtime.EnsureSettingsForRole(witnessParentDir, "witness", runtimeConfig); err != nil {
+	witnessSettingsDir := config.RoleSettingsDir("witness", m.rig.Path)
+	if err := runtime.EnsureSettingsForRole(witnessSettingsDir, witnessDir, "witness", runtimeConfig); err != nil {
 		return fmt.Errorf("ensuring runtime settings: %w", err)
+	}
+
+	// Ensure .gitignore has required Gas Town patterns
+	if err := rig.EnsureGitignorePatterns(witnessDir); err != nil {
+		fmt.Printf("Warning: could not update witness .gitignore: %v\n", err)
 	}
 
 	roleConfig, err := m.roleConfig()
@@ -178,7 +187,14 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	}
 
 	// Accept bypass permissions warning dialog if it appears.
-	_ = t.AcceptBypassPermissionsWarning(sessionID)
+	if err := t.AcceptBypassPermissionsWarning(sessionID); err != nil {
+		log.Printf("warning: accepting bypass permissions for %s: %v", sessionID, err)
+	}
+
+	// Track PID for defense-in-depth orphan cleanup (non-fatal)
+	if err := session.TrackSessionPID(townRoot, sessionID, t); err != nil {
+		log.Printf("warning: tracking session PID for %s: %v", sessionID, err)
+	}
 
 	time.Sleep(constants.ShutdownNotifyDelay)
 
@@ -226,7 +242,7 @@ func buildWitnessStartCommand(rigPath, rigName, townRoot, agentOverride string, 
 		Recipient: fmt.Sprintf("%s/witness", rigName),
 		Sender:    "deacon",
 		Topic:     "patrol",
-	}, "I am Witness for "+rigName+". Start patrol: check gt hook, if empty create mol-witness-patrol wisp and execute it.")
+	}, "Run `gt prime --hook` and begin patrol.")
 	command, err := config.BuildAgentStartupCommandWithAgentOverride("witness", rigName, townRoot, rigPath, initialPrompt, agentOverride)
 	if err != nil {
 		return "", fmt.Errorf("building startup command: %w", err)

@@ -2,13 +2,19 @@ package cmd
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // runBatchSling handles slinging multiple beads to a rig.
@@ -18,6 +24,16 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	for _, beadID := range beadIDs {
 		if err := verifyBeadExists(beadID); err != nil {
 			return fmt.Errorf("bead '%s' not found", beadID)
+		}
+	}
+
+	// Cross-rig guard: check all beads match the target rig before spawning (gt-myecw)
+	if !slingForce {
+		townRoot := filepath.Dir(townBeadsDir)
+		for _, beadID := range beadIDs {
+			if err := checkCrossRigGuard(beadID, rigName+"/polecats/_", townRoot); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -31,6 +47,10 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	}
 
 	fmt.Printf("%s Batch slinging %d beads to rig '%s'...\n", style.Bold.Render("🎯"), len(beadIDs), rigName)
+
+	if slingMaxConcurrent > 0 {
+		fmt.Printf("  Max concurrent spawns: %d\n", slingMaxConcurrent)
+	}
 
 	// Issue #288: Auto-apply mol-polecat-work for batch sling
 	// Cook once before the loop for efficiency
@@ -46,9 +66,26 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		errMsg  string
 	}
 	results := make([]slingResult, 0, len(beadIDs))
+	activeCount := 0 // Track active spawns for --max-concurrent throttling
 
 	// Spawn a polecat for each bead and sling it
 	for i, beadID := range beadIDs {
+		// Admission control: throttle spawns when --max-concurrent is set
+		if slingMaxConcurrent > 0 && activeCount >= slingMaxConcurrent {
+			fmt.Printf("\n%s Max concurrent limit reached (%d), waiting for capacity...\n",
+				style.Warning.Render("⏳"), slingMaxConcurrent)
+			// Wait for sessions to settle before spawning more
+			for wait := 0; wait < 30; wait++ {
+				time.Sleep(2 * time.Second)
+				if wait >= 2 {
+					break
+				}
+			}
+			// Reset counter after cooldown — polecats become self-sufficient
+			// quickly, so we use time-based batching rather than precise counting
+			activeCount = 0
+		}
+
 		fmt.Printf("\n[%d/%d] Slinging %s...\n", i+1, len(beadIDs), beadID)
 
 		// Check bead status
@@ -59,21 +96,45 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			continue
 		}
 
-		if info.Status == "pinned" && !slingForce {
-			results = append(results, slingResult{beadID: beadID, success: false, errMsg: "already pinned"})
-			fmt.Printf("  %s Already pinned (use --force to re-sling)\n", style.Dim.Render("✗"))
+		if (info.Status == "pinned" || info.Status == "hooked") && !slingForce {
+			results = append(results, slingResult{beadID: beadID, success: false, errMsg: "already " + info.Status})
+			fmt.Printf("  %s Already %s (use --force to re-sling)\n", style.Dim.Render("✗"), info.Status)
 			continue
+		}
+
+		// Guard: burn existing molecules before applying new formula.
+		// Runs before polecat spawn to avoid wasted spawn/cleanup on rejected beads.
+		if formulaName != "" {
+			existingMolecules := collectExistingMolecules(info)
+			if len(existingMolecules) > 0 {
+				if slingForce {
+					fmt.Printf("  %s Burning %d stale molecule(s): %s\n",
+						style.Warning.Render("⚠"), len(existingMolecules), strings.Join(existingMolecules, ", "))
+					if err := burnExistingMolecules(existingMolecules, beadID, townRoot); err != nil {
+						fmt.Printf("  %s Skipping %s: burn failed: %v\n",
+							style.Dim.Render("✗"), beadID, err)
+						results = append(results, slingResult{beadID: beadID, success: false, errMsg: fmt.Sprintf("burn failed: %v", err)})
+						continue
+					}
+				} else {
+					fmt.Printf("  %s Skipping %s: has existing molecule(s) (use --force)\n",
+						style.Dim.Render("✗"), beadID)
+					results = append(results, slingResult{beadID: beadID, success: false, errMsg: "has existing molecule(s)"})
+					continue
+				}
+			}
 		}
 
 		// Spawn a fresh polecat
 		spawnOpts := SlingSpawnOptions{
-			Force:    slingForce,
-			Account:  slingAccount,
-			Create:   slingCreate,
-			HookBead: beadID, // Set atomically at spawn time
-			Agent:    slingAgent,
+			Force:      slingForce,
+			Account:    slingAccount,
+			Create:     slingCreate,
+			HookBead:   beadID, // Set atomically at spawn time
+			Agent:      slingAgent,
+			BaseBranch: slingBaseBranch,
 		}
-		spawnInfo, err := SpawnPolecatForSling(rigName, spawnOpts)
+		spawnInfo, err := spawnPolecatForSling(rigName, spawnOpts)
 		if err != nil {
 			results = append(results, slingResult{beadID: beadID, success: false, errMsg: err.Error()})
 			fmt.Printf("  %s Failed to spawn polecat: %v\n", style.Dim.Render("✗"), err)
@@ -87,7 +148,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		if !slingNoConvoy {
 			existingConvoy := isTrackedByConvoy(beadID)
 			if existingConvoy == "" {
-				convoyID, err := createAutoConvoy(beadID, info.Title)
+				convoyID, err := createAutoConvoy(beadID, info.Title, slingOwned, slingMerge)
 				if err != nil {
 					fmt.Printf("  %s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 				} else {
@@ -102,7 +163,7 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		// Cook once (lazy), then instantiate for each bead
 		if !formulaCooked {
 			workDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-			if err := CookFormula(formulaName, workDir); err != nil {
+			if err := CookFormula(formulaName, workDir, townRoot); err != nil {
 				fmt.Printf("  %s Could not cook formula %s: %v\n", style.Dim.Render("Warning:"), formulaName, err)
 				// Fall back to raw hook if formula cook fails
 			} else {
@@ -113,8 +174,17 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		beadToHook := beadID
 		attachedMoleculeID := ""
 		if formulaCooked {
-			result, err := InstantiateFormulaOnBead(formulaName, beadID, info.Title, hookWorkDir, townRoot, true, slingVars)
+			// Auto-inject rig command vars as defaults (user --var flags override)
+			rigCmdVars := loadRigCommandVars(townRoot, rigName)
+			// Build per-bead vars: rig defaults first, then user vars (higher priority)
+			batchVars := append(rigCmdVars, slingVars...)
+			if spawnInfo.BaseBranch != "" && spawnInfo.BaseBranch != "main" {
+				batchVars = append(batchVars, fmt.Sprintf("base_branch=%s", spawnInfo.BaseBranch))
+			}
+			result, err := InstantiateFormulaOnBead(formulaName, beadID, info.Title, hookWorkDir, townRoot, true, batchVars)
 			if err != nil {
+				// Best-effort: in batch mode, a formula instantiation failure should not abort or rollback the
+				// spawned polecat. We still hook the raw bead so work can proceed (e.g., missing required vars).
 				fmt.Printf("  %s Could not apply formula: %v (hooking raw bead)\n", style.Dim.Render("Warning:"), err)
 			} else {
 				fmt.Printf("  %s Formula %s applied\n", style.Bold.Render("✓"), formulaName)
@@ -123,13 +193,13 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			}
 		}
 
-		// Hook the bead (or wisp compound if formula was applied)
-		hookCmd := exec.Command("bd", "--no-daemon", "update", beadToHook, "--status=hooked", "--assignee="+targetAgent)
-		hookCmd.Dir = beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
-		hookCmd.Stderr = os.Stderr
-		if err := hookCmd.Run(); err != nil {
+		// Hook the bead (or wisp compound if formula was applied) with retry
+		hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
+		if err := hookBeadWithRetry(beadToHook, targetAgent, hookDir); err != nil {
 			results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: false, errMsg: "hook failed"})
 			fmt.Printf("  %s Failed to hook bead: %v\n", style.Dim.Render("✗"), err)
+			// Clean up orphaned polecat to avoid leaving spawned-but-unhookable polecats
+			cleanupSpawnedPolecat(spawnInfo, rigName)
 			continue
 		}
 
@@ -142,30 +212,56 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 		// Update agent bead state
 		updateAgentHookBead(targetAgent, beadToHook, hookWorkDir, townBeadsDir)
 
-		// Store attached molecule in the hooked bead
-		if attachedMoleculeID != "" {
-			if err := storeAttachedMoleculeInBead(beadToHook, attachedMoleculeID); err != nil {
-				fmt.Printf("  %s Could not store attached_molecule: %v\n", style.Dim.Render("Warning:"), err)
+		// Store all attachment fields in a single read-modify-write cycle.
+		// This eliminates the race condition where sequential independent updates
+		// could overwrite each other under concurrent access.
+		fieldUpdates := beadFieldUpdates{
+			Dispatcher:       actor,
+			Args:             slingArgs,
+			AttachedMolecule: attachedMoleculeID,
+			NoMerge:          slingNoMerge,
+		}
+		// Use beadToHook for the update target (may differ from beadID when formula-on-bead)
+		if err := storeFieldsInBead(beadToHook, fieldUpdates); err != nil {
+			fmt.Printf("  %s Could not store fields in bead: %v\n", style.Dim.Render("Warning:"), err)
+		}
+
+		// Create Dolt branch AFTER all sling writes are complete.
+		// CommitWorkingSet flushes working set to HEAD, then CreatePolecatBranch
+		// forks from HEAD — ensuring the polecat's branch includes all writes.
+		if spawnInfo.DoltBranch != "" {
+			if err := spawnInfo.CreateDoltBranch(); err != nil {
+				fmt.Printf("  %s Could not create Dolt branch: %v, cleaning up...\n", style.Dim.Render("✗"), err)
+				rollbackSlingArtifactsFn(spawnInfo, beadToHook, hookWorkDir)
+				results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: false})
+				continue
 			}
 		}
 
-		// Store args if provided
-		if slingArgs != "" {
-			if err := storeArgsInBead(beadID, slingArgs); err != nil {
-				fmt.Printf("  %s Could not store args: %v\n", style.Dim.Render("Warning:"), err)
-			}
+		// Start polecat session now that molecule/bead is attached.
+		// This ensures polecat sees its work when gt prime runs on session start.
+		pane, err := spawnInfo.StartSession()
+		if err != nil {
+			fmt.Printf("  %s Could not start session: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
+			rollbackSlingArtifactsFn(spawnInfo, beadToHook, hookWorkDir)
+			results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: false})
+			continue
+		} else {
+			fmt.Printf("  %s Session started for %s\n", style.Bold.Render("▶"), spawnInfo.PolecatName)
+			// Fresh polecats get StartupNudge from SessionManager.Start(),
+			// so no need to inject a start prompt here.
+			_ = pane
 		}
 
-		// Nudge the polecat
-		if spawnInfo.Pane != "" {
-			if err := injectStartPrompt(spawnInfo.Pane, beadID, slingSubject, slingArgs); err != nil {
-				fmt.Printf("  %s Could not nudge (agent will discover via gt prime)\n", style.Dim.Render("○"))
-			} else {
-				fmt.Printf("  %s Start prompt sent\n", style.Bold.Render("▶"))
-			}
-		}
-
+		activeCount++
 		results = append(results, slingResult{beadID: beadID, polecat: spawnInfo.PolecatName, success: true})
+
+		// Delay between spawns to prevent Dolt lock contention — sequential
+		// spawns without delay cause database lock timeouts when multiple bd
+		// operations (agent bead creation, hook setting) overlap.
+		if i < len(beadIDs)-1 {
+			time.Sleep(2 * time.Second)
+		}
 	}
 
 	if !slingNoBoot {
@@ -190,4 +286,34 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	}
 
 	return nil
+}
+
+// cleanupSpawnedPolecat removes a polecat that was spawned but whose hook failed,
+// preventing orphaned polecats from accumulating.
+func cleanupSpawnedPolecat(spawnInfo *SpawnedPolecatInfo, rigName string) {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return
+	}
+	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
+	if err != nil {
+		return
+	}
+	g := git.NewGit(townRoot)
+	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
+	r, err := rigMgr.GetRig(rigName)
+	if err != nil {
+		return
+	}
+	polecatGit := git.NewGit(r.Path)
+	t := tmux.NewTmux()
+	polecatMgr := polecat.NewManager(r, polecatGit, t)
+	if err := polecatMgr.Remove(spawnInfo.PolecatName, true); err != nil {
+		fmt.Printf("  %s Could not clean up orphaned polecat %s: %v\n",
+			style.Dim.Render("Warning:"), spawnInfo.PolecatName, err)
+	} else {
+		fmt.Printf("  %s Cleaned up orphaned polecat %s\n",
+			style.Dim.Render("○"), spawnInfo.PolecatName)
+	}
 }

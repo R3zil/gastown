@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"html/template"
@@ -9,13 +10,12 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 //go:embed static
 var staticFiles embed.FS
-
-// fetchTimeout is the maximum time allowed for all data fetches to complete.
-const fetchTimeout = 8 * time.Second
 
 // ConvoyFetcher defines the interface for fetching convoy data.
 type ConvoyFetcher interface {
@@ -37,20 +37,22 @@ type ConvoyFetcher interface {
 
 // ConvoyHandler handles HTTP requests for the convoy dashboard.
 type ConvoyHandler struct {
-	fetcher  ConvoyFetcher
-	template *template.Template
+	fetcher      ConvoyFetcher
+	template     *template.Template
+	fetchTimeout time.Duration
 }
 
-// NewConvoyHandler creates a new convoy handler with the given fetcher.
-func NewConvoyHandler(fetcher ConvoyFetcher) (*ConvoyHandler, error) {
+// NewConvoyHandler creates a new convoy handler with the given fetcher and fetch timeout.
+func NewConvoyHandler(fetcher ConvoyFetcher, fetchTimeout time.Duration) (*ConvoyHandler, error) {
 	tmpl, err := LoadTemplates()
 	if err != nil {
 		return nil, err
 	}
 
 	return &ConvoyHandler{
-		fetcher:  fetcher,
-		template: tmpl,
+		fetcher:      fetcher,
+		template:     tmpl,
+		fetchTimeout: fetchTimeout,
 	}, nil
 }
 
@@ -60,7 +62,7 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	expandPanel := r.URL.Query().Get("expand")
 
 	// Create a timeout context for all fetches
-	ctx, cancel := context.WithTimeout(r.Context(), fetchTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), h.fetchTimeout)
 	defer cancel()
 
 	var (
@@ -208,7 +210,10 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case <-done:
 		// All fetches completed
 	case <-ctx.Done():
-		log.Printf("dashboard: fetch timeout after %v", fetchTimeout)
+		log.Printf("dashboard: fetch timeout after %v", h.fetchTimeout)
+		// Goroutines may still be writing to shared result variables.
+		// Wait for them to finish to avoid a data race on read below.
+		<-done
 	}
 
 	// Compute summary from already-fetched data
@@ -233,11 +238,19 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Expand:      expandPanel,
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-	if err := h.template.ExecuteTemplate(w, "convoy.html", data); err != nil {
+	var buf bytes.Buffer
+	if err := h.template.ExecuteTemplate(&buf, "convoy.html", data); err != nil {
+		// Security: intentionally returns a generic error message to the client.
+		// Internal error details (err) are not exposed in the HTTP response to
+		// prevent information leakage. The error is logged server-side only.
+		log.Printf("dashboard: template execution failed: %v", err)
 		http.Error(w, "Failed to render template", http.StatusInternalServerError)
 		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if _, err := buf.WriteTo(w); err != nil {
+		log.Printf("dashboard: response write failed: %v", err)
 	}
 }
 
@@ -316,13 +329,21 @@ func enrichIssuesWithAssignees(issues []IssueRow, hooks []HookRow) []IssueRow {
 }
 
 // NewDashboardMux creates an HTTP handler that serves both the dashboard and API.
-func NewDashboardMux(fetcher ConvoyFetcher) (http.Handler, error) {
-	convoyHandler, err := NewConvoyHandler(fetcher)
+// webCfg may be nil, in which case defaults are used.
+func NewDashboardMux(fetcher ConvoyFetcher, webCfg *config.WebTimeoutsConfig) (http.Handler, error) {
+	if webCfg == nil {
+		webCfg = config.DefaultWebTimeoutsConfig()
+	}
+
+	fetchTimeout := config.ParseDurationOrDefault(webCfg.FetchTimeout, 8*time.Second)
+	convoyHandler, err := NewConvoyHandler(fetcher, fetchTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	apiHandler := NewAPIHandler()
+	defaultRunTimeout := config.ParseDurationOrDefault(webCfg.DefaultRunTimeout, 30*time.Second)
+	maxRunTimeout := config.ParseDurationOrDefault(webCfg.MaxRunTimeout, 60*time.Second)
+	apiHandler := NewAPIHandler(defaultRunTimeout, maxRunTimeout)
 
 	// Create static file server from embedded files
 	staticFS, err := fs.Sub(staticFiles, "static")

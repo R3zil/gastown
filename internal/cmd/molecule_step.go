@@ -153,7 +153,7 @@ func runMoleculeStepDone(cmd *cobra.Command, args []string) error {
 	// Step 5: Handle next action
 	switch result.Action {
 	case "continue":
-		return handleStepContinue(cwd, townRoot, workDir, readySteps[0], moleculeStepDryRun)
+		return handleStepContinue(cwd, townRoot, readySteps[0], moleculeStepDryRun)
 
 	case "parallel":
 		return handleParallelSteps(cwd, townRoot, workDir, readySteps, moleculeStepDryRun)
@@ -174,9 +174,10 @@ func runMoleculeStepDone(cmd *cobra.Command, args []string) error {
 // extractMoleculeIDFromStep extracts the molecule ID from a step ID.
 // Step IDs have format: mol-id.N where N is the step number.
 // Examples:
-//   gt-abc.1 -> gt-abc
-//   gt-xyz.3 -> gt-xyz
-//   bd-mol-abc.2 -> bd-mol-abc
+//
+//	gt-abc.1 -> gt-abc
+//	gt-xyz.3 -> gt-xyz
+//	bd-mol-abc.2 -> bd-mol-abc
 func extractMoleculeIDFromStep(stepID string) string {
 	// Find the last dot
 	lastDot := strings.LastIndex(stepID, ".")
@@ -198,100 +199,19 @@ func extractMoleculeIDFromStep(stepID string) string {
 	return stepID[:lastDot]
 }
 
-// findNextReadyStep finds the next ready step in a molecule.
-// Returns (nextStep, allComplete, error).
-// If all steps are complete, returns (nil, true, nil).
-// If no steps are ready but some are blocked/in_progress, returns (nil, false, nil).
-func findNextReadyStep(b *beads.Beads, moleculeID string) (*beads.Issue, bool, error) {
-	// Get all children of the molecule
-	children, err := b.List(beads.ListOptions{
-		Parent:   moleculeID,
-		Status:   "all",
-		Priority: -1,
-	})
-	if err != nil {
-		return nil, false, fmt.Errorf("listing molecule steps: %w", err)
-	}
-
-	if len(children) == 0 {
-		return nil, true, nil // No steps = complete
-	}
-
-	// Build set of closed step IDs and collect open step IDs
-	// Note: "open" means not started. "in_progress" means someone's working on it.
-	// We only consider "open" steps as candidates for the next step.
-	closedIDs := make(map[string]bool)
-	var openStepIDs []string
-	hasNonClosedSteps := false
-
-	for _, child := range children {
-		switch child.Status {
-		case "closed":
-			closedIDs[child.ID] = true
-		case "open":
-			openStepIDs = append(openStepIDs, child.ID)
-			hasNonClosedSteps = true
-		default:
-			// in_progress or other status - not closed, not available
-			hasNonClosedSteps = true
-		}
-	}
-
-	// Check if all complete
-	if !hasNonClosedSteps {
-		return nil, true, nil
-	}
-
-	// No open steps to check
-	if len(openStepIDs) == 0 {
-		return nil, false, nil
-	}
-
-	// Fetch full details for open steps to get dependency info.
-	// bd list doesn't return dependencies, but bd show does.
-	openStepsMap, err := b.ShowMultiple(openStepIDs)
-	if err != nil {
-		return nil, false, fmt.Errorf("fetching step details: %w", err)
-	}
-
-	// Find ready steps (open steps with all dependencies closed)
-	for _, stepID := range openStepIDs {
-		step, ok := openStepsMap[stepID]
-		if !ok {
-			continue
-		}
-
-		// Check dependencies using the Dependencies field (from bd show),
-		// not DependsOn (which is empty from bd list).
-		// Only "blocks" type dependencies block progress - ignore "parent-child".
-		allDepsClosed := true
-		hasBlockingDeps := false
-		for _, dep := range step.Dependencies {
-			if dep.DependencyType != "blocks" {
-				continue // Skip parent-child and other non-blocking relationships
-			}
-			hasBlockingDeps = true
-			if !closedIDs[dep.ID] {
-				allDepsClosed = false
-				break
-			}
-		}
-
-		if !hasBlockingDeps || allDepsClosed {
-			return step, false, nil
-		}
-	}
-
-	// No ready steps (all blocked or in_progress)
-	return nil, false, nil
-}
-
 // findAllReadySteps finds all ready steps in a molecule.
 // Returns (readySteps, allComplete, error).
 // If all steps are complete, returns (nil, true, nil).
 // If no steps are ready but some are blocked/in_progress, returns (nil, false, nil).
+//
+// Delegates readiness calculation to beads' canonical bd ready --mol command,
+// which uses the materialized blocked_issues_cache for correct handling of all
+// blocking types (blocks, conditional-blocks, waits-for), transitive propagation,
+// and cross-rig dependencies. See #1420.
 func findAllReadySteps(b *beads.Beads, moleculeID string) ([]*beads.Issue, bool, error) {
-	// Get all children of the molecule
+	// Check completion: list all children to detect "all closed" state.
+	// bd ready --mol only returns open+unblocked steps, so it can't distinguish
+	// "all complete" from "all blocked".
 	children, err := b.List(beads.ListOptions{
 		Parent:   moleculeID,
 		Status:   "all",
@@ -305,70 +225,35 @@ func findAllReadySteps(b *beads.Beads, moleculeID string) ([]*beads.Issue, bool,
 		return nil, true, nil // No steps = complete
 	}
 
-	// Build set of closed step IDs and collect open step IDs
-	closedIDs := make(map[string]bool)
-	var openStepIDs []string
-	hasNonClosedSteps := false
-
+	// Check if all steps are closed
+	allClosed := true
 	for _, child := range children {
-		switch child.Status {
-		case "closed":
-			closedIDs[child.ID] = true
-		case "open":
-			openStepIDs = append(openStepIDs, child.ID)
-			hasNonClosedSteps = true
-		default:
-			hasNonClosedSteps = true
+		if child.Status != "closed" {
+			allClosed = false
+			break
 		}
 	}
-
-	// Check if all complete
-	if !hasNonClosedSteps {
+	if allClosed {
 		return nil, true, nil
 	}
 
-	// No open steps to check
-	if len(openStepIDs) == 0 {
-		return nil, false, nil
-	}
-
-	// Fetch full details for open steps to get dependency info
-	openStepsMap, err := b.ShowMultiple(openStepIDs)
+	// Delegate readiness to beads' canonical ready-work semantics.
+	// This replaces manual dependency walking with isBlockingDepType,
+	// using beads' blocked_issues_cache which handles all blocking types,
+	// transitive propagation, and conditional-blocks resolution.
+	readySteps, err := b.ReadyForMol(moleculeID)
 	if err != nil {
-		return nil, false, fmt.Errorf("fetching step details: %w", err)
+		return nil, false, fmt.Errorf("finding ready steps: %w", err)
 	}
 
-	// Find ALL ready steps (open steps with all dependencies closed)
-	var readySteps []*beads.Issue
-	for _, stepID := range openStepIDs {
-		step, ok := openStepsMap[stepID]
-		if !ok {
-			continue
-		}
-
-		allDepsClosed := true
-		hasBlockingDeps := false
-		for _, dep := range step.Dependencies {
-			if dep.DependencyType != "blocks" {
-				continue
-			}
-			hasBlockingDeps = true
-			if !closedIDs[dep.ID] {
-				allDepsClosed = false
-				break
-			}
-		}
-
-		if !hasBlockingDeps || allDepsClosed {
-			readySteps = append(readySteps, step)
-		}
-	}
+	// Sort ready steps by sequence number so step 1 comes before step 2, etc.
+	sortStepsBySequence(readySteps)
 
 	return readySteps, false, nil
 }
 
 // handleStepContinue handles continuing to the next step.
-func handleStepContinue(cwd, townRoot, _ string, nextStep *beads.Issue, dryRun bool) error { // workDir unused but kept for signature consistency
+func handleStepContinue(cwd, townRoot string, nextStep *beads.Issue, dryRun bool) error {
 	fmt.Printf("\n%s Next step: %s\n", style.Bold.Render("→"), nextStep.ID)
 	fmt.Printf("  %s\n", nextStep.Title)
 
@@ -457,7 +342,7 @@ func handleStepContinue(cwd, townRoot, _ string, nextStep *beads.Issue, dryRun b
 
 // handleParallelSteps handles executing multiple steps concurrently (fan-out pattern).
 // This function spawns goroutines to execute each step in parallel and waits for all to complete.
-func handleParallelSteps(cwd, townRoot, workDir string, steps []*beads.Issue, dryRun bool) error {
+func handleParallelSteps(cwd, townRoot, _ string, steps []*beads.Issue, dryRun bool) error {
 	fmt.Printf("\n%s Fan-out: %d parallel steps ready\n", style.Bold.Render("⚡"), len(steps))
 	for i, step := range steps {
 		fmt.Printf("  %d. %s: %s\n", i+1, step.ID, step.Title)
@@ -528,7 +413,7 @@ func handleParallelSteps(cwd, townRoot, workDir string, steps []*beads.Issue, dr
 	// Other steps can be picked up by other agents or run manually
 	if len(steps) > 0 {
 		fmt.Printf("\n%s Continuing with first parallel step: %s\n", style.Bold.Render("→"), steps[0].ID)
-		return handleStepContinue(cwd, townRoot, workDir, steps[0], dryRun)
+		return handleStepContinue(cwd, townRoot, steps[0], dryRun)
 	}
 
 	return nil

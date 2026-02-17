@@ -16,7 +16,16 @@ var beadCmd = &cobra.Command{
 	Aliases: []string{"bd"},
 	GroupID: GroupWork,
 	Short:   "Bead management utilities",
-	Long:    `Utilities for managing beads across repositories.`,
+	Long: `Utilities for managing beads across repositories.
+
+Provides operations that span multiple beads repositories, such as
+moving beads between repos and viewing beads by ID with automatic
+prefix-based routing.
+
+Subcommands:
+  move    Move a bead from one repository to another
+  show    Show details of a bead (routes by prefix)
+  read    Alias for show`,
 }
 
 var beadMoveCmd = &cobra.Command{
@@ -142,7 +151,7 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 	createArgs := []string{
 		"create",
 		"--prefix", targetPrefix,
-		"--title", source.Title,
+		"--title=" + source.Title,
 		"--type", source.Type,
 		"--priority", fmt.Sprintf("%d", source.Priority),
 		"--silent", // Only output the ID
@@ -174,9 +183,15 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 	closeCmd := exec.Command("bd", "close", sourceID, "--reason", closeReason)
 	closeCmd.Stderr = os.Stderr
 	if err := closeCmd.Run(); err != nil {
-		// Try to clean up the new bead if close fails
+		// Clean up the new bead since we couldn't close the source
 		fmt.Fprintf(os.Stderr, "Warning: failed to close source bead: %v\n", err)
-		fmt.Fprintf(os.Stderr, "New bead %s was created but source %s remains open\n", newID, sourceID)
+		cleanupCmd := exec.Command("bd", "close", newID, "--reason", "Cleanup: source bead close failed during move")
+		if cleanupErr := cleanupCmd.Run(); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: also failed to clean up new bead %s: %v\n", newID, cleanupErr)
+			fmt.Fprintf(os.Stderr, "Both %s and %s remain open - manual cleanup needed\n", sourceID, newID)
+		} else {
+			fmt.Fprintf(os.Stderr, "Cleaned up new bead %s\n", newID)
+		}
 		return err
 	}
 

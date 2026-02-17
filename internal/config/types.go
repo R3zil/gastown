@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,7 +47,7 @@ type TownSettings struct {
 	CLITheme string `json:"cli_theme,omitempty"`
 
 	// DefaultAgent is the name of the agent preset to use by default.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent name defined in settings/agents.json.
 	// Default: "claude"
 	DefaultAgent string `json:"default_agent,omitempty"`
@@ -68,6 +69,18 @@ type TownSettings struct {
 	// Agent addresses like "gastown/crew/jack" become "gastown.crew.jack@{domain}".
 	// Default: "gastown.local"
 	AgentEmailDomain string `json:"agent_email_domain,omitempty"`
+
+	// WebTimeouts configures command execution timeouts for the web dashboard.
+	WebTimeouts *WebTimeoutsConfig `json:"web_timeouts,omitempty"`
+
+	// WorkerStatus configures activity-age thresholds for worker status classification.
+	WorkerStatus *WorkerStatusConfig `json:"worker_status,omitempty"`
+
+	// FeedCurator configures event deduplication and aggregation windows.
+	FeedCurator *FeedCuratorConfig `json:"feed_curator,omitempty"`
+
+	// Convoy configures convoy behavior settings.
+	Convoy *ConvoyConfig `json:"convoy,omitempty"`
 }
 
 // NewTownSettings creates a new TownSettings with defaults.
@@ -79,6 +92,101 @@ func NewTownSettings() *TownSettings {
 		Agents:       make(map[string]*RuntimeConfig),
 		RoleAgents:   make(map[string]string),
 	}
+}
+
+// WebTimeoutsConfig configures command execution timeouts for the web dashboard.
+type WebTimeoutsConfig struct {
+	// CmdTimeout is the timeout for bd (beads) commands. Default: "15s".
+	CmdTimeout string `json:"cmd_timeout,omitempty"`
+	// GhCmdTimeout is the timeout for GitHub API commands. Default: "10s".
+	GhCmdTimeout string `json:"gh_cmd_timeout,omitempty"`
+	// TmuxCmdTimeout is the timeout for tmux queries. Default: "2s".
+	TmuxCmdTimeout string `json:"tmux_cmd_timeout,omitempty"`
+	// FetchTimeout is the maximum time for all dashboard data fetches. Default: "8s".
+	FetchTimeout string `json:"fetch_timeout,omitempty"`
+	// DefaultRunTimeout is the default timeout for /api/run commands. Default: "30s".
+	DefaultRunTimeout string `json:"default_run_timeout,omitempty"`
+	// MaxRunTimeout is the maximum allowed timeout for /api/run commands. Default: "60s".
+	MaxRunTimeout string `json:"max_run_timeout,omitempty"`
+}
+
+// DefaultWebTimeoutsConfig returns a WebTimeoutsConfig with sensible defaults.
+func DefaultWebTimeoutsConfig() *WebTimeoutsConfig {
+	return &WebTimeoutsConfig{
+		CmdTimeout:        "15s",
+		GhCmdTimeout:      "10s",
+		TmuxCmdTimeout:    "2s",
+		FetchTimeout:      "8s",
+		DefaultRunTimeout: "30s",
+		MaxRunTimeout:     "60s",
+	}
+}
+
+// WorkerStatusConfig configures activity-age thresholds for worker status classification.
+type WorkerStatusConfig struct {
+	// StaleThreshold is the activity age after which a worker is considered "stale".
+	// Default: "5m".
+	StaleThreshold string `json:"stale_threshold,omitempty"`
+	// StuckThreshold is the activity age after which a worker is considered "stuck".
+	// Default: "30m".
+	StuckThreshold string `json:"stuck_threshold,omitempty"`
+	// HeartbeatFreshThreshold is the max age for a Deacon heartbeat to be considered fresh.
+	// Default: "5m".
+	HeartbeatFreshThreshold string `json:"heartbeat_fresh_threshold,omitempty"`
+	// MayorActiveThreshold is the max session inactivity for the Mayor to be considered active.
+	// Default: "5m".
+	MayorActiveThreshold string `json:"mayor_active_threshold,omitempty"`
+}
+
+// DefaultWorkerStatusConfig returns a WorkerStatusConfig with sensible defaults.
+func DefaultWorkerStatusConfig() *WorkerStatusConfig {
+	return &WorkerStatusConfig{
+		StaleThreshold:          "5m",
+		StuckThreshold:          "30m",
+		HeartbeatFreshThreshold: "5m",
+		MayorActiveThreshold:    "5m",
+	}
+}
+
+// FeedCuratorConfig configures event deduplication and aggregation windows.
+type FeedCuratorConfig struct {
+	// DoneDedupeWindow is the time window for deduplicating repeated done events.
+	// Default: "10s".
+	DoneDedupeWindow string `json:"done_dedupe_window,omitempty"`
+	// SlingAggregateWindow is the time window for aggregating sling events.
+	// Default: "30s".
+	SlingAggregateWindow string `json:"sling_aggregate_window,omitempty"`
+	// MinAggregateCount is the minimum number of events to trigger aggregation.
+	// Default: 3.
+	MinAggregateCount int `json:"min_aggregate_count,omitempty"`
+}
+
+// DefaultFeedCuratorConfig returns a FeedCuratorConfig with sensible defaults.
+func DefaultFeedCuratorConfig() *FeedCuratorConfig {
+	return &FeedCuratorConfig{
+		DoneDedupeWindow:     "10s",
+		SlingAggregateWindow: "30s",
+		MinAggregateCount:    3,
+	}
+}
+
+// ConvoyConfig configures convoy behavior settings.
+type ConvoyConfig struct {
+	// NotifyOnComplete controls whether convoy completion pushes a notification
+	// into the active Mayor session (in addition to mail). Opt-in; default false.
+	NotifyOnComplete bool `json:"notify_on_complete,omitempty"`
+}
+
+// ParseDurationOrDefault parses a Go duration string, returning fallback on error or empty input.
+func ParseDurationOrDefault(s string, fallback time.Duration) time.Duration {
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 // DaemonConfig represents daemon process settings.
@@ -104,9 +212,10 @@ type HeartbeatConfig struct {
 
 // PatrolConfig represents a single patrol configuration.
 type PatrolConfig struct {
-	Enabled  bool   `json:"enabled"`            // whether this patrol is enabled
-	Interval string `json:"interval,omitempty"` // e.g., "5m"
-	Agent    string `json:"agent,omitempty"`    // agent that runs this patrol
+	Enabled  bool     `json:"enabled"`            // whether this patrol is enabled
+	Interval string   `json:"interval,omitempty"` // e.g., "5m"
+	Agent    string   `json:"agent,omitempty"`    // agent that runs this patrol
+	Rigs     []string `json:"rigs,omitempty"`     // rigs this patrol manages (empty = all)
 }
 
 // CurrentDaemonPatrolConfigVersion is the current schema version for DaemonPatrolConfig.
@@ -219,7 +328,7 @@ type RigSettings struct {
 	Runtime    *RuntimeConfig    `json:"runtime,omitempty"`     // LLM runtime settings (deprecated: use Agent)
 
 	// Agent selects which agent preset to use for this rig.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent defined in settings/agents.json.
 	// If empty, uses the town's default_agent setting.
 	// Takes precedence over Runtime if both are set.
@@ -310,7 +419,7 @@ type RuntimeSessionConfig struct {
 
 // RuntimeHooksConfig configures runtime hook installation.
 type RuntimeHooksConfig struct {
-	// Provider controls which hook templates to install: "claude", "opencode", or "none".
+	// Provider controls which hook templates to install: "claude", "opencode", "copilot", or "none".
 	Provider string `json:"provider,omitempty"`
 
 	// Dir is the settings directory (e.g., ".claude").
@@ -318,6 +427,12 @@ type RuntimeHooksConfig struct {
 
 	// SettingsFile is the settings file name (e.g., "settings.json").
 	SettingsFile string `json:"settings_file,omitempty"`
+
+	// Informational indicates the hooks provider installs instructions files only,
+	// not executable lifecycle hooks. When true, Gas Town sends startup fallback
+	// commands (gt prime) via nudge since hooks won't run automatically.
+	// Defaults to false (backwards compatible with claude/opencode which have real hooks).
+	Informational bool `json:"informational,omitempty"`
 }
 
 // RuntimeTmuxConfig controls tmux heuristics for detecting runtime readiness.
@@ -361,6 +476,7 @@ func (rc *RuntimeConfig) BuildCommand() string {
 // BuildCommandWithPrompt returns the full command line with an initial prompt.
 // If the config has an InitialPrompt, it's appended as a quoted argument.
 // If prompt is provided, it overrides the config's InitialPrompt.
+// For opencode, uses --prompt flag; for other agents, uses positional argument.
 func (rc *RuntimeConfig) BuildCommandWithPrompt(prompt string) string {
 	resolved := normalizeRuntimeConfig(rc)
 	base := resolved.BuildCommand()
@@ -375,7 +491,13 @@ func (rc *RuntimeConfig) BuildCommandWithPrompt(prompt string) string {
 		return base
 	}
 
-	// Quote the prompt for shell safety
+	// OpenCode requires --prompt flag for initial prompt in interactive mode.
+	// Positional argument causes opencode to exit immediately.
+	if resolved.Command == "opencode" {
+		return base + " --prompt " + quoteForShell(p)
+	}
+
+	// Quote the prompt for shell safety (positional arg for claude and others)
 	return base + " " + quoteForShell(p)
 }
 
@@ -399,6 +521,28 @@ func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 	if rc == nil {
 		rc = &RuntimeConfig{}
+	}
+
+	// Shallow copy to avoid mutating the input
+	copy := *rc
+	rc = &copy
+
+	// Deep copy nested structs to avoid shared references
+	if rc.Session != nil {
+		s := *rc.Session
+		rc.Session = &s
+	}
+	if rc.Hooks != nil {
+		h := *rc.Hooks
+		rc.Hooks = &h
+	}
+	if rc.Tmux != nil {
+		t := *rc.Tmux
+		rc.Tmux = &t
+	}
+	if rc.Instructions != nil {
+		i := *rc.Instructions
+		rc.Instructions = &i
 	}
 
 	if rc.Provider == "" {
@@ -445,6 +589,13 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 		rc.Hooks.SettingsFile = defaultHooksFile(rc.Provider)
 	}
 
+	// Set informational flag for providers whose "hooks" are instructions files,
+	// not executable lifecycle hooks. This tells startup fallback logic to send
+	// gt prime via nudge since hooks won't run automatically.
+	if !rc.Hooks.Informational {
+		rc.Hooks.Informational = defaultHooksInformational(rc.Provider)
+	}
+
 	if rc.Tmux == nil {
 		rc.Tmux = &RuntimeTmuxConfig{}
 	}
@@ -473,16 +624,18 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 }
 
 func defaultRuntimeCommand(provider string) string {
-	switch provider {
-	case "codex":
-		return "codex"
-	case "opencode":
-		return "opencode"
-	case "generic":
+	if provider == "generic" {
 		return ""
-	default:
-		return resolveClaudePath()
 	}
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		cmd := preset.Command
+		// Resolve claude path for Claude preset (handles alias installations)
+		if preset.Name == AgentClaude && cmd == "claude" {
+			return resolveClaudePath()
+		}
+		return cmd
+	}
+	return resolveClaudePath() // fallback for unknown providers
 }
 
 // resolveClaudePath finds the claude binary, checking PATH first then common installation locations.
@@ -511,80 +664,67 @@ func resolveClaudePath() string {
 }
 
 func defaultRuntimeArgs(provider string) []string {
-	switch provider {
-	case "claude":
-		return []string{"--dangerously-skip-permissions"}
-	default:
-		return nil
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.Args != nil {
+		return append([]string(nil), preset.Args...) // copy to avoid mutation
 	}
+	return nil
 }
 
 func defaultPromptMode(provider string) string {
-	switch provider {
-	case "codex":
-		return "none"
-	case "opencode":
-		return "none"
-	default:
-		return "arg"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.PromptMode != "" {
+		return preset.PromptMode
 	}
+	return "arg"
 }
 
 func defaultSessionIDEnv(provider string) string {
-	if provider == "claude" {
-		return "CLAUDE_SESSION_ID"
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.SessionIDEnv
 	}
 	return ""
 }
 
 func defaultConfigDirEnv(provider string) string {
-	if provider == "claude" {
-		return "CLAUDE_CONFIG_DIR"
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ConfigDirEnv
 	}
 	return ""
 }
 
 func defaultHooksProvider(provider string) string {
-	switch provider {
-	case "claude":
-		return "claude"
-	case "opencode":
-		return "opencode"
-	default:
-		return "none"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.HooksProvider != "" {
+		return preset.HooksProvider
 	}
+	return "none"
 }
 
 func defaultHooksDir(provider string) string {
-	switch provider {
-	case "claude":
-		return ".claude"
-	case "opencode":
-		return ".opencode/plugin"
-	default:
-		return ""
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksDir
 	}
+	return ""
 }
 
 func defaultHooksFile(provider string) string {
-	switch provider {
-	case "claude":
-		return "settings.json"
-	case "opencode":
-		return "gastown.js"
-	default:
-		return ""
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksSettingsFile
 	}
+	return ""
+}
+
+// defaultHooksInformational returns true for providers whose hooks are instructions
+// files only (not executable lifecycle hooks). For these providers, Gas Town sends
+// startup fallback commands (gt prime) via nudge since hooks won't auto-run.
+func defaultHooksInformational(provider string) bool {
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.HooksInformational
+	}
+	return false
 }
 
 func defaultProcessNames(provider, command string) []string {
-	if provider == "claude" {
-		return []string{"node"}
-	}
-	if provider == "opencode" {
-		// OpenCode runs as Node.js process, need both for IsAgentRunning detection.
-		// tmux pane_current_command may show "node" or "opencode" depending on how invoked.
-		return []string{"opencode", "node"}
+	if preset := GetAgentPresetByName(provider); preset != nil && len(preset.ProcessNames) > 0 {
+		return append([]string(nil), preset.ProcessNames...) // copy to avoid mutation
 	}
 	if command != "" {
 		return []string{filepath.Base(command)}
@@ -593,37 +733,24 @@ func defaultProcessNames(provider, command string) []string {
 }
 
 func defaultReadyPromptPrefix(provider string) string {
-	if provider == "claude" {
-		// Claude Code uses ❯ (U+276F) as the prompt character
-		return "❯ "
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ReadyPromptPrefix
 	}
 	return ""
 }
 
 func defaultReadyDelayMs(provider string) int {
-	if provider == "claude" {
-		return 10000
-	}
-	if provider == "codex" {
-		return 3000
-	}
-	if provider == "opencode" {
-		// OpenCode requires delay-based detection because its TUI uses
-		// box-drawing characters (┃) that break prompt prefix matching.
-		// 8000ms provides reliable startup detection across models.
-		return 8000
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.ReadyDelayMs
 	}
 	return 0
 }
 
 func defaultInstructionsFile(provider string) string {
-	if provider == "codex" {
-		return "AGENTS.md"
+	if preset := GetAgentPresetByName(provider); preset != nil && preset.InstructionsFile != "" {
+		return preset.InstructionsFile
 	}
-	if provider == "opencode" {
-		return "AGENTS.md"
-	}
-	return "CLAUDE.md"
+	return "AGENTS.md"
 }
 
 // quoteForShell quotes a string for safe shell usage.
@@ -682,11 +809,15 @@ type MergeQueueConfig struct {
 	// Enabled controls whether the merge queue is active.
 	Enabled bool `json:"enabled"`
 
-	// TargetBranch is the default branch to merge into (usually "main").
-	TargetBranch string `json:"target_branch"`
+	// IntegrationBranchPolecatEnabled controls whether polecats auto-source
+	// their worktrees from integration branches when the parent epic has one.
+	// Nil defaults to true.
+	IntegrationBranchPolecatEnabled *bool `json:"integration_branch_polecat_enabled,omitempty"`
 
-	// IntegrationBranches enables integration branch workflow for epics.
-	IntegrationBranches bool `json:"integration_branches"`
+	// IntegrationBranchRefineryEnabled controls whether mq submit and gt done
+	// auto-detect integration branches as MR targets.
+	// Nil defaults to true.
+	IntegrationBranchRefineryEnabled *bool `json:"integration_branch_refinery_enabled,omitempty"`
 
 	// IntegrationBranchTemplate is the pattern for integration branch names.
 	// Supports variables: {epic}, {prefix}, {user}
@@ -696,17 +827,36 @@ type MergeQueueConfig struct {
 	// Default: "integration/{epic}"
 	IntegrationBranchTemplate string `json:"integration_branch_template,omitempty"`
 
+	// IntegrationBranchAutoLand controls whether the refinery should automatically
+	// land integration branches when all children of the epic are closed.
+	// Nil defaults to false (manual landing required).
+	IntegrationBranchAutoLand *bool `json:"integration_branch_auto_land,omitempty"`
+
 	// OnConflict specifies conflict resolution strategy: "assign_back" or "auto_rebase".
 	OnConflict string `json:"on_conflict"`
 
 	// RunTests controls whether to run tests before merging.
-	RunTests bool `json:"run_tests"`
+	// Nil defaults to true (tests are run).
+	RunTests *bool `json:"run_tests,omitempty"`
 
 	// TestCommand is the command to run for tests.
 	TestCommand string `json:"test_command,omitempty"`
 
+	// LintCommand is the command to run for linting (used by formulas).
+	LintCommand string `json:"lint_command,omitempty"`
+
+	// BuildCommand is the command to run for building (used by formulas).
+	BuildCommand string `json:"build_command,omitempty"`
+
+	// SetupCommand is the command to run for project setup (e.g., pnpm install).
+	SetupCommand string `json:"setup_command,omitempty"`
+
+	// TypecheckCommand is the command to run for type checking (e.g., tsc --noEmit).
+	TypecheckCommand string `json:"typecheck_command,omitempty"`
+
 	// DeleteMergedBranches controls whether to delete branches after merging.
-	DeleteMergedBranches bool `json:"delete_merged_branches"`
+	// Nil defaults to true (merged branches are deleted).
+	DeleteMergedBranches *bool `json:"delete_merged_branches,omitempty"`
 
 	// RetryFlakyTests is the number of times to retry flaky tests.
 	RetryFlakyTests int `json:"retry_flaky_tests"`
@@ -716,6 +866,10 @@ type MergeQueueConfig struct {
 
 	// MaxConcurrent is the maximum number of concurrent merges.
 	MaxConcurrent int `json:"max_concurrent"`
+
+	// StaleClaimTimeout is how long a claimed MR can go without updates before
+	// being considered abandoned and eligible for re-claim (e.g., "30m").
+	StaleClaimTimeout string `json:"stale_claim_timeout,omitempty"`
 }
 
 // OnConflict strategy constants.
@@ -724,19 +878,71 @@ const (
 	OnConflictAutoRebase = "auto_rebase"
 )
 
+// IsPolecatIntegrationEnabled returns whether polecat integration branch
+// sourcing is enabled. Nil-safe, defaults to true.
+func (c *MergeQueueConfig) IsPolecatIntegrationEnabled() bool {
+	if c.IntegrationBranchPolecatEnabled == nil {
+		return true
+	}
+	return *c.IntegrationBranchPolecatEnabled
+}
+
+// IsRefineryIntegrationEnabled returns whether refinery/submit integration
+// branch auto-detection is enabled. Nil-safe, defaults to true.
+func (c *MergeQueueConfig) IsRefineryIntegrationEnabled() bool {
+	if c.IntegrationBranchRefineryEnabled == nil {
+		return true
+	}
+	return *c.IntegrationBranchRefineryEnabled
+}
+
+// IsIntegrationBranchAutoLandEnabled returns whether the refinery should
+// auto-land integration branches when all epic children are closed.
+// Nil-safe, defaults to false (manual landing required).
+func (c *MergeQueueConfig) IsIntegrationBranchAutoLandEnabled() bool {
+	if c.IntegrationBranchAutoLand == nil {
+		return false
+	}
+	return *c.IntegrationBranchAutoLand
+}
+
+// IsRunTestsEnabled returns whether tests should run before merging.
+// Nil-safe, defaults to true.
+func (c *MergeQueueConfig) IsRunTestsEnabled() bool {
+	if c.RunTests == nil {
+		return true
+	}
+	return *c.RunTests
+}
+
+// IsDeleteMergedBranchesEnabled returns whether merged branches should be deleted.
+// Nil-safe, defaults to true.
+func (c *MergeQueueConfig) IsDeleteMergedBranchesEnabled() bool {
+	if c.DeleteMergedBranches == nil {
+		return true
+	}
+	return *c.DeleteMergedBranches
+}
+
+// boolPtr returns a pointer to a bool value.
+func boolPtr(b bool) *bool {
+	return &b
+}
+
 // DefaultMergeQueueConfig returns a MergeQueueConfig with sensible defaults.
 func DefaultMergeQueueConfig() *MergeQueueConfig {
 	return &MergeQueueConfig{
-		Enabled:              true,
-		TargetBranch:         "main",
-		IntegrationBranches:  true,
-		OnConflict:           OnConflictAssignBack,
-		RunTests:             true,
-		TestCommand:          "go test ./...",
-		DeleteMergedBranches: true,
-		RetryFlakyTests:      1,
-		PollInterval:         "30s",
-		MaxConcurrent:        1,
+		Enabled:                          true,
+		IntegrationBranchPolecatEnabled:  boolPtr(true),
+		IntegrationBranchRefineryEnabled: boolPtr(true),
+		OnConflict:                       OnConflictAssignBack,
+		RunTests:                         boolPtr(true),
+		TestCommand:                      "go test ./...",
+		DeleteMergedBranches:             boolPtr(true),
+		RetryFlakyTests:                  1,
+		PollInterval:                     "30s",
+		MaxConcurrent:                    1,
+		StaleClaimTimeout:               "30m",
 	}
 }
 
@@ -782,9 +988,12 @@ type Account struct {
 const CurrentAccountsVersion = 1
 
 // DefaultAccountsConfigDir returns the default base directory for account configs.
-func DefaultAccountsConfigDir() string {
-	home, _ := os.UserHomeDir()
-	return home + "/.claude-accounts"
+func DefaultAccountsConfigDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	return home + "/.claude-accounts", nil
 }
 
 // MessagingConfig represents the messaging configuration (config/messaging.json).
@@ -877,7 +1086,8 @@ type EscalationConfig struct {
 
 	// MaxReescalations limits how many times an escalation can be
 	// re-escalated. Default: 2 (low→medium→high, then stops)
-	MaxReescalations int `json:"max_reescalations,omitempty"`
+	// Pointer type to distinguish "not configured" (nil) from explicit 0.
+	MaxReescalations *int `json:"max_reescalations,omitempty"`
 }
 
 // EscalationContacts contains contact information for external notification channels.
@@ -928,6 +1138,9 @@ func NextSeverity(severity string) string {
 	}
 }
 
+// intPtr returns a pointer to the given int value.
+func intPtr(v int) *int { return &v }
+
 // NewEscalationConfig creates a new EscalationConfig with sensible defaults.
 func NewEscalationConfig() *EscalationConfig {
 	return &EscalationConfig{
@@ -941,6 +1154,6 @@ func NewEscalationConfig() *EscalationConfig {
 		},
 		Contacts:         EscalationContacts{},
 		StaleThreshold:   "4h",
-		MaxReescalations: 2,
+		MaxReescalations: intPtr(2),
 	}
 }

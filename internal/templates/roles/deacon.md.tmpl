@@ -154,9 +154,8 @@ gt mail inbox
 # If mail contains attached work, hook it:
 gt mol attach-from-mail <mail-id>
 
-# Step 4: Still nothing? Create patrol wisp (two-step: create then hook)
-bd mol wisp mol-deacon-patrol
-bd update <wisp-id> --status=hooked --assignee=deacon
+# Step 4: Still nothing? Create patrol wisp
+{{ cmd }} patrol new
 ```
 
 **Work hooked → Run it. Hook empty → Check mail. Nothing anywhere → Create patrol.**
@@ -196,7 +195,7 @@ discover them at runtime:
 
 ```bash
 # What step am I on?
-bd ready
+bd mol current
 
 # What does this step require?
 bd show <step-id>
@@ -241,8 +240,7 @@ Then squash and decide:
 bd mol squash <wisp-id> --summary="Patrol complete: checked inbox, scanned health, no issues"
 
 # Option A: Loop (low context)
-bd mol wisp mol-deacon-patrol
-bd update <wisp-id> --status=hooked --assignee=deacon
+{{ cmd }} patrol new
 # Continue to first step...
 
 # Option B: Exit (high context)
@@ -392,6 +390,27 @@ gt mail send deacon/ -s "🤝 HANDOFF: ..." -m "Context for next session"
 But typically just exit and let the daemon respawn you with fresh context.
 
 ---
+
+## ⚡ Command Quick-Reference
+
+**Commonly confused — use the right command:**
+
+| Want to... | Correct command | Common mistake |
+|------------|----------------|----------------|
+| Start rig agents | `{{ cmd }} rig start <rig>` | ~~gt rig boot~~ (starts without patrol) |
+| Stop rig agents | `{{ cmd }} rig stop <rig>` | ~~gt rig shutdown~~ (same thing) |
+| Pause rig (daemon won't restart) | `{{ cmd }} rig park <rig>` | ~~gt rig stop~~ (daemon will restart it) |
+| Permanently disable rig | `{{ cmd }} rig dock <rig>` | ~~gt rig park~~ (temporary only) |
+| Resume parked rig | `{{ cmd }} rig unpark <rig>` | |
+| Re-enable docked rig | `{{ cmd }} rig undock <rig>` | |
+| Message another agent | `{{ cmd }} nudge <target> "msg"` | ~~tmux send-keys~~ (unreliable) |
+| Restart Mayor | `{{ cmd }} mayor stop` then `{{ cmd }} mayor start` | |
+
+**Rig lifecycle commands (park vs dock vs stop):**
+- `park/unpark` — Temporary pause. Daemon skips parked rigs.
+- `dock/undock` — Persistent disable. Survives daemon restarts.
+- `stop/start` — Immediate stop/start of rig patrol agents (witness + refinery).
+- `restart/reboot` — Stop then start rig agents.
 
 State directory: {{ .TownRoot }}/deacon/
 Mail identity: deacon/

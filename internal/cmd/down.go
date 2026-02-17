@@ -12,7 +12,9 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/daemon"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -26,6 +28,11 @@ import (
 const (
 	shutdownLockFile    = "daemon/shutdown.lock"
 	shutdownLockTimeout = 5 * time.Second
+
+	// defaultDownOrphanGraceSecs is the grace period for orphan cleanup during gt down.
+	// Short because gt down is meant to be quick - processes already had SIGTERM via
+	// KillSessionWithProcesses.
+	defaultDownOrphanGraceSecs = 5
 )
 
 var downCmd = &cobra.Command{
@@ -37,7 +44,7 @@ var downCmd = &cobra.Command{
 Shutdown levels (progressively more aggressive):
   gt down                    Stop infrastructure (default)
   gt down --polecats         Also stop all polecat sessions
-  gt down --all              Also stop bd daemons/activity
+  gt down --all              Full shutdown with orphan cleanup
   gt down --nuke             Also kill the tmux server (DESTRUCTIVE)
 
 Infrastructure agents stopped:
@@ -47,6 +54,7 @@ Infrastructure agents stopped:
   • Boot       - Deacon's watchdog
   • Deacon     - Health orchestrator
   • Daemon     - Go background process
+  • Dolt       - Shared SQL database server
 
 This is a "pause" operation - use 'gt start' to bring everything back up.
 For permanent cleanup (removing worktrees), use 'gt shutdown' instead.
@@ -71,7 +79,7 @@ func init() {
 	downCmd.Flags().BoolVarP(&downQuiet, "quiet", "q", false, "Only show errors")
 	downCmd.Flags().BoolVarP(&downForce, "force", "f", false, "Force kill without graceful shutdown")
 	downCmd.Flags().BoolVarP(&downPolecats, "polecats", "p", false, "Also stop all polecat sessions")
-	downCmd.Flags().BoolVarP(&downAll, "all", "a", false, "Stop bd daemons/activity and verify shutdown")
+	downCmd.Flags().BoolVarP(&downAll, "all", "a", false, "Full shutdown with orphan cleanup and verification")
 	downCmd.Flags().BoolVar(&downNuke, "nuke", false, "Kill entire tmux server (DESTRUCTIVE - kills non-GT sessions!)")
 	downCmd.Flags().BoolVar(&downDryRun, "dry-run", false, "Preview what would be stopped without taking action")
 	rootCmd.AddCommand(downCmd)
@@ -96,8 +104,11 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 		defer func() {
 			_ = lock.Unlock()
-			// Clean up lock file after releasing (defense in depth)
-			_ = os.Remove(filepath.Join(townRoot, shutdownLockFile))
+			// Do NOT remove the lock file. Flock works on file descriptors,
+			// not paths. Removing the file while another process is waiting
+			// on the flock causes it to acquire a lock on the deleted inode,
+			// providing no mutual exclusion against a process that creates a
+			// new file at the same path.
 		}()
 
 		// Prevent tmux server from exiting when all sessions are killed.
@@ -141,7 +152,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Phase 1: Stop refineries
 	for _, rigName := range rigs {
-		sessionName := fmt.Sprintf("gt-%s-refinery", rigName)
+		sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
 		if downDryRun {
 			if running, _ := t.HasSession(sessionName); running {
 				printDownStatus(fmt.Sprintf("Refinery (%s)", rigName), true, "would stop")
@@ -161,7 +172,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Phase 2: Stop witnesses
 	for _, rigName := range rigs {
-		sessionName := fmt.Sprintf("gt-%s-witness", rigName)
+		sessionName := session.WitnessSessionName(session.PrefixFor(rigName))
 		if downDryRun {
 			if running, _ := t.HasSession(sessionName); running {
 				printDownStatus(fmt.Sprintf("Witness (%s)", rigName), true, "would stop")
@@ -220,8 +231,48 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Phase 5: Verification (--all only)
-	if downAll && !downDryRun {
+	// Phase 4b: Stop Dolt server
+	doltCfg := doltserver.DefaultConfig(townRoot)
+	if _, statErr := os.Stat(doltCfg.DataDir); statErr == nil {
+		doltRunning, doltPid, doltErr := doltserver.IsRunning(townRoot)
+		if doltErr != nil {
+			printDownStatus("Dolt", false, fmt.Sprintf("status check failed: %v", doltErr))
+			allOK = false
+		} else if downDryRun {
+			if doltRunning {
+				printDownStatus("Dolt", true, fmt.Sprintf("would stop (PID %d)", doltPid))
+			}
+		} else {
+			if doltRunning {
+				if err := doltserver.Stop(townRoot); err != nil {
+					printDownStatus("Dolt", false, err.Error())
+					allOK = false
+				} else {
+					printDownStatus("Dolt", true, fmt.Sprintf("stopped (was PID %d)", doltPid))
+				}
+			} else {
+				printDownStatus("Dolt", true, "not running")
+			}
+		}
+	}
+
+	// Phase 5: Orphan cleanup and verification (--all or --force)
+	if (downAll || downForce) && !downDryRun {
+		fmt.Println()
+
+		// Kill any processes tracked via PID files (defense-in-depth for
+		// processes that survived normal session teardown).
+		killed, pidErrs := session.KillTrackedPIDs(townRoot)
+		if killed > 0 {
+			fmt.Printf("  Killed %d tracked orphan process(es) via PID files\n", killed)
+		}
+		for _, e := range pidErrs {
+			fmt.Printf("  PID cleanup warning: %s\n", e)
+		}
+
+		fmt.Println("Cleaning up orphaned Claude processes...")
+		cleanupOrphanedClaude(defaultDownOrphanGraceSecs)
+
 		time.Sleep(500 * time.Millisecond)
 		respawned := verifyShutdown(t, townRoot)
 		if len(respawned) > 0 {
@@ -231,10 +282,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  • %s\n", r)
 			}
 			fmt.Println()
-			fmt.Printf("This may indicate systemd/launchd is managing bd.\n")
+			fmt.Printf("This may indicate a process manager is respawning agents.\n")
 			fmt.Printf("Check with:\n")
-			fmt.Printf("  %s\n", style.Dim.Render("systemctl status bd-daemon  # Linux"))
-			fmt.Printf("  %s\n", style.Dim.Render("launchctl list | grep bd    # macOS"))
+			fmt.Printf("  %s\n", style.Dim.Render("ps aux | grep claude  # Find respawned processes"))
+			fmt.Printf("  %s\n", style.Dim.Render("gt status             # Verify town state"))
 			allOK = false
 		}
 	}
@@ -271,7 +322,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	if allOK {
 		fmt.Printf("%s All services stopped\n", style.Bold.Render("✓"))
-		stoppedServices := []string{"daemon", "deacon", "boot", "mayor"}
+		stoppedServices := []string{"dolt", "daemon", "deacon", "boot", "mayor"}
 		for _, rigName := range rigs {
 			stoppedServices = append(stoppedServices, fmt.Sprintf("%s/refinery", rigName))
 			stoppedServices = append(stoppedServices, fmt.Sprintf("%s/witness", rigName))
@@ -316,7 +367,7 @@ func stopAllPolecats(t *tmux.Tmux, townRoot string, rigNames []string, force boo
 		}
 
 		polecatMgr := polecat.NewSessionManager(t, r)
-		infos, err := polecatMgr.List()
+		infos, err := polecatMgr.ListPolecats()
 		if err != nil {
 			continue
 		}
@@ -365,7 +416,9 @@ func stopSession(t *tmux.Tmux, sessionName string) (bool, error) {
 	// Try graceful shutdown first (Ctrl-C, best-effort interrupt)
 	if !downForce {
 		_ = t.SendKeysRaw(sessionName, "C-c")
-		time.Sleep(100 * time.Millisecond)
+		if session.WaitForSessionExit(t, sessionName, constants.GracefulShutdownTimeout) {
+			return true, nil // Process exited gracefully
+		}
 	}
 
 	// Kill the session (with explicit process termination to prevent orphans)
@@ -406,7 +459,7 @@ func verifyShutdown(t *tmux.Tmux, townRoot string) []string {
 	sessions, err := t.ListSessions()
 	if err == nil {
 		for _, sess := range sessions {
-			if strings.HasPrefix(sess, "gt-") || strings.HasPrefix(sess, "hq-") {
+			if session.IsKnownSession(sess) {
 				respawned = append(respawned, fmt.Sprintf("tmux session %s", sess))
 			}
 		}
@@ -434,53 +487,54 @@ func verifyShutdown(t *tmux.Tmux, townRoot string) []string {
 // findOrphanedClaudeProcesses finds Claude/node processes that are running in the
 // town directory but aren't associated with any active tmux session.
 // This can happen when tmux sessions are killed but child processes don't terminate.
+//
+// Only matches processes whose full command line references the town root path,
+// which avoids false positives on unrelated Node.js applications (VS Code
+// extensions, web servers, etc.).
 func findOrphanedClaudeProcesses(townRoot string) []int {
-	// Use pgrep to find all claude/node processes
-	cmd := exec.Command("pgrep", "-l", "node")
-	output, err := cmd.Output()
+	// Use ps to get PID, process name, and full command line in a single pass.
+	// Previous implementation used "pgrep -l node" which matched ALL node
+	// processes on the system regardless of whether they belonged to Gas Town.
+	out, err := exec.Command("ps", "-eo", "pid,comm,args").Output()
 	if err != nil {
-		return nil // pgrep found no processes or failed
+		return nil
 	}
 
 	var orphaned []int
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		// Format: "PID command"
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			continue
-		}
-		pidStr := parts[0]
-		var pid int
-		if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
+
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
 			continue
 		}
 
-		// Check if this process is running in the town directory
-		if isProcessInTown(pid, townRoot) {
+		var pid int
+		if _, err := fmt.Sscanf(fields[0], "%d", &pid); err != nil {
+			continue
+		}
+
+		// Only consider known Gas Town process names
+		comm := strings.ToLower(fields[1])
+		switch comm {
+		case "claude", "claude-code", "codex", "node":
+			// Potential Gas Town process
+		default:
+			continue
+		}
+
+		// Verify the process's command line references the town root.
+		// This filters out unrelated node processes (VS Code, web servers, etc.)
+		// whose command lines won't contain the Gas Town directory path.
+		args := strings.Join(fields[2:], " ")
+		if strings.Contains(args, townRoot) {
 			orphaned = append(orphaned, pid)
 		}
 	}
 
 	return orphaned
-}
-
-// isProcessInTown checks if a process is running in the given town directory.
-// Uses ps to check the process's working directory.
-func isProcessInTown(pid int, townRoot string) bool {
-	// Use ps to get the process's working directory
-	cmd := exec.Command("ps", "-o", "command=", "-p", fmt.Sprintf("%d", pid))
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	// Check if the command line includes the town path
-	command := string(output)
-	return strings.Contains(command, townRoot)
 }
 

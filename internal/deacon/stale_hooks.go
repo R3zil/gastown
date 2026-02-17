@@ -4,10 +4,13 @@ package deacon
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -46,6 +49,12 @@ type StaleHookResult struct {
 	AgentAlive  bool   `json:"agent_alive"`
 	Unhooked    bool   `json:"unhooked"`
 	Error       string `json:"error,omitempty"`
+	// PartialWork indicates uncommitted changes or unpushed commits were found
+	// in the agent's worktree before unhooking.
+	PartialWork    bool   `json:"partial_work,omitempty"`
+	WorktreeDirty  bool   `json:"worktree_dirty,omitempty"`
+	UnpushedCount  int    `json:"unpushed_count,omitempty"`
+	WorktreeError  string `json:"worktree_error,omitempty"`
 }
 
 // StaleHookScanResult contains the full results of a stale hook scan.
@@ -57,7 +66,12 @@ type StaleHookScanResult struct {
 	Results     []*StaleHookResult `json:"results"`
 }
 
-// ScanStaleHooks finds hooked beads older than the threshold and optionally unhooks them.
+// ScanStaleHooks finds hooked beads with dead agents and optionally unhooks them.
+// Session liveness is checked for ALL hooked beads regardless of age (gt-pqf9x).
+// A hooked bead is considered stale if:
+//  1. The assignee's tmux session is dead (immediate unhook), OR
+//  2. The bead is older than MaxAge AND we can't determine session liveness
+//     (e.g., unknown assignee format)
 func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult, error) {
 	if cfg == nil {
 		cfg = DefaultStaleHookConfig()
@@ -76,18 +90,10 @@ func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult
 
 	result.TotalHooked = len(hookedBeads)
 
-	// Filter to stale ones (older than threshold)
 	threshold := time.Now().Add(-cfg.MaxAge)
 	t := tmux.NewTmux()
 
 	for _, bead := range hookedBeads {
-		// Skip if updated recently (not stale)
-		if bead.UpdatedAt.After(threshold) {
-			continue
-		}
-
-		result.StaleCount++
-
 		hookResult := &StaleHookResult{
 			BeadID:   bead.ID,
 			Title:    bead.Title,
@@ -95,22 +101,48 @@ func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult
 			Age:      time.Since(bead.UpdatedAt).Round(time.Minute).String(),
 		}
 
-		// Check if assignee agent is still alive
+		// Check if assignee agent is still alive (regardless of age)
+		sessionChecked := false
 		if bead.Assignee != "" {
 			sessionName := assigneeToSessionName(bead.Assignee)
 			if sessionName != "" {
 				alive, _ := t.HasSession(sessionName)
 				hookResult.AgentAlive = alive
+				sessionChecked = true
 			}
 		}
 
-		// If agent is dead/gone and not dry run, unhook the bead
-		if !hookResult.AgentAlive && !cfg.DryRun {
-			if err := unhookBead(townRoot, bead.ID); err != nil {
-				hookResult.Error = err.Error()
-			} else {
-				hookResult.Unhooked = true
-				result.Unhooked++
+		// Determine if this hook is stale:
+		// - Agent confirmed dead → stale (regardless of age)
+		// - Can't check session + older than MaxAge → stale (fallback)
+		// - Agent alive → not stale
+		isStale := false
+		if sessionChecked && !hookResult.AgentAlive {
+			// Session confirmed dead — unhook immediately regardless of age
+			isStale = true
+		} else if !sessionChecked && bead.UpdatedAt.Before(threshold) {
+			// Can't determine session liveness (unknown assignee format)
+			// Fall back to age-based check
+			isStale = true
+		}
+
+		if !isStale {
+			continue
+		}
+
+		result.StaleCount++
+
+		// If agent is dead/gone, check worktree state before unhooking
+		if !hookResult.AgentAlive {
+			checkWorktreeState(townRoot, bead.Assignee, hookResult)
+
+			if !cfg.DryRun {
+				if err := unhookBead(townRoot, bead.ID); err != nil {
+					hookResult.Error = err.Error()
+				} else {
+					hookResult.Unhooked = true
+					result.Unhooked++
+				}
 			}
 		}
 
@@ -147,44 +179,71 @@ func listHookedBeads(townRoot string) ([]*HookedBead, error) {
 }
 
 // assigneeToSessionName converts an assignee address to a tmux session name.
-// Supports formats like "gastown/polecats/max", "gastown/crew/joe", etc.
+// Delegates to session.ParseAddress for consistent parsing across the codebase.
 func assigneeToSessionName(assignee string) string {
-	parts := strings.Split(assignee, "/")
-
-	switch len(parts) {
-	case 1:
-		// Simple names like "deacon", "mayor"
-		switch assignee {
-		case "deacon":
-			return session.DeaconSessionName()
-		case "mayor":
-			return session.MayorSessionName()
-		default:
-			return ""
-		}
-	case 2:
-		// rig/role: "gastown/witness", "gastown/refinery"
-		rig, role := parts[0], parts[1]
-		switch role {
-		case "witness", "refinery":
-			return fmt.Sprintf("gt-%s-%s", rig, role)
-		default:
-			return ""
-		}
-	case 3:
-		// rig/type/name: "gastown/polecats/max", "gastown/crew/joe"
-		rig, agentType, name := parts[0], parts[1], parts[2]
-		switch agentType {
-		case "polecats":
-			return fmt.Sprintf("gt-%s-%s", rig, name)
-		case "crew":
-			return fmt.Sprintf("gt-%s-crew-%s", rig, name)
-		default:
-			return ""
-		}
-	default:
+	identity, err := session.ParseAddress(assignee)
+	if err != nil {
 		return ""
 	}
+	return identity.SessionName()
+}
+
+// checkWorktreeState checks an agent's worktree for uncommitted changes or
+// unpushed commits and populates the result fields. This is best-effort;
+// errors are recorded but do not prevent unhooking.
+func checkWorktreeState(townRoot, assignee string, result *StaleHookResult) {
+	worktreePath := assigneeToWorktreePath(townRoot, assignee)
+	if worktreePath == "" {
+		return
+	}
+
+	g := git.NewGit(worktreePath)
+	workStatus, err := g.CheckUncommittedWork()
+	if err != nil {
+		result.WorktreeError = fmt.Sprintf("checking worktree: %v", err)
+		return
+	}
+
+	if !workStatus.CleanExcludingBeads() {
+		result.PartialWork = true
+		result.WorktreeDirty = workStatus.HasUncommittedChanges
+		result.UnpushedCount = workStatus.UnpushedCommits
+	}
+}
+
+// assigneeToWorktreePath resolves an assignee address to its git worktree path.
+// Returns "" if the assignee format is unrecognized or the worktree doesn't exist.
+// Supports polecat format "rig/polecats/name" and crew format "rig/crew/name".
+func assigneeToWorktreePath(townRoot, assignee string) string {
+	parts := strings.Split(assignee, "/")
+	if len(parts) != 3 {
+		return ""
+	}
+
+	rigName, agentType, name := parts[0], parts[1], parts[2]
+	if agentType != "polecats" && agentType != "crew" {
+		return ""
+	}
+
+	rigPath := filepath.Join(townRoot, rigName)
+
+	// New structure: rig/polecats/<name>/<rigname>/
+	newPath := filepath.Join(rigPath, agentType, name, rigName)
+	if info, err := os.Stat(newPath); err == nil && info.IsDir() {
+		if _, err := os.Stat(filepath.Join(newPath, ".git")); err == nil {
+			return newPath
+		}
+	}
+
+	// Old structure: rig/polecats/<name>/
+	oldPath := filepath.Join(rigPath, agentType, name)
+	if info, err := os.Stat(oldPath); err == nil && info.IsDir() {
+		if _, err := os.Stat(filepath.Join(oldPath, ".git")); err == nil {
+			return oldPath
+		}
+	}
+
+	return ""
 }
 
 // unhookBead sets a bead's status back to 'open'.

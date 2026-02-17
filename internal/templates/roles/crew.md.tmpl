@@ -366,6 +366,31 @@ gt nudge mayor "Status update needed"
 **Important:** `{{ cmd }} nudge` is the ONLY reliable way to send text to Claude sessions.
 Raw `tmux send-keys` is unreliable. Always use `{{ cmd }} nudge` for agent-to-agent communication.
 
+### Nudge Delivery Modes
+
+Nudges support three delivery modes to avoid interrupting agents mid-work:
+
+| Mode | Flag | Behavior |
+|------|------|----------|
+| Immediate | `--mode=immediate` (default) | Direct send-keys. Interrupts current work. |
+| Queue | `--mode=queue` | Writes to file queue. Agent picks up at next turn boundary via hook. |
+| Wait-idle | `--mode=wait-idle` | Waits for idle prompt, then delivers. Falls back to queue on timeout. |
+
+For non-urgent coordination, prefer `--mode=queue` to avoid killing in-flight work.
+
+### Nudge Resilience (for your own work)
+
+Queued nudges arrive as `<system-reminder>` blocks via your `UserPromptSubmit` hook.
+When you see a queued nudge:
+
+1. **Evaluate priority** — Is the nudge more urgent than your current task?
+2. **If higher priority**: Checkpoint current work (commit, update beads), then handle nudge
+3. **If lower priority**: Note the nudge, continue current work, handle when done
+
+For long-running operations (builds, tests, multi-step implementations), prefer
+`run_in_background: true` on Task and Bash tools. Background tasks survive turn
+interruption, making your work naturally nudge-resilient.
+
 ## No Witness Monitoring
 
 **Important**: Unlike polecats, you have no Witness watching over you:
@@ -411,17 +436,75 @@ fixed heuristics (N rounds → cycle), you cycle when it feels right:
 
 When you restart, your hook still has your molecule. The handoff mail provides context.
 
-## Session End Checklist
+## Landing the Plane (Session End Protocol)
 
-Before ending your session:
+When ending a session, complete ALL steps below. The plane is NOT landed until
+`git push` succeeds. NEVER stop before pushing. NEVER say "ready to push when
+you are!" - that is a FAILURE. YOU must push, not the user.
 
-```
-[ ] git status              (check for uncommitted changes)
-[ ] git push                (push any commits)
-[ ] Check inbox             (any messages needing response?)
-[ ] gt handoff              (cycle to fresh session)
-    # Or with context: gt handoff -s "Brief" -m "Details"
-```
+**MANDATORY WORKFLOW - COMPLETE ALL STEPS:**
+
+1. **File beads for remaining work** that needs follow-up:
+   ```bash
+   bd create "Follow-up: description" -t task
+   ```
+
+2. **Run quality gates** (only if code changes were made):
+   ```bash
+   go test ./...             # or: make test
+   golangci-lint run ./...   # or: make lint
+   ```
+   File P0 beads if quality gates are broken.
+
+3. **Update beads** - close finished work, update status:
+   ```bash
+   bd close <id> --reason "Completed"
+   ```
+
+4. **PUSH TO REMOTE - NON-NEGOTIABLE:**
+   ```bash
+   # Pull first to catch any remote changes
+   git pull --rebase
+
+   # Stage and commit any remaining changes
+   git add <files> && git commit -m "description"
+
+   # MANDATORY: Push everything to remote
+   # DO NOT STOP BEFORE THIS COMMAND COMPLETES
+   git push
+
+   # MANDATORY: Verify push succeeded
+   git status   # MUST show "up to date with origin/main"
+   ```
+
+   **CRITICAL RULES:**
+   - The plane has NOT landed until `git push` completes successfully
+   - NEVER stop before `git push` - unpushed work breaks multi-agent coordination
+   - NEVER say "ready to push when you are!" - YOU must push, not the user
+   - If `git push` fails, resolve the issue and retry until it succeeds
+
+5. **Clean up git state:**
+   ```bash
+   git stash clear              # Remove old stashes
+   git remote prune origin      # Clean up deleted remote branches
+   ```
+
+6. **Handoff or close:**
+   ```bash
+   # If cycling to fresh context:
+   {{ cmd }} handoff -s "Brief summary" -m "Details for next session"
+
+   # If done for now, verify clean state:
+   git status
+   ```
+
+7. **Provide session summary:**
+   - What was completed this session
+   - What beads were filed for follow-up
+   - Status of quality gates (all passing / issues filed)
+   - Confirmation that ALL changes have been pushed to remote
+
+**REMEMBER: Landing the plane means EVERYTHING is pushed to remote. No exceptions.**
 
 ## Desire Paths: Improving the Tooling
 
@@ -444,6 +527,24 @@ See `~/gt/docs/AGENT-ERGONOMICS.md` for the full philosophy.
 - **Ask for help**: No Witness means no automatic escalation. Reach out proactively.
 - **Clean git state**: Keep `git status` clean before breaks.
 - **Spot desire paths**: When commands fail but "should have worked", file a bead.
+
+## ⚡ Command Quick-Reference
+
+**Commonly confused — use the right command:**
+
+| Want to... | Correct command | Common mistake |
+|------------|----------------|----------------|
+| Message another agent | `{{ cmd }} nudge <target> "msg"` | ~~tmux send-keys~~ (unreliable) |
+| Dispatch work to polecat | `{{ cmd }} sling <bead> <rig>` | ~~gt polecat spawn~~ (not a command) |
+| Stop my session | `{{ cmd }} crew stop {{ .Polecat }}` | ~~gt rig stop~~ (stops rig agents, not crew) |
+| Pause rig (daemon won't restart) | `{{ cmd }} rig park <rig>` | ~~gt rig stop~~ (daemon will restart it) |
+| Permanently disable rig | `{{ cmd }} rig dock <rig>` | ~~gt rig park~~ (temporary only) |
+
+**Rig lifecycle commands (park vs dock vs stop):**
+- `park/unpark` — Temporary pause. Daemon skips parked rigs.
+- `dock/undock` — Persistent disable. Survives daemon restarts.
+- `stop/start` — Immediate stop/start of rig patrol agents (witness + refinery).
+- `restart/reboot` — Stop then start rig agents.
 
 Crew member: {{ .Polecat }}
 Rig: {{ .RigName }}

@@ -4,9 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"strings"
-
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/events"
@@ -16,6 +16,18 @@ import (
 )
 
 func runMailSend(cmd *cobra.Command, args []string) error {
+	// Handle --stdin: read message body from stdin (avoids shell quoting issues)
+	if mailStdin {
+		if mailBody != "" {
+			return fmt.Errorf("cannot use --stdin with --message/-m")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+		mailBody = strings.TrimRight(string(data), "\n")
+	}
+
 	var to string
 
 	if mailSendSelf {
@@ -58,13 +70,8 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	// Determine sender
 	from := detectSender()
 
-	// Create message
-	msg := &mail.Message{
-		From:    from,
-		To:      to,
-		Subject: mailSubject,
-		Body:    mailBody,
-	}
+	// Create message with auto-generated ID and thread ID
+	msg := mail.NewMessage(from, to, mailSubject, mailBody)
 
 	// Set priority (--urgent overrides --priority)
 	if mailUrgent {
@@ -88,6 +95,13 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	// Set CC recipients
 	msg.CC = mailCC
 
+	// Suppress router-side notification when --no-notify is passed.
+	// Otherwise the router handles idle-aware notification per-recipient,
+	// which also works correctly for fan-out (groups, lists, channels).
+	if mailNoNotify {
+		msg.SuppressNotify = true
+	}
+
 	// Handle reply-to: auto-set type to reply and look up thread
 	if mailReplyTo != "" {
 		msg.ReplyTo = mailReplyTo
@@ -95,11 +109,18 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			msg.Type = mail.TypeReply
 		}
 
-		// Look up original message to get thread ID
+		// Look up original message in current user's mailbox to get thread ID.
+		// The message we're replying to lives in our inbox (we received it),
+		// so we look it up via our own identity (from), not the recipient (to).
 		router := mail.NewRouter(workDir)
 		mailbox, err := router.GetMailbox(from)
-		if err == nil {
-			if original, err := mailbox.Get(mailReplyTo); err == nil {
+		if err != nil {
+			style.PrintWarning("could not open mailbox for thread lookup: %v", err)
+		} else {
+			original, err := mailbox.Get(mailReplyTo)
+			if err != nil {
+				style.PrintWarning("could not find original message %s for threading (new thread will be created)", mailReplyTo)
+			} else {
 				msg.ThreadID = original.ThreadID
 			}
 		}
@@ -119,6 +140,7 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		// Fall back to legacy routing if resolver fails
 		router := mail.NewRouter(workDir)
+		defer router.WaitPendingNotifications()
 		if err := router.Send(msg); err != nil {
 			return fmt.Errorf("sending message: %w", err)
 		}
@@ -128,9 +150,11 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Route based on recipient type
+	// Route based on recipient type, collecting errors instead of failing early
 	router := mail.NewRouter(workDir)
+	defer router.WaitPendingNotifications()
 	var recipientAddrs []string
+	var sendErrs []string
 
 	for _, rec := range recipients {
 		switch rec.Type {
@@ -138,7 +162,8 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			// Queue messages: single message, workers claim
 			msg.To = rec.Address
 			if err := router.Send(msg); err != nil {
-				return fmt.Errorf("sending to queue: %w", err)
+				sendErrs = append(sendErrs, fmt.Sprintf("queue %s: %v", rec.Address, err))
+				continue
 			}
 			recipientAddrs = append(recipientAddrs, rec.Address)
 
@@ -146,7 +171,8 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			// Channel messages: single message, broadcast
 			msg.To = rec.Address
 			if err := router.Send(msg); err != nil {
-				return fmt.Errorf("sending to channel: %w", err)
+				sendErrs = append(sendErrs, fmt.Sprintf("channel %s: %v", rec.Address, err))
+				continue
 			}
 			recipientAddrs = append(recipientAddrs, rec.Address)
 
@@ -154,11 +180,20 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 			// Direct/agent messages: fan out to each recipient
 			msgCopy := *msg
 			msgCopy.To = rec.Address
+			msgCopy.ID = "" // Each fan-out copy gets its own unique ID
 			if err := router.Send(&msgCopy); err != nil {
-				return fmt.Errorf("sending to %s: %w", rec.Address, err)
+				sendErrs = append(sendErrs, fmt.Sprintf("%s: %v", rec.Address, err))
+				continue
 			}
 			recipientAddrs = append(recipientAddrs, rec.Address)
 		}
+	}
+
+	if len(sendErrs) > 0 {
+		if len(recipientAddrs) == 0 {
+			return fmt.Errorf("all sends failed: %s", strings.Join(sendErrs, "; "))
+		}
+		fmt.Fprintf(os.Stderr, "⚠ Some deliveries failed: %s\n", strings.Join(sendErrs, "; "))
 	}
 
 	// Log mail event to activity feed

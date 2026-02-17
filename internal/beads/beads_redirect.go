@@ -111,20 +111,14 @@ func cleanBeadsRuntimeFiles(beadsDir string) error {
 
 	// Runtime files/patterns that are gitignored and safe to remove
 	runtimePatterns := []string{
-		// SQLite databases
-		"*.db", "*.db-*", "*.db?*",
 		// Daemon runtime
 		"daemon.lock", "daemon.log", "daemon.pid", "bd.sock",
 		// Sync state
-		"sync-state.json", "last-touched", "metadata.json",
+		"last-touched", "metadata.json",
 		// Version tracking
 		".local_version",
 		// Redirect file (we're about to recreate it)
 		"redirect",
-		// Merge artifacts
-		"beads.base.*", "beads.left.*", "beads.right.*",
-		// JSONL files (tracked but will be redirected, safe to remove in worktrees)
-		"issues.jsonl", "interactions.jsonl",
 		// Runtime directories
 		"mq",
 	}
@@ -148,36 +142,34 @@ func cleanBeadsRuntimeFiles(beadsDir string) error {
 	return firstErr
 }
 
-// SetupRedirect creates a .beads/redirect file for a worktree to point to the rig's shared beads.
-// This is used by crew, polecats, and refinery worktrees to share the rig's beads database.
+// ComputeRedirectTarget computes the expected redirect target for a worktree.
+// This is the canonical function for determining what a redirect should contain.
+// Both SetupRedirect and doctor checks should use this to stay in sync.
 //
 // Parameters:
 //   - townRoot: the town root directory (e.g., ~/gt)
 //   - worktreePath: the worktree directory (e.g., <rig>/crew/<name> or <rig>/refinery/rig)
 //
-// The function:
-//  1. Computes the relative path from worktree to rig-level .beads
-//  2. Cleans up runtime files (preserving tracked files like formulas/)
-//  3. Creates the redirect file
-//
-// Safety: This function refuses to create redirects in the canonical beads location
-// (mayor/rig) to prevent circular redirect chains.
-func SetupRedirect(townRoot, worktreePath string) error {
+// Returns the redirect target path (e.g., "../../.beads" or "../../mayor/rig/.beads"),
+// or an error if the path is invalid or no beads location exists.
+func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
 	// Get rig root from worktree path
 	// worktreePath = <town>/<rig>/crew/<name> or <town>/<rig>/refinery/rig etc.
 	relPath, err := filepath.Rel(townRoot, worktreePath)
 	if err != nil {
-		return fmt.Errorf("computing relative path: %w", err)
+		return "", fmt.Errorf("computing relative path: %w", err)
 	}
 	parts := strings.Split(filepath.ToSlash(relPath), "/")
 	if len(parts) < 2 {
-		return fmt.Errorf("invalid worktree path: must be at least 2 levels deep from town root")
+		return "", fmt.Errorf("invalid worktree path: must be at least 2 levels deep from town root")
 	}
 
-	// Safety check: prevent creating redirect in canonical beads location (mayor/rig)
-	// This would create a circular redirect chain since rig/.beads redirects to mayor/rig/.beads
-	if len(parts) >= 2 && parts[1] == "mayor" {
-		return fmt.Errorf("cannot create redirect in canonical beads location (mayor/rig)")
+	// Safety check: prevent creating redirect in canonical beads location (mayor/rig).
+	// This would create a circular redirect chain since rig/.beads redirects to mayor/rig/.beads.
+	// Check both parts[0] (worktree IS the mayor dir, e.g., <town>/mayor/rig) and
+	// parts[1] (worktree is inside a rig's mayor, e.g., <town>/<rig>/mayor/rig).
+	if parts[0] == "mayor" || (len(parts) >= 2 && parts[1] == "mayor") {
+		return "", fmt.Errorf("cannot create redirect in canonical beads location (mayor/rig)")
 	}
 
 	rigRoot := filepath.Join(townRoot, parts[0])
@@ -200,6 +192,10 @@ func SetupRedirect(townRoot, worktreePath string) error {
 			rigHasDB = true
 		} else if _, err := os.Stat(filepath.Join(rigBeadsPath, "beads.db")); err == nil {
 			rigHasDB = true
+		} else if _, err := os.Stat(filepath.Join(rigBeadsPath, "redirect")); err == nil {
+			// A redirect file is a valid beads configuration (tracked beads case).
+			// initBeads creates this to point to mayor/rig/.beads.
+			rigHasDB = true
 		}
 	}
 
@@ -207,34 +203,13 @@ func SetupRedirect(townRoot, worktreePath string) error {
 		// Rig .beads doesn't exist or has no database — check mayor/rig/.beads
 		if _, err := os.Stat(mayorBeadsPath); os.IsNotExist(err) {
 			if !rigBeadsExists {
-				return fmt.Errorf("no beads found at %s or %s", rigBeadsPath, mayorBeadsPath)
+				return "", fmt.Errorf("no beads found at %s or %s", rigBeadsPath, mayorBeadsPath)
 			}
 			// Rig .beads exists but has no DB and mayor path doesn't exist either.
 			// Fall through to use rig path (best effort).
 		} else {
 			usesMayorFallback = true
 		}
-	}
-
-	// Clean up runtime files in .beads/ but preserve tracked files (formulas/, README.md, etc.)
-	worktreeBeadsDir := filepath.Join(worktreePath, ".beads")
-
-	// Handle edge case: if .beads exists as a file (not directory), remove it.
-	// This can happen with stale state from previous failed operations or
-	// unusual clone state. MkdirAll would fail with "file exists" in this case.
-	if info, err := os.Stat(worktreeBeadsDir); err == nil && !info.IsDir() {
-		if err := os.Remove(worktreeBeadsDir); err != nil {
-			return fmt.Errorf("removing stale .beads file: %w", err)
-		}
-	}
-
-	if err := cleanBeadsRuntimeFiles(worktreeBeadsDir); err != nil {
-		return fmt.Errorf("cleaning runtime files: %w", err)
-	}
-
-	// Create .beads directory if it doesn't exist
-	if err := os.MkdirAll(worktreeBeadsDir, 0755); err != nil {
-		return fmt.Errorf("creating .beads dir: %w", err)
 	}
 
 	// Compute relative path from worktree to rig root
@@ -262,6 +237,67 @@ func SetupRedirect(townRoot, worktreePath string) error {
 				redirectPath = upPath + rigRedirectTarget
 			}
 		}
+	}
+
+	return redirectPath, nil
+}
+
+// SetupRedirect creates a .beads/redirect file for a worktree to point to the rig's shared beads.
+// This is used by crew, polecats, and refinery worktrees to share the rig's beads database.
+//
+// Parameters:
+//   - townRoot: the town root directory (e.g., ~/gt)
+//   - worktreePath: the worktree directory (e.g., <rig>/crew/<name> or <rig>/refinery/rig)
+//
+// The function:
+//  1. Computes the relative path from worktree to rig-level .beads
+//  2. Cleans up runtime files (preserving tracked files like formulas/)
+//  3. Creates the redirect file
+//
+// Safety: This function refuses to create redirects in the canonical beads location
+// (mayor/rig) to prevent circular redirect chains.
+func SetupRedirect(townRoot, worktreePath string) error {
+	redirectPath, err := ComputeRedirectTarget(townRoot, worktreePath)
+	if err != nil {
+		return err
+	}
+
+	// Warn only when using mayor fallback WITHOUT a redirect file.
+	// When rig/.beads/redirect exists pointing to mayor/rig/.beads, that's the
+	// intended configuration for tracked beads — not a fallback worth warning about.
+	if strings.Contains(redirectPath, "mayor/rig/.beads") {
+		relPath, _ := filepath.Rel(townRoot, worktreePath)
+		parts := strings.Split(filepath.ToSlash(relPath), "/")
+		rigRoot := filepath.Join(townRoot, parts[0])
+		rigRedirectPath := filepath.Join(rigRoot, ".beads", "redirect")
+		if _, err := os.Stat(rigRedirectPath); os.IsNotExist(err) {
+			// No redirect file — this is an unexpected fallback
+			rigBeadsPath := filepath.Join(rigRoot, ".beads")
+			mayorBeadsPath := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+			fmt.Fprintf(os.Stderr, "Warning: rig .beads not found at %s, using %s\n", rigBeadsPath, mayorBeadsPath)
+			fmt.Fprintf(os.Stderr, "  Run 'bd doctor' to fix rig beads configuration\n")
+		}
+	}
+
+	// Clean up runtime files in .beads/ but preserve tracked files (formulas/, README.md, etc.)
+	worktreeBeadsDir := filepath.Join(worktreePath, ".beads")
+
+	// Handle edge case: if .beads exists as a file (not directory), remove it.
+	// This can happen with stale state from previous failed operations or
+	// unusual clone state. MkdirAll would fail with "file exists" in this case.
+	if info, err := os.Stat(worktreeBeadsDir); err == nil && !info.IsDir() {
+		if err := os.Remove(worktreeBeadsDir); err != nil {
+			return fmt.Errorf("removing stale .beads file: %w", err)
+		}
+	}
+
+	if err := cleanBeadsRuntimeFiles(worktreeBeadsDir); err != nil {
+		return fmt.Errorf("cleaning runtime files: %w", err)
+	}
+
+	// Create .beads directory if it doesn't exist
+	if err := os.MkdirAll(worktreeBeadsDir, 0755); err != nil {
+		return fmt.Errorf("creating .beads dir: %w", err)
 	}
 
 	// Create redirect file

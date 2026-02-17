@@ -81,6 +81,9 @@ logs/
 # Polecats - worker worktrees
 **/polecats/
 
+# Deacon dogs - patrol worker worktrees
+**/deacon/dogs/
+
 # Mayor rig clones
 **/mayor/rig/
 
@@ -114,7 +117,7 @@ logs/
 # =============================================================================
 # Explicitly track (override above patterns)
 # =============================================================================
-# Note: .beads/ has its own .gitignore that handles SQLite files
+# Note: .beads/ has its own .gitignore that handles database files
 # and keeps issues.jsonl, metadata.json, config file as source of truth
 `
 
@@ -152,18 +155,6 @@ func runGitInit(cmd *cobra.Command, args []string) error {
 	// Install pre-checkout hook to prevent accidental branch switches
 	if err := InstallPreCheckoutHook(hqRoot); err != nil {
 		fmt.Printf("   %s Could not install pre-checkout hook: %v\n", style.Dim.Render("⚠"), err)
-	}
-
-	// Ensure beads database has repository fingerprint now that git is initialized.
-	// This fixes the case where 'gt install' ran before git, leaving the database
-	// without a fingerprint (causes slow bd commands due to daemon startup failures).
-	beadsDir := filepath.Join(hqRoot, ".beads")
-	if _, err := os.Stat(beadsDir); err == nil {
-		if err := ensureRepoFingerprint(hqRoot); err != nil {
-			fmt.Printf("   %s Could not update beads fingerprint: %v\n", style.Dim.Render("⚠"), err)
-		} else {
-			fmt.Printf("   ✓ Updated beads repository fingerprint\n")
-		}
 	}
 
 	// Create GitHub repo if requested
@@ -331,18 +322,6 @@ func InitGitForHarness(hqRoot string, github string, private bool) error {
 	// Install pre-checkout hook to prevent accidental branch switches
 	if err := InstallPreCheckoutHook(hqRoot); err != nil {
 		fmt.Printf("   %s Could not install pre-checkout hook: %v\n", style.Dim.Render("⚠"), err)
-	}
-
-	// Ensure beads database has repository fingerprint now that git is initialized.
-	// This fixes the case where 'gt install' ran before git, leaving the database
-	// without a fingerprint (causes slow bd commands due to daemon startup failures).
-	beadsDir := filepath.Join(hqRoot, ".beads")
-	if _, err := os.Stat(beadsDir); err == nil {
-		if err := ensureRepoFingerprint(hqRoot); err != nil {
-			fmt.Printf("   %s Could not update beads fingerprint: %v\n", style.Dim.Render("⚠"), err)
-		} else {
-			fmt.Printf("   ✓ Updated beads repository fingerprint\n")
-		}
 	}
 
 	// Create GitHub repo if requested

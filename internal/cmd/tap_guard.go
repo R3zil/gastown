@@ -18,7 +18,7 @@ is violated. They're called before the tool runs, preventing the
 forbidden operation entirely.
 
 Available guards:
-  pr-workflow   - Block PR creation and feature branches
+  pr-workflow      - Block PR creation and feature branches
 
 Example hook configuration:
   {
@@ -77,9 +77,7 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(os.Stderr, "║  See: ~/gt/docs/PRIMING.md (GUPP principle)                     ║")
 	fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
 	fmt.Fprintln(os.Stderr, "")
-	os.Exit(2) // Exit 2 = BLOCK in Claude Code hooks
-
-	return nil
+	return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
 }
 
 // isGasTownAgentContext returns true if we're running as a Gas Town managed agent.

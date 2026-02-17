@@ -45,6 +45,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache: true
 
       - name: Build without go:generate
         run: |
@@ -75,18 +76,31 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache: true
 
       - name: Configure Git
         run: |
           git config --global user.name "CI Bot"
           git config --global user.email "ci@gastown.test"
 
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
       - name: Build
         run: go build -v ./cmd/gt
 
       - name: Test with Coverage
         run: |
-          go test -race -short -coverprofile=coverage.out ./... 2>&1 | tee test-output.txt
+          set -o pipefail
+          gotestsum --format testname --junitfile junit.xml -- -race -short -coverprofile=coverage.out ./... 2>&1 | tee test-output.txt
+
+      - name: Test Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 .github/scripts/junit-report.py junit.xml "Unit Test Failures"
 
       - name: Upload Coverage Data
         if: github.event_name == 'pull_request'
@@ -110,6 +124,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache: true
 
       - name: Download Coverage Data
         uses: actions/download-artifact@v4
@@ -132,7 +147,9 @@ jobs:
           echo "|---------|----------|" >> coverage-report.md
 
           # Extract package coverage from all test output lines
+          # tr -d '()' handles both raw go test and gotestsum output formats
           grep -E "github.com/steveyegge/gastown.*coverage:" test-output.txt | \
+            tr -d '()' | \
             sed 's/.*github.com\/steveyegge\/gastown\///' | \
             awk '{
               pkg = $1
@@ -211,11 +228,12 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache: true
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.10.1
           args: --timeout=5m
 
   integration:
@@ -228,15 +246,26 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
+          cache: true
 
       - name: Configure Git
         run: |
           git config --global user.name "CI Bot"
           git config --global user.email "ci@gastown.test"
 
+      - name: Cache beads (bd)
+        id: cache-beads-int
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/bd
+          key: beads-${{ hashFiles('.github/workflows/ci.yml') }}
+
       - name: Install beads (bd)
-        # Pin to v0.47.1 - v0.47.2 has routing defaults that cause prefix mismatch errors
-        run: go install github.com/steveyegge/beads/cmd/bd@v0.47.1
+        if: steps.cache-beads-int.outputs.cache-hit != 'true'
+        run: go install github.com/steveyegge/beads/cmd/bd@v0.52.0
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
 
       - name: Build gt
         run: |
@@ -247,4 +276,12 @@ jobs:
         run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
       - name: Integration Tests
-        run: go test -tags=integration -timeout=5m -v ./internal/cmd/...
+        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=5m -v ./internal/cmd/...
+
+      - name: Test Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 .github/scripts/junit-report.py junit-integration.xml "Integration Test Failures"

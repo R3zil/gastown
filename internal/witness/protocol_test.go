@@ -18,6 +18,8 @@ func TestClassifyMessage(t *testing.T) {
 		{"MERGED valkyrie", ProtoMerged},
 		{"MERGE_FAILED nux", ProtoMergeFailed},
 		{"MERGE_FAILED ace", ProtoMergeFailed},
+		{"MERGE_READY nux", ProtoMergeReady},
+		{"MERGE_READY ace", ProtoMergeReady},
 		{"🤝 HANDOFF: Patrol context", ProtoHandoff},
 		{"🤝HANDOFF: No space", ProtoHandoff},
 		{"SWARM_START", ProtoSwarmStart},
@@ -215,6 +217,112 @@ func TestParseMergeFailed_InvalidSubject(t *testing.T) {
 	_, err := ParseMergeFailed("Not a merge failed", "body")
 	if err == nil {
 		t.Error("ParseMergeFailed() expected error for invalid subject")
+	}
+}
+
+func TestParseMergeReady(t *testing.T) {
+	subject := "MERGE_READY nux"
+	body := `Branch: polecat/nux/gt-abc123
+Issue: gt-abc123
+MR: mr-xyz789
+Polecat: nux
+Verified: clean git state`
+
+	payload, err := ParseMergeReady(subject, body)
+	if err != nil {
+		t.Fatalf("ParseMergeReady() error = %v", err)
+	}
+
+	if payload.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "nux")
+	}
+	if payload.Branch != "polecat/nux/gt-abc123" {
+		t.Errorf("Branch = %q, want %q", payload.Branch, "polecat/nux/gt-abc123")
+	}
+	if payload.IssueID != "gt-abc123" {
+		t.Errorf("IssueID = %q, want %q", payload.IssueID, "gt-abc123")
+	}
+	if payload.MRID != "mr-xyz789" {
+		t.Errorf("MRID = %q, want %q", payload.MRID, "mr-xyz789")
+	}
+	if payload.ReadyAt.IsZero() {
+		t.Error("ReadyAt should not be zero")
+	}
+}
+
+func TestParseMergeReady_MinimalBody(t *testing.T) {
+	subject := "MERGE_READY ace"
+	body := "Branch: feature-ace"
+
+	payload, err := ParseMergeReady(subject, body)
+	if err != nil {
+		t.Fatalf("ParseMergeReady() error = %v", err)
+	}
+
+	if payload.PolecatName != "ace" {
+		t.Errorf("PolecatName = %q, want %q", payload.PolecatName, "ace")
+	}
+	if payload.Branch != "feature-ace" {
+		t.Errorf("Branch = %q, want %q", payload.Branch, "feature-ace")
+	}
+	if payload.IssueID != "" {
+		t.Errorf("IssueID = %q, want empty", payload.IssueID)
+	}
+}
+
+func TestParseMergeReady_InvalidSubject(t *testing.T) {
+	_, err := ParseMergeReady("Not a merge ready", "body")
+	if err == nil {
+		t.Error("ParseMergeReady() expected error for invalid subject")
+	}
+}
+
+func TestParseSwarmStart(t *testing.T) {
+	body := `SwarmID: batch-123
+Beads: bd-a, bd-b, bd-c
+Total: 3`
+
+	payload, err := ParseSwarmStart(body)
+	if err != nil {
+		t.Fatalf("ParseSwarmStart() error = %v", err)
+	}
+
+	if payload.SwarmID != "batch-123" {
+		t.Errorf("SwarmID = %q, want %q", payload.SwarmID, "batch-123")
+	}
+	if payload.Total != 3 {
+		t.Errorf("Total = %d, want %d", payload.Total, 3)
+	}
+	expectedBeads := []string{"bd-a", "bd-b", "bd-c"}
+	if len(payload.BeadIDs) != len(expectedBeads) {
+		t.Fatalf("BeadIDs has %d items, want %d", len(payload.BeadIDs), len(expectedBeads))
+	}
+	for i, b := range payload.BeadIDs {
+		if b != expectedBeads[i] {
+			t.Errorf("BeadIDs[%d] = %q, want %q", i, b, expectedBeads[i])
+		}
+	}
+	if payload.StartedAt.IsZero() {
+		t.Error("StartedAt should not be zero")
+	}
+}
+
+func TestParseSwarmStart_MinimalBody(t *testing.T) {
+	body := "SwarmID: batch-456"
+
+	payload, err := ParseSwarmStart(body)
+	if err != nil {
+		t.Fatalf("ParseSwarmStart() error = %v", err)
+	}
+
+	if payload.SwarmID != "batch-456" {
+		t.Errorf("SwarmID = %q, want %q", payload.SwarmID, "batch-456")
+	}
+	if payload.Total != 0 {
+		t.Errorf("Total = %d, want 0", payload.Total)
+	}
+	if len(payload.BeadIDs) != 0 {
+		t.Errorf("BeadIDs = %v, want empty", payload.BeadIDs)
 	}
 }
 

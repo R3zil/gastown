@@ -80,9 +80,6 @@ func runMailThread(cmd *cobra.Command, args []string) error {
 }
 
 func runMailReply(cmd *cobra.Command, args []string) error {
-	if mailReplyMessage == "" {
-		return fmt.Errorf("required flag \"message\" or \"body\" not set")
-	}
 	msgID := args[0]
 
 	// Get message body from positional arg or flag (positional takes precedence)
@@ -144,7 +141,8 @@ func runMailReply(cmd *cobra.Command, args []string) error {
 		reply.ThreadID = generateThreadID()
 	}
 
-	// Send the reply
+	// Send the reply (defer drains async notification goroutines before CLI exits)
+	defer router.WaitPendingNotifications()
 	if err := router.Send(reply); err != nil {
 		return fmt.Errorf("sending reply: %w", err)
 	}

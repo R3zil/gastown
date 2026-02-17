@@ -44,7 +44,7 @@ var dogCmd = &cobra.Command{
 	Long: `Manage dogs - reusable workers for infrastructure and cleanup.
 
 CATS VS DOGS:
-  Polecats (cats) build features. One rig. Ephemeral (one task, then nuked).
+  Polecats (cats) build features. One rig. Ephemeral sessions (one task, then nuked).
   Dogs clean up messes. Cross-rig. Reusable (multiple tasks, eventually recycled).
 
 Dogs are managed by the Deacon for town-level work:
@@ -347,6 +347,9 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 		b = beads.New(townRoot)
 	}
 
+	var removeErrors []string
+	removed := 0
+
 	for _, name := range names {
 		d, err := mgr.Get(name)
 		if err != nil {
@@ -356,22 +359,40 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 
 		// Check if working
 		if d.State == dog.StateWorking && !dogForce {
-			return fmt.Errorf("dog %s is working (use --force to remove anyway)", name)
+			removeErrors = append(removeErrors, fmt.Sprintf("%s: is working (use --force to remove anyway)", name))
+			continue
 		}
 
 		if err := mgr.Remove(name); err != nil {
-			return fmt.Errorf("removing dog %s: %w", name, err)
+			removeErrors = append(removeErrors, fmt.Sprintf("%s: %v", name, err))
+			continue
 		}
 
 		fmt.Printf("✓ Removed dog %s\n", name)
+		removed++
 
-		// Delete agent bead for the dog
+		// Reset agent bead for the dog (preserves persistent identity)
 		if b != nil {
-			if err := b.DeleteDogAgentBead(name); err != nil {
+			if err := b.ResetDogAgentBead(name); err != nil {
 				// Non-fatal: warn but don't fail dog removal
-				fmt.Printf("  Warning: could not delete agent bead: %v\n", err)
+				fmt.Printf("  Warning: could not reset agent bead: %v\n", err)
 			}
 		}
+	}
+
+	if len(removeErrors) > 0 {
+		fmt.Printf("\nSome removals failed:\n")
+		for _, e := range removeErrors {
+			fmt.Printf("  - %s\n", e)
+		}
+	}
+
+	if removed > 0 {
+		fmt.Printf("\n✓ Removed %d dog(s).\n", removed)
+	}
+
+	if len(removeErrors) > 0 {
+		return fmt.Errorf("%d removal(s) failed", len(removeErrors))
 	}
 
 	return nil
@@ -546,15 +567,11 @@ func runDogClear(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check for live tmux session
-	townRoot, _ := workspace.FindFromCwd()
-	if townRoot != "" && !dogForce {
-		townName, err := workspace.GetTownName(townRoot)
-		if err == nil {
-			sessionName := fmt.Sprintf("gt-%s-deacon-%s", townName, name)
-			tm := tmux.NewTmux()
-			if has, _ := tm.HasSession(sessionName); has {
-				return fmt.Errorf("dog %s has an active session (%s)\nUse --force to clear anyway", name, sessionName)
-			}
+	if !dogForce {
+		sessionName := fmt.Sprintf("hq-dog-%s", name)
+		tm := tmux.NewTmux()
+		if has, _ := tm.HasSession(sessionName); has {
+			return fmt.Errorf("dog %s has an active session (%s)\nUse --force to clear anyway", name, sessionName)
 		}
 	}
 
@@ -681,16 +698,10 @@ func showDogStatus(mgr *dog.Manager, name string) error {
 	}
 
 	// Check for tmux session
-	townRoot, _ := workspace.FindFromCwd()
-	if townRoot != "" {
-		townName, err := workspace.GetTownName(townRoot)
-		if err == nil {
-			sessionName := fmt.Sprintf("gt-%s-deacon-%s", townName, name)
-			tm := tmux.NewTmux()
-			if has, _ := tm.HasSession(sessionName); has {
-				fmt.Printf("\nSession: %s (running)\n", sessionName)
-			}
-		}
+	sessionName := fmt.Sprintf("hq-dog-%s", name)
+	tm := tmux.NewTmux()
+	if has, _ := tm.HasSession(sessionName); has {
+		fmt.Printf("\nSession: %s (running)\n", sessionName)
 	}
 
 	return nil
@@ -917,6 +928,7 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 	body := formatPluginMailBody(p)
 
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
+	defer router.WaitPendingNotifications()
 	msg := &mail.Message{
 		From:      "deacon/",
 		To:        dogAddress,

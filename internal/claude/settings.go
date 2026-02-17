@@ -27,7 +27,7 @@ const (
 // RoleTypeFor returns the RoleType for a given role name.
 func RoleTypeFor(role string) RoleType {
 	switch role {
-	case "polecat", "witness", "refinery", "deacon":
+	case "polecat", "witness", "refinery", "deacon", "boot":
 		return Autonomous
 	default:
 		return Interactive
@@ -35,8 +35,8 @@ func RoleTypeFor(role string) RoleType {
 }
 
 // EnsureSettings ensures .claude/settings.json exists in the given directory.
-// For worktrees, we use sparse checkout to exclude source repo's .claude/ directory,
-// so our settings.json is the only one Claude Code sees.
+// Settings are installed in a gastown-managed parent directory and passed to
+// Claude Code via --settings flag, keeping customer repos untouched.
 func EnsureSettings(workDir string, roleType RoleType) error {
 	return EnsureSettingsAt(workDir, roleType, ".claude", "settings.json")
 }

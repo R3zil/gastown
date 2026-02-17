@@ -63,7 +63,7 @@ Your personal workspace within a rig. Where you do hands-on work.
 
 ### Polecats 🦨
 
-Ephemeral worker agents that spawn, complete a task, and disappear.
+Worker agents with persistent identity but ephemeral sessions. Spawned for tasks, sessions end on completion, but identity and work history persist.
 
 ### Hooks 🪝
 
@@ -87,7 +87,7 @@ Git-backed issue tracking system that stores work state as structured data.
 
 - **Go 1.23+** - [go.dev/dl](https://go.dev/dl/)
 - **Git 2.25+** - for worktree support
-- **beads (bd) 0.44.0+** - [github.com/steveyegge/beads](https://github.com/steveyegge/beads) (required for custom type support)
+- **beads (bd) 0.52.0+** - [github.com/steveyegge/beads](https://github.com/steveyegge/beads)
 - **sqlite3** - for convoy database queries (usually pre-installed on macOS/Linux)
 - **tmux 3.0+** - recommended for full experience
 - **Claude Code CLI** (default runtime) - [claude.ai/code](https://claude.ai/code)
@@ -307,7 +307,7 @@ Gas Town supports multiple AI coding runtimes. Per-rig runtime settings are in `
 
 **Notes:**
 
-- Claude uses hooks in `.claude/settings.json` for mail injection and startup.
+- Claude uses hooks in `.claude/settings.json` (managed via `--settings` flag) for mail injection and startup.
 - For Codex, set `project_doc_fallback_filenames = ["CLAUDE.md"]` in
   `~/.codex/config.toml` so role instructions are picked up.
 - For runtimes without hooks (e.g., Codex), Gas Town sends a startup fallback

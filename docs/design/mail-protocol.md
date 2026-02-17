@@ -128,24 +128,70 @@ The Refinery will retry the merge after rebase is complete.
 
 **Handler**: Witness notifies polecat with rebase instructions.
 
-### WITNESS_PING
+### RECOVERED_BEAD
 
-**Route**: Witness → Deacon (all witnesses send)
+**Route**: Witness → Deacon
 
-**Purpose**: Second-order monitoring - ensure Deacon is alive.
+**Purpose**: Notify Deacon that a dead polecat's abandoned work has been recovered
+and needs re-dispatch.
 
-**Subject format**: `WITNESS_PING <rig>`
+**Subject format**: `RECOVERED_BEAD <bead-id>`
 
 **Body format**:
 ```
-Rig: <rig>
-Timestamp: <timestamp>
-Patrol: <cycle-number>
+Recovered abandoned bead from dead polecat.
+
+Bead: <bead-id>
+Polecat: <rig>/<polecat-name>
+Previous Status: <hooked|in_progress>
+
+The bead has been reset to open with no assignee.
+Please re-dispatch to an available polecat.
 ```
 
-**Trigger**: Each witness sends periodically (every N patrol cycles).
+**Trigger**: Witness detects a zombie polecat with work still hooked/in_progress.
+The bead is reset to open status and this mail is sent for re-dispatch.
 
-**Handler**: Deacon acknowledges. If no ack, witnesses escalate to Mayor.
+**Handler**: Deacon runs `gt deacon redispatch <bead-id>` which:
+- Rate-limits re-dispatches (5-minute cooldown per bead)
+- Tracks failure count (after 3 failures, escalates to Mayor)
+- Auto-detects target rig from bead prefix
+- Slings the bead to an available polecat via `gt sling`
+
+### RECOVERY_NEEDED
+
+**Route**: Witness → Deacon
+
+**Purpose**: Escalate a dirty polecat that has unpushed/uncommitted work needing
+manual recovery before cleanup.
+
+**Subject format**: `RECOVERY_NEEDED <rig>/<polecat-name>`
+
+**Body format**:
+```
+Polecat: <rig>/<polecat-name>
+Cleanup Status: <has_uncommitted|has_stash|has_unpushed>
+Branch: <branch>
+Issue: <issue-id>
+Detected: <timestamp>
+```
+
+**Trigger**: Witness detects zombie polecat with dirty git state.
+
+**Handler**: Deacon coordinates recovery (push branch, save work) before
+authorizing cleanup. Only escalates to Mayor if Deacon cannot resolve.
+
+### WITNESS_PING (deprecated)
+
+**Status**: Removed. Witnesses no longer send WITNESS_PING mail.
+
+**Previous behavior**: Witnesses sent heartbeat mail to the Deacon every patrol
+cycle, which spammed inboxes with routine noise.
+
+**Current behavior**: Witnesses passively check the Deacon's agent bead
+`last_activity` timestamp. If stale (>5 minutes), they escalate directly to
+the Mayor with an `ALERT: Deacon appears unresponsive` message. No routine
+heartbeat mail is sent — only escalations when a problem is detected.
 
 ### HELP
 
@@ -290,19 +336,42 @@ Polecat                       │                          │
    │                          │                    (retry merge)
 ```
 
+### Abandoned Work Recovery Flow
+
+```
+Dead Polecat               Witness                    Deacon
+     │                        │                          │
+     │ (session dies)         │                          │
+     │                        │                          │
+     │                  (detects zombie)                 │
+     │                  (bead status=hooked)             │
+     │                        │                          │
+     │                  resetAbandonedBead()             │
+     │                  bd update --status=open          │
+     │                        │                          │
+     │                        │ RECOVERED_BEAD           │
+     │                        │─────────────────────────>│
+     │                        │                          │
+     │                        │                    gt deacon redispatch
+     │                        │                    gt sling <bead> <rig>
+     │                        │                          │
+     │                        │                          ├──> New Polecat
+     │                        │                          │    (re-dispatched)
+```
+
 ### Second-Order Monitoring
 
 ```
 Witness-1 ──┐
-            │ WITNESS_PING
-Witness-2 ──┼────────────────> Deacon
+            │ (check agent bead last_activity)
+Witness-2 ──┼────────────────> Deacon agent bead
             │
 Witness-N ──┘
                                  │
-                          (if no response)
+                          (if stale >5min)
                                  │
-            <────────────────────┘
-            Escalate to Mayor
+            ─────────────────────┘
+            ALERT to Mayor (mail only on failure)
 ```
 
 ## Implementation

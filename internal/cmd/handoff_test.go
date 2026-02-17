@@ -3,12 +3,47 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
+func setupHandoffTestRegistry(t *testing.T) {
+	t.Helper()
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", "gastown")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+}
+
+func TestHandoffStdinFlag(t *testing.T) {
+	t.Run("errors when both stdin and message provided", func(t *testing.T) {
+		// Save and restore flag state
+		origMessage := handoffMessage
+		origStdin := handoffStdin
+		defer func() {
+			handoffMessage = origMessage
+			handoffStdin = origStdin
+		}()
+
+		handoffMessage = "some message"
+		handoffStdin = true
+
+		err := runHandoff(handoffCmd, nil)
+		if err == nil {
+			t.Fatal("expected error when both --stdin and --message are set")
+		}
+		if !strings.Contains(err.Error(), "cannot use --stdin with --message/-m") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
 func TestSessionWorkDir(t *testing.T) {
+	setupHandoffTestRegistry(t)
 	townRoot := "/home/test/gt"
 
 	tests := []struct {
@@ -31,19 +66,19 @@ func TestSessionWorkDir(t *testing.T) {
 		},
 		{
 			name:        "crew runs from crew subdirectory",
-			sessionName: "gt-gastown-crew-holden",
+			sessionName: "gt-crew-holden",
 			wantDir:     townRoot + "/gastown/crew/holden",
 			wantErr:     false,
 		},
 		{
 			name:        "witness runs from witness directory",
-			sessionName: "gt-gastown-witness",
+			sessionName: "gt-witness",
 			wantDir:     townRoot + "/gastown/witness",
 			wantErr:     false,
 		},
 		{
 			name:        "refinery runs from refinery/rig directory",
-			sessionName: "gt-gastown-refinery",
+			sessionName: "gt-refinery",
 			wantDir:     townRoot + "/gastown/refinery/rig",
 			wantErr:     false,
 		},

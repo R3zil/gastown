@@ -58,11 +58,17 @@ func runPeek(cmd *cobra.Command, args []string) error {
 
 	rigName, polecatName, err := parseAddress(address)
 	if err != nil {
+		if !strings.Contains(address, "/") {
+			return fmt.Errorf("not in a rig directory. Use full address format: gt peek <rig>/<polecat>")
+		}
 		return err
 	}
 
 	mgr, _, err := getSessionManager(rigName)
 	if err != nil {
+		if !strings.Contains(address, "/") {
+			return fmt.Errorf("not in a rig directory. Use full address format: gt peek <rig>/<polecat>")
+		}
 		return err
 	}
 
@@ -72,7 +78,7 @@ func runPeek(cmd *cobra.Command, args []string) error {
 	// e.g., "beads/crew/dave" -> session name "gt-beads-crew-dave"
 	if strings.HasPrefix(polecatName, "crew/") {
 		crewName := strings.TrimPrefix(polecatName, "crew/")
-		sessionID := session.CrewSessionName(rigName, crewName)
+		sessionID := session.CrewSessionName(session.PrefixFor(rigName), crewName)
 		output, err = mgr.CaptureSession(sessionID, lines)
 	} else {
 		output, err = mgr.Capture(polecatName, lines)

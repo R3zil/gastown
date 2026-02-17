@@ -5,13 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var (
@@ -26,11 +31,11 @@ var (
 var moleculeAwaitSignalCmd = &cobra.Command{
 	Use:   "await-signal",
 	Short: "Wait for activity feed signal with timeout",
-	Long: `Wait for any activity on the beads feed, with optional backoff.
+	Long: `Wait for any activity on the events feed, with optional backoff.
 
-This command is the primary wake mechanism for patrol agents. It subscribes
-to 'bd activity --follow' and returns immediately when any line of output
-is received (indicating beads activity).
+This command is the primary wake mechanism for patrol agents. It tails
+~/gt/.events.jsonl and returns immediately when a new event is appended
+(indicating Gas Town activity such as slings, nudges, mail, spawns, etc.).
 
 If no activity occurs within the timeout, the command returns with exit code 0
 but sets the AWAIT_SIGNAL_REASON environment variable to "timeout".
@@ -48,7 +53,7 @@ received, the caller should reset idle:0 on the agent bead.
 
 EXIT CODES:
   0 - Signal received or timeout (check output for which)
-  1 - Error starting feed subscription
+  1 - Error opening events file
 
 EXAMPLES:
   # Simple wait with 60s timeout
@@ -94,16 +99,23 @@ func init() {
 }
 
 func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
-	// Find beads directory
+	// Find beads directory (rig-local for bead operations)
 	workDir, err := findLocalBeadsDir()
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
 	}
 
+	// Find town root for events file (events are always at <townRoot>/.events.jsonl)
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
 	beadsDir := beads.ResolveBeadsDir(workDir)
 
-	// Read current idle cycles from agent bead (if specified)
+	// Read current idle cycles and backoff window from agent bead (if specified)
 	var idleCycles int
+	var backoffUntil time.Time // zero value means no active window
 	if awaitSignalAgentBead != "" {
 		labels, err := getAgentLabels(awaitSignalAgentBead, beadsDir)
 		if err != nil {
@@ -112,21 +124,59 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 				fmt.Printf("%s Could not read agent bead (starting at idle=0): %v\n",
 					style.Dim.Render("⚠"), err)
 			}
-		} else if idleStr, ok := labels["idle"]; ok {
-			if n, err := parseIntSimple(idleStr); err == nil {
-				idleCycles = n
+		} else {
+			if idleStr, ok := labels["idle"]; ok {
+				if n, err := parseIntSimple(idleStr); err == nil {
+					idleCycles = n
+				}
+			}
+			if untilStr, ok := labels["backoff-until"]; ok {
+				if ts, err := parseIntSimple(untilStr); err == nil && ts > 0 {
+					backoffUntil = time.Unix(int64(ts), 0)
+				}
 			}
 		}
 	}
 
-	// Calculate effective timeout (uses idle cycles if backoff mode)
-	timeout, err := calculateEffectiveTimeout(idleCycles)
+	// Calculate full timeout from backoff formula (uses idle cycles)
+	fullTimeout, err := calculateEffectiveTimeout(idleCycles)
 	if err != nil {
 		return fmt.Errorf("invalid timeout configuration: %w", err)
 	}
 
+	// Determine effective timeout: resume from persisted window or start fresh.
+	// This makes backoff resilient to interrupts (e.g., nudges that kill the
+	// running await-signal). If the process is interrupted and relaunched within
+	// the same backoff window, it sleeps only for the remaining time.
+	timeout := fullTimeout
+	resumed := false
+	now := time.Now()
+	if awaitSignalAgentBead != "" && !backoffUntil.IsZero() && backoffUntil.After(now) {
+		remaining := backoffUntil.Sub(now)
+		// Sanity: remaining should not exceed the calculated full timeout.
+		// If idle:N was reset externally, the stored window may be stale.
+		if remaining <= fullTimeout {
+			timeout = remaining
+			resumed = true
+		}
+	}
+
+	// Persist the backoff window end time so interrupted invocations can resume.
+	if awaitSignalAgentBead != "" && !resumed {
+		windowEnd := now.Add(timeout)
+		if err := setAgentBackoffUntil(awaitSignalAgentBead, beadsDir, windowEnd); err != nil {
+			if !awaitSignalQuiet {
+				fmt.Printf("%s Failed to persist backoff window: %v\n",
+					style.Dim.Render("⚠"), err)
+			}
+		}
+	}
+
 	if !awaitSignalQuiet && !moleculeJSON {
-		if awaitSignalAgentBead != "" {
+		if resumed {
+			fmt.Printf("%s Resuming backoff (remaining: %v, idle: %d)...\n",
+				style.Dim.Render("⏳"), timeout.Round(time.Second), idleCycles)
+		} else if awaitSignalAgentBead != "" {
 			fmt.Printf("%s Awaiting signal (timeout: %v, idle: %d)...\n",
 				style.Dim.Render("⏳"), timeout, idleCycles)
 		} else {
@@ -137,18 +187,18 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 
 	startTime := time.Now()
 
-	// Start bd activity --follow
+	// Tail events file for new activity
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := waitForActivitySignal(ctx, workDir)
+	result, err := waitForActivitySignal(ctx, townRoot)
 	if err != nil {
 		return fmt.Errorf("feed subscription failed: %w", err)
 	}
 
 	result.Elapsed = time.Since(startTime)
 
-	// On timeout, increment idle cycles on agent bead
+	// On timeout, increment idle cycles and clear backoff window
 	if result.Reason == "timeout" && awaitSignalAgentBead != "" {
 		newIdleCycles := idleCycles + 1
 		if err := setAgentIdleCycles(awaitSignalAgentBead, beadsDir, newIdleCycles); err != nil {
@@ -159,6 +209,15 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 		} else {
 			result.IdleCycles = newIdleCycles
 		}
+		// Update last_activity so watchers know agent is still alive
+		if err := updateAgentHeartbeat(awaitSignalAgentBead, beadsDir); err != nil {
+			if !awaitSignalQuiet {
+				fmt.Printf("%s Failed to update agent heartbeat: %v\n",
+					style.Dim.Render("⚠"), err)
+			}
+		}
+		// Clear the backoff window — timeout completed normally
+		_ = clearAgentBackoffUntil(awaitSignalAgentBead, beadsDir)
 	} else if result.Reason == "signal" && awaitSignalAgentBead != "" {
 		// On signal, update last_activity to prove agent is alive
 		if err := updateAgentHeartbeat(awaitSignalAgentBead, beadsDir); err != nil {
@@ -169,6 +228,8 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 		}
 		// Report current idle cycles (caller should reset)
 		result.IdleCycles = idleCycles
+		// Clear the backoff window — woken by real activity
+		_ = clearAgentBackoffUntil(awaitSignalAgentBead, beadsDir)
 	}
 
 	// Output result
@@ -241,74 +302,56 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 	return time.ParseDuration(awaitSignalTimeout)
 }
 
-// waitForActivitySignal starts bd activity --follow and waits for any output.
-// Returns immediately when a line is received, or when context is canceled.
-func waitForActivitySignal(ctx context.Context, workDir string) (*AwaitSignalResult, error) {
-	// Start bd activity --follow
-	cmd := exec.CommandContext(ctx, "bd", "activity", "--follow")
-	cmd.Dir = workDir
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("creating stdout pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting bd activity: %w", err)
-	}
-
-	// Channel for results
-	signalCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-
-	// Read lines in goroutine
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		if scanner.Scan() {
-			// Got a line - this is our signal
-			signalCh <- scanner.Text()
-		} else if err := scanner.Err(); err != nil {
-			errCh <- err
-		}
-	}()
-
-	// Wait for signal, error, or timeout
-	select {
-	case signal := <-signalCh:
-		// Got activity signal - kill the process and return
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return &AwaitSignalResult{
-			Reason: "signal",
-			Signal: signal,
-		}, nil
-
-	case err := <-errCh:
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return nil, fmt.Errorf("reading from feed: %w", err)
-
-	case <-ctx.Done():
-		// Timeout - kill process and return timeout result
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return &AwaitSignalResult{
-			Reason: "timeout",
-		}, nil
-	}
+// waitForActivitySignal tails the events file for new activity.
+// townRoot is the Gas Town workspace root; the events file is at
+// <townRoot>/.events.jsonl. Returns immediately when a new event line is
+// appended, or when context is canceled.
+func waitForActivitySignal(ctx context.Context, townRoot string) (*AwaitSignalResult, error) {
+	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile))
 }
 
-// GetCurrentStepBackoff retrieves backoff config from the current step.
-// This is used by patrol agents to get the timeout for await-signal.
-func GetCurrentStepBackoff(workDir string) (*beads.BackoffConfig, error) {
-	b := beads.New(workDir)
+// waitForEventsFile tails the events file for new lines.
+// This replaces the former bd activity --follow subprocess approach.
+func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResult, error) {
 
-	// Get current agent's hook
-	// This would need to query the pinned/hooked bead and parse its description
-	// for backoff configuration. For now, return nil (use defaults).
-	_ = b
+	f, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("opening events file %s: %w", eventsPath, err)
+	}
+	defer f.Close()
 
-	return nil, nil
+	// Seek to end — we only want new events, not historical ones
+	if _, err := f.Seek(0, 2); err != nil {
+		return nil, fmt.Errorf("seeking to end of events file: %w", err)
+	}
+
+	// Poll for new lines using bufio.Reader (not Scanner, which doesn't
+	// resume after EOF). Reader.ReadString properly retries the underlying
+	// file reader, picking up appended data between polls.
+	reader := bufio.NewReader(f)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return &AwaitSignalResult{
+				Reason: "timeout",
+			}, nil
+		case <-ticker.C:
+			line, err := reader.ReadString('\n')
+			if err == nil && line != "" {
+				return &AwaitSignalResult{
+					Reason: "signal",
+					Signal: strings.TrimRight(line, "\n"),
+				}, nil
+			}
+			// io.EOF means no new data yet — keep polling
+			if err != nil && err != io.EOF {
+				return nil, fmt.Errorf("reading events file: %w", err)
+			}
+		}
+	}
 }
 
 // parseIntSimple parses a string to int without using strconv.
@@ -369,5 +412,75 @@ func setAgentIdleCycles(agentBead, beadsDir string, cycles int) error {
 		return fmt.Errorf("setting idle label: %w", err)
 	}
 
+	return nil
+}
+
+// setAgentBackoffUntil persists a backoff-until:TIMESTAMP label on the agent bead.
+// This allows interrupted await-signal invocations to resume with remaining time
+// instead of restarting the full backoff period.
+func setAgentBackoffUntil(agentBead, beadsDir string, until time.Time) error {
+	allLabels, err := getAllAgentLabels(agentBead, beadsDir)
+	if err != nil {
+		return err
+	}
+
+	var newLabels []string
+	for _, label := range allLabels {
+		if len(label) > 14 && label[:14] == "backoff-until:" {
+			continue // Strip existing backoff-until
+		}
+		newLabels = append(newLabels, label)
+	}
+	newLabels = append(newLabels, fmt.Sprintf("backoff-until:%d", until.Unix()))
+
+	args := []string{"update", agentBead}
+	for _, label := range newLabels {
+		args = append(args, "--set-labels="+label)
+	}
+
+	cmd := exec.Command("bd", args...)
+	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("setting backoff-until label: %w", err)
+	}
+	return nil
+}
+
+// clearAgentBackoffUntil removes the backoff-until label from the agent bead.
+// Called when await-signal completes normally (timeout or signal received).
+func clearAgentBackoffUntil(agentBead, beadsDir string) error {
+	allLabels, err := getAllAgentLabels(agentBead, beadsDir)
+	if err != nil {
+		return err
+	}
+
+	var newLabels []string
+	found := false
+	for _, label := range allLabels {
+		if len(label) > 14 && label[:14] == "backoff-until:" {
+			found = true
+			continue // Strip backoff-until
+		}
+		newLabels = append(newLabels, label)
+	}
+
+	if !found {
+		return nil // Nothing to clear
+	}
+
+	args := []string{"update", agentBead}
+	if len(newLabels) == 0 {
+		args = append(args, "--set-labels=")
+	} else {
+		for _, label := range newLabels {
+			args = append(args, "--set-labels="+label)
+		}
+	}
+
+	cmd := exec.Command("bd", args...)
+	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("clearing backoff-until label: %w", err)
+	}
 	return nil
 }

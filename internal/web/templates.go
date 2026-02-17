@@ -125,11 +125,14 @@ type IssueRow struct {
 
 // ActivityRow represents an event in the activity feed.
 type ActivityRow struct {
-	Time    string // Formatted time (e.g., "2m ago")
-	Icon    string // Emoji for event type
-	Type    string // Event type (sling, done, mail, etc.)
-	Actor   string // Who did it
-	Summary string // Human-readable description
+	Time         string // Formatted time (e.g., "2m ago")
+	Icon         string // Emoji for event type
+	Type         string // Event type (sling, done, mail, etc.)
+	Category     string // Event category for filtering (agent, work, comms, system)
+	Actor        string // Who did it
+	Rig          string // Rig name extracted from actor (e.g., "gastown")
+	Summary      string // Human-readable description
+	RawTimestamp string // ISO 8601 timestamp for JS sorting/filtering
 }
 
 // DashboardSummary provides at-a-glance stats and alerts.
@@ -177,7 +180,7 @@ type WorkerRow struct {
 	IssueID      string        // Currently assigned issue ID (e.g., "hq-1234")
 	IssueTitle   string        // Issue title (truncated)
 	WorkStatus   string        // working, stale, stuck, idle
-	AgentType    string        // "polecat" (ephemeral) or "refinery" (permanent)
+	AgentType    string        // "polecat" (ephemeral sessions) or "refinery" (permanent)
 }
 
 // MergeQueueRow represents a PR in the merge queue.
@@ -225,6 +228,7 @@ func LoadTemplates() (*template.Template, error) {
 		"dogStateClass":      dogStateClass,
 		"queueStatusClass":   queueStatusClass,
 		"polecatStatusClass": polecatStatusClass,
+		"activityTypeClass": activityTypeClass,
 		"contains": func(s, substr string) bool {
 			return strings.Contains(s, substr)
 		},
@@ -376,5 +380,21 @@ func polecatStatusClass(status string) string {
 		return "polecat-idle"
 	default:
 		return "polecat-unknown"
+	}
+}
+
+// activityTypeClass returns CSS class for an activity event category.
+func activityTypeClass(category string) string {
+	switch category {
+	case "agent":
+		return "tl-cat-agent"
+	case "work":
+		return "tl-cat-work"
+	case "comms":
+		return "tl-cat-comms"
+	case "system":
+		return "tl-cat-system"
+	default:
+		return "tl-cat-default"
 	}
 }

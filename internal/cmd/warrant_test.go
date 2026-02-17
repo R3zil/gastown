@@ -6,7 +6,19 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
+
+func setupWarrantTestRegistry(t *testing.T) {
+	t.Helper()
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", "gastown")
+	reg.Register("bd", "beads")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+}
 
 // =============================================================================
 // Warrant Tests
@@ -166,6 +178,7 @@ func TestWarrantExecute_MarksExecuted(t *testing.T) {
 
 // TestTargetToSessionName verifies session name conversion.
 func TestTargetToSessionName(t *testing.T) {
+	setupWarrantTestRegistry(t)
 	tests := []struct {
 		target   string
 		wantErr  bool
@@ -174,12 +187,12 @@ func TestTargetToSessionName(t *testing.T) {
 		{
 			target:   "gastown/polecats/alpha",
 			wantErr:  false,
-			contains: "gt-gastown-alpha",
+			contains: "gt-alpha",
 		},
 		{
 			target:   "beads/polecats/charlie",
 			wantErr:  false,
-			contains: "gt-beads-charlie",
+			contains: "bd-charlie",
 		},
 		{
 			target:   "deacon/dogs",
@@ -210,14 +223,14 @@ func TestWarrantFilePath(t *testing.T) {
 		want   string
 	}{
 		{
-			dir:    "/tmp/warrants",
+			dir:    filepath.Join("/tmp", "warrants"),
 			target: "gastown/polecats/alpha",
-			want:   "/tmp/warrants/gastown_polecats_alpha.warrant.json",
+			want:   filepath.Join("/tmp", "warrants", "gastown_polecats_alpha.warrant.json"),
 		},
 		{
-			dir:    "/home/user/gt/warrants",
+			dir:    filepath.Join("/home", "user", "gt", "warrants"),
 			target: "deacon/dogs/bravo",
-			want:   "/home/user/gt/warrants/deacon_dogs_bravo.warrant.json",
+			want:   filepath.Join("/home", "user", "gt", "warrants", "deacon_dogs_bravo.warrant.json"),
 		},
 	}
 

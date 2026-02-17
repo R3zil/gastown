@@ -29,7 +29,6 @@ const (
 // MessageType indicates the purpose of a message.
 type MessageType string
 
-
 const (
 	// TypeTask indicates a message requiring action from the recipient.
 	TypeTask MessageType = "task"
@@ -123,6 +122,18 @@ type Message struct {
 	// ClaimedAt is when the queue message was claimed.
 	// Only set for queue messages after claiming.
 	ClaimedAt *time.Time `json:"claimed_at,omitempty"`
+
+	// DeliveryState tracks two-phase mailbox delivery state: pending or acked.
+	DeliveryState string `json:"delivery_state,omitempty"`
+	// DeliveryAckedBy is the recipient identity that acknowledged receipt.
+	DeliveryAckedBy string `json:"delivery_acked_by,omitempty"`
+	// DeliveryAckedAt is when receipt was acknowledged.
+	DeliveryAckedAt *time.Time `json:"delivery_acked_at,omitempty"`
+
+	// SuppressNotify tells the router to skip all recipient notification
+	// (no nudge, no banner). Set by the CLI when --no-notify is passed.
+	// In-memory only — not serialized.
+	SuppressNotify bool `json:"-"`
 }
 
 // NewMessage creates a new message with a generated ID and thread ID.
@@ -212,9 +223,21 @@ func (m *Message) IsClaimed() bool {
 	return m.ClaimedBy != ""
 }
 
-// Validate checks that the message has a valid routing configuration.
-// Returns an error if to, queue, and channel are not mutually exclusive.
+// Validate checks that the message has valid required fields and routing configuration.
+// Returns an error if required fields are missing or routing targets are not mutually exclusive.
 func (m *Message) Validate() error {
+	// Required fields
+	if m.ID == "" {
+		return fmt.Errorf("message must have an ID")
+	}
+	if m.From == "" {
+		return fmt.Errorf("message must have a From address")
+	}
+	if m.Subject == "" {
+		return fmt.Errorf("message must have a Subject")
+	}
+
+	// Routing: exactly one of To, Queue, or Channel
 	count := 0
 	if m.To != "" {
 		count++
@@ -290,10 +313,28 @@ type BeadsMessage struct {
 	channel   string     // Channel name (for broadcast messages)
 	claimedBy string     // Who claimed the queue message
 	claimedAt *time.Time // When the queue message was claimed
+	// Two-phase delivery metadata
+	deliveryState   string
+	deliveryAckedBy string
+	deliveryAckedAt *time.Time
 }
 
 // ParseLabels extracts metadata from the labels array.
+// Safe to call multiple times - resets parsed state before re-parsing.
 func (bm *BeadsMessage) ParseLabels() {
+	bm.sender = ""
+	bm.threadID = ""
+	bm.replyTo = ""
+	bm.msgType = ""
+	bm.cc = nil
+	bm.queue = ""
+	bm.channel = ""
+	bm.claimedBy = ""
+	bm.claimedAt = nil
+	bm.deliveryState = ""
+	bm.deliveryAckedBy = ""
+	bm.deliveryAckedAt = nil
+
 	for _, label := range bm.Labels {
 		if strings.HasPrefix(label, "from:") {
 			bm.sender = strings.TrimPrefix(label, "from:")
@@ -318,6 +359,8 @@ func (bm *BeadsMessage) ParseLabels() {
 			}
 		}
 	}
+
+	bm.deliveryState, bm.deliveryAckedBy, bm.deliveryAckedAt = ParseDeliveryLabels(bm.Labels)
 }
 
 // GetCC returns the parsed CC recipients.
@@ -367,23 +410,26 @@ func (bm *BeadsMessage) ToMessage() *Message {
 	}
 
 	return &Message{
-		ID:        bm.ID,
-		From:      identityToAddress(bm.sender),
-		To:        identityToAddress(bm.Assignee),
-		Subject:   bm.Title,
-		Body:      bm.Description,
-		Timestamp: bm.CreatedAt,
-		Read:      bm.Status == "closed" || bm.HasLabel("read"),
-		Priority:  priority,
-		Type:      msgType,
-		ThreadID:  bm.threadID,
-		ReplyTo:   bm.replyTo,
-		Wisp:      bm.Wisp,
-		CC:        ccAddrs,
-		Queue:     bm.queue,
-		Channel:   bm.channel,
-		ClaimedBy: bm.claimedBy,
-		ClaimedAt: bm.claimedAt,
+		ID:              bm.ID,
+		From:            identityToAddress(bm.sender),
+		To:              identityToAddress(bm.Assignee),
+		Subject:         bm.Title,
+		Body:            bm.Description,
+		Timestamp:       bm.CreatedAt,
+		Read:            bm.Status == "closed" || bm.HasLabel("read"),
+		Priority:        priority,
+		Type:            msgType,
+		ThreadID:        bm.threadID,
+		ReplyTo:         bm.replyTo,
+		Wisp:            bm.Wisp,
+		CC:              ccAddrs,
+		Queue:           bm.queue,
+		Channel:         bm.channel,
+		ClaimedBy:       bm.claimedBy,
+		ClaimedAt:       bm.claimedAt,
+		DeliveryState:   bm.deliveryState,
+		DeliveryAckedBy: bm.deliveryAckedBy,
+		DeliveryAckedAt: bm.deliveryAckedAt,
 	}
 }
 

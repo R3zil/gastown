@@ -82,8 +82,14 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting crew worker: %w", err)
 	}
 
-	// Ensure crew workspace is on default branch (persistent roles should not use feature branches)
-	ensureDefaultBranch(worker.ClonePath, fmt.Sprintf("Crew workspace %s/%s", r.Name, name), r.Path)
+	// Reset to default branch if --reset flag is passed; otherwise warn if off-branch
+	if crewReset {
+		if err := ensureDefaultBranch(worker.ClonePath, fmt.Sprintf("Crew workspace %s/%s", r.Name, name), r.Path); err != nil {
+			return fmt.Errorf("resetting to default branch: %w", err)
+		}
+	} else {
+		warnIfNotDefaultBranch(worker.ClonePath, fmt.Sprintf("Crew workspace %s/%s", r.Name, name), r.Path)
+	}
 
 	// If --no-tmux, just print the path
 	if crewNoTmux {
@@ -105,8 +111,23 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Using account: %s\n", accountHandle)
 	}
 
-	runtimeConfig := config.LoadRuntimeConfig(r.Path)
-	if err := runtime.EnsureSettingsForRole(worker.ClonePath, "crew", runtimeConfig); err != nil {
+	var runtimeConfig *config.RuntimeConfig
+	if crewAgentOverride != "" {
+		rc, _, resolveErr := config.ResolveAgentConfigWithOverride(townRoot, r.Path, crewAgentOverride)
+		if resolveErr != nil {
+			style.PrintWarning("could not resolve agent override %q: %v, falling back to default", crewAgentOverride, resolveErr)
+			runtimeConfig = config.ResolveRoleAgentConfig("crew", townRoot, r.Path)
+		} else {
+			runtimeConfig = rc
+		}
+	} else {
+		runtimeConfig = config.ResolveRoleAgentConfig("crew", townRoot, r.Path)
+	}
+	if runtimeConfig == nil {
+		runtimeConfig = config.DefaultRuntimeConfig()
+	}
+	crewSettingsDir := config.RoleSettingsDir("crew", r.Path)
+	if err := runtime.EnsureSettingsForRole(crewSettingsDir, worker.ClonePath, "crew", runtimeConfig); err != nil {
 		// Non-fatal but log warning - missing settings can cause agents to start without hooks
 		style.PrintWarning("could not ensure settings for %s: %v", name, err)
 	}
@@ -128,7 +149,7 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 	// Before creating a new session, check if there's already a runtime session
 	// running in this crew's directory (might have been started manually or via
 	// a different mechanism)
-	if !hasSession {
+	if !hasSession && runtimeConfig.Tmux != nil {
 		existingSessions, err := t.FindSessionByWorkDir(worker.ClonePath, runtimeConfig.Tmux.ProcessNames)
 		if err == nil && len(existingSessions) > 0 {
 			// Found an existing session with runtime running in this directory
@@ -170,7 +191,6 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 			AgentName:        name,
 			TownRoot:         townRoot,
 			RuntimeConfigDir: claudeConfigDir,
-			BeadsNoDaemon:    true,
 		})
 		for k, v := range envVars {
 			_ = t.SetEnvironment(sessionID, k, v)
@@ -224,14 +244,11 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Created session for %s/%s\n",
 			style.Bold.Render("✓"), r.Name, name)
 	} else {
-		// Session exists - check if runtime is still running
-		// Uses both pane command check and UI marker detection to avoid
-		// restarting when user is in a subshell spawned from the runtime
-		agentCfg, _, err := config.ResolveAgentConfigWithOverride(townRoot, r.Path, crewAgentOverride)
-		if err != nil {
-			return fmt.Errorf("resolving agent: %w", err)
-		}
-		if !t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {
+		// Session exists - check if agent is still alive
+		// Uses descendant process check instead of pane command check,
+		// since crew members launch via bash -c wrappers that cause
+		// false-negative detection with IsAgentRunning (see #1315, #1330).
+		if !t.IsAgentAlive(sessionID) {
 			// Runtime has exited, restart it using respawn-pane
 			fmt.Printf("Runtime exited, restarting...\n")
 
@@ -287,15 +304,18 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 
 	// Check if we're already in the target session
 	if isInTmuxSession(sessionID) {
-		// Check if agent is already running - don't restart if so
+		// Check if agent is already alive - don't restart if so
+		// Uses descendant process check (see #1315, #1330).
+		if t.IsAgentAlive(sessionID) {
+			// Agent is already running, nothing to do
+			fmt.Printf("Already in %s session with agent running.\n", name)
+			return nil
+		}
+
+		// Agent not alive — resolve config to start it
 		agentCfg, _, err := config.ResolveAgentConfigWithOverride(townRoot, r.Path, crewAgentOverride)
 		if err != nil {
 			return fmt.Errorf("resolving agent: %w", err)
-		}
-		if t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {
-			// Agent is already running, nothing to do
-			fmt.Printf("Already in %s session with %s running.\n", name, agentCfg.Command)
-			return nil
 		}
 
 		// We're in the session at a shell prompt - start the agent

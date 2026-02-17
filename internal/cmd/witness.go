@@ -7,6 +7,7 @@ import (
 	"os/exec"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -156,6 +157,10 @@ func getWitnessManager(rigName string) (*witness.Manager, error) {
 func runWitnessStart(cmd *cobra.Command, args []string) error {
 	rigName := args[0]
 
+	if err := checkRigNotParkedOrDocked(rigName); err != nil {
+		return err
+	}
+
 	mgr, err := getWitnessManager(rigName)
 	if err != nil {
 		return err
@@ -287,7 +292,7 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 
 // witnessSessionName returns the tmux session name for a rig's witness.
 func witnessSessionName(rigName string) string {
-	return fmt.Sprintf("gt-%s-witness", rigName)
+	return session.WitnessSessionName(session.PrefixFor(rigName))
 }
 
 func runWitnessAttach(cmd *cobra.Command, args []string) error {
@@ -338,6 +343,10 @@ func runWitnessAttach(cmd *cobra.Command, args []string) error {
 
 func runWitnessRestart(cmd *cobra.Command, args []string) error {
 	rigName := args[0]
+
+	if err := checkRigNotParkedOrDocked(rigName); err != nil {
+		return err
+	}
 
 	mgr, err := getWitnessManager(rigName)
 	if err != nil {

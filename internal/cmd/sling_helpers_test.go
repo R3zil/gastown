@@ -1,15 +1,30 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
 
+func setupSlingTestRegistry(t *testing.T) {
+	t.Helper()
+	reg := session.NewPrefixRegistry()
+	reg.Register("gt", "gastown")
+	reg.Register("bd", "beads")
+	reg.Register("mp", "my-project")
+	old := session.DefaultRegistry()
+	session.SetDefaultRegistry(reg)
+	t.Cleanup(func() { session.SetDefaultRegistry(old) })
+}
+
 // TestNudgeRefinerySessionName verifies that nudgeRefinery constructs the
-// correct tmux session name (gt-<rigName>-refinery) and passes the message.
+// correct tmux session name ({prefix}-refinery) and passes the message.
 func TestNudgeRefinerySessionName(t *testing.T) {
+	setupSlingTestRegistry(t)
 	logPath := filepath.Join(t.TempDir(), "nudge.log")
 	t.Setenv("GT_TEST_NUDGE_LOG", logPath)
 
@@ -23,13 +38,13 @@ func TestNudgeRefinerySessionName(t *testing.T) {
 			name:        "simple rig name",
 			rigName:     "gastown",
 			message:     "MR submitted: gt-abc branch=polecat/Nux/gt-abc",
-			wantSession: "gt-gastown-refinery",
+			wantSession: "gt-refinery",
 		},
 		{
 			name:        "hyphenated rig name",
 			rigName:     "my-project",
 			message:     "MR submitted: mp-xyz branch=polecat/Toast/mp-xyz",
-			wantSession: "gt-my-project-refinery",
+			wantSession: "mp-refinery",
 		},
 	}
 
@@ -96,4 +111,31 @@ func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
 
 	// Should not panic even though no tmux session exists
 	nudgeRefinery("nonexistent-rig", "test message")
+}
+
+func TestIsSlingConfigError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"not initialized", fmt.Errorf("database not initialized"), true},
+		{"no such table", fmt.Errorf("no such table: issues"), true},
+		{"table not found", fmt.Errorf("table not found: issues"), true},
+		{"issue_prefix missing", fmt.Errorf("issue_prefix not configured"), true},
+		{"no database", fmt.Errorf("no database found"), true},
+		{"database not found", fmt.Errorf("database not found"), true},
+		{"connection refused", fmt.Errorf("connection refused"), true},
+		{"transient error", fmt.Errorf("optimistic lock failed"), false},
+		{"generic error", fmt.Errorf("something else"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSlingConfigError(tt.err); got != tt.want {
+				t.Errorf("isSlingConfigError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
 }

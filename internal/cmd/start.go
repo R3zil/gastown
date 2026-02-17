@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -28,6 +29,13 @@ import (
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// defaultOrphanGraceSecs is the grace period (in seconds) between SIGTERM and SIGKILL
+// when automatically cleaning up orphaned Claude processes during shutdown.
+// This is shorter than the --cleanup-orphans-grace-secs default (60s) because
+// automatic cleanup runs after sessions are already killed, so processes have
+// already had time to shut down.
+const defaultOrphanGraceSecs = 5
 
 var (
 	startAll                    bool
@@ -93,8 +101,12 @@ Shutdown levels (progressively more aggressive):
 Use --force or --yes to skip confirmation prompt.
 Use --graceful to allow agents time to save state before killing.
 Use --nuclear to force cleanup even if polecats have uncommitted work (DANGER).
-Use --cleanup-orphans to kill orphaned Claude processes (TTY-less, older than 60s).
-Use --cleanup-orphans-grace-secs to set the grace period (default 60s).`,
+Use --cleanup-orphans to use a longer grace period for orphan cleanup (default 60s).
+Use --cleanup-orphans-grace-secs to set that grace period.
+
+Orphaned Claude processes are always cleaned up after session termination.
+By default, a 5-second grace period is used. The --cleanup-orphans flag
+extends this to --cleanup-orphans-grace-secs (default 60s) for stubborn processes.`,
 	RunE: runShutdown,
 }
 
@@ -142,7 +154,7 @@ func init() {
 	shutdownCmd.Flags().BoolVar(&shutdownNuclear, "nuclear", false,
 		"Force cleanup even if polecats have uncommitted work (DANGER: may lose work)")
 	shutdownCmd.Flags().BoolVar(&shutdownCleanupOrphans, "cleanup-orphans", false,
-		"Clean up orphaned Claude processes (TTY-less processes older than 60s)")
+		"Use longer grace period (--cleanup-orphans-grace-secs) for orphan cleanup instead of default 5s")
 	shutdownCmd.Flags().IntVar(&shutdownCleanupOrphansGrace, "cleanup-orphans-grace-secs", 60,
 		"Grace period in seconds between SIGTERM and SIGKILL when cleaning orphans (default 60)")
 
@@ -198,6 +210,36 @@ func runStart(cmd *cobra.Command, args []string) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex // Protects stdout
 	var coreErr error
+	var doltOK bool
+
+	// Ensure Dolt server is running (prerequisite for beads)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cfg := doltserver.DefaultConfig(townRoot)
+		if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
+			// No Dolt data dir — nothing to start
+			return
+		}
+		running, _, _ := doltserver.IsRunning(townRoot)
+		if running {
+			doltOK = true
+			mu.Lock()
+			fmt.Printf("  %s Dolt server already running\n", style.Dim.Render("○"))
+			mu.Unlock()
+			return
+		}
+		if err := doltserver.Start(townRoot); err != nil {
+			mu.Lock()
+			fmt.Printf("  %s Dolt server failed: %v\n", style.Dim.Render("○"), err)
+			mu.Unlock()
+		} else {
+			doltOK = true
+			mu.Lock()
+			fmt.Printf("  %s Dolt server started (port %d)\n", style.Bold.Render("✓"), doltserver.DefaultPort)
+			mu.Unlock()
+		}
+	}()
 
 	// Start core agents (Mayor and Deacon) in background
 	wg.Add(1)
@@ -229,6 +271,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	wg.Wait()
+
+	// Ensure beads metadata points to the Dolt server
+	if doltOK {
+		_, _ = doltserver.EnsureAllMetadata(townRoot)
+	}
 
 	if coreErr != nil {
 		return coreErr
@@ -395,12 +442,16 @@ func startConfiguredCrew(t *tmux.Tmux, rigs []*rig.Rig, townRoot string, mu *syn
 }
 
 // startOrRestartCrewMember starts or restarts a single crew member and returns a status message.
+// Uses IsAgentAlive for robust zombie detection (checks pane command + descendant processes),
+// and delegates zombie cleanup to crewMgr.Start() which kills the zombie session and recreates
+// it with fresh env vars and runtime settings.
 func startOrRestartCrewMember(t *tmux.Tmux, r *rig.Rig, crewName, townRoot string) (msg string, started bool) {
 	sessionID := crewSessionName(r.Name, crewName)
 	if running, _ := t.HasSession(sessionID); running {
-		// Session exists - check if agent is still running
-		agentCfg := config.ResolveRoleAgentConfig(constants.RoleCrew, townRoot, r.Path)
-		if !t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {
+		// Session exists - check if agent is still alive
+		// Uses descendant process check instead of pane command check,
+		// since crew members launch via bash -c wrappers (see #1315, #1330).
+		if !t.IsAgentAlive(sessionID) {
 			// Agent has exited, restart it
 			// Build startup beacon for predecessor discovery via /resume
 			address := fmt.Sprintf("%s/crew/%s", r.Name, crewName)
@@ -415,6 +466,7 @@ func startOrRestartCrewMember(t *tmux.Tmux, r *rig.Rig, crewName, townRoot strin
 			}
 			return fmt.Sprintf("  %s %s/%s agent restarted\n", style.Bold.Render("✓"), r.Name, crewName), true
 		}
+		// Agent is alive — nothing to do
 		return fmt.Sprintf("  %s %s/%s already running\n", style.Dim.Render("○"), r.Name, crewName), false
 	}
 
@@ -450,10 +502,7 @@ func runShutdown(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
 
-	// Get session names for categorization
-	mayorSession := getMayorSessionName()
-	deaconSession := getDeaconSessionName()
-	toStop, preserved := categorizeSessions(sessions, mayorSession, deaconSession)
+	toStop, preserved := categorizeSessions(sessions)
 
 	if len(toStop) == 0 {
 		fmt.Printf("%s Gas Town was not running\n", style.Dim.Render("○"))
@@ -501,26 +550,22 @@ func runShutdown(cmd *cobra.Command, args []string) error {
 }
 
 // categorizeSessions splits sessions into those to stop and those to preserve.
-// mayorSession and deaconSession are the dynamic session names for the current town.
-func categorizeSessions(sessions []string, mayorSession, deaconSession string) (toStop, preserved []string) {
+func categorizeSessions(sessions []string) (toStop, preserved []string) {
 	for _, sess := range sessions {
-		// Gas Town sessions use gt- (rig-level) or hq- (town-level) prefix
-		if !strings.HasPrefix(sess, "gt-") && !strings.HasPrefix(sess, "hq-") {
+		// Gas Town sessions use rig-specific prefixes or hq- (town-level)
+		if !session.IsKnownSession(sess) {
 			continue // Not a Gas Town session
 		}
 
-		// Check if it's a crew session (pattern: gt-<rig>-crew-<name>)
-		isCrew := strings.Contains(sess, "-crew-")
-
-		// Check if it's a polecat session (pattern: gt-<rig>-<name> where name is not crew/witness/refinery)
+		// Parse session to determine role
 		isPolecat := false
-		if !isCrew && sess != mayorSession && sess != deaconSession {
-			parts := strings.Split(sess, "-")
-			if len(parts) >= 3 {
-				role := parts[2]
-				if role != "witness" && role != "refinery" && role != "crew" {
-					isPolecat = true
-				}
+		isCrew := false
+		if identity, err := session.ParseSessionName(sess); err == nil {
+			switch identity.Role {
+			case session.RolePolecat:
+				isPolecat = true
+			case session.RoleCrew:
+				isCrew = true
 			}
 		}
 
@@ -588,11 +633,16 @@ func runGracefulShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) err
 	deaconSession := getDeaconSessionName()
 	stopped := killSessionsInOrder(t, gtSessions, mayorSession, deaconSession)
 
-	// Phase 5: Cleanup orphaned Claude processes if requested
+	// Phase 5: Always clean up orphaned Claude processes after killing sessions.
+	// Processes can survive session kills if they caught/ignored SIGHUP or called setsid().
+	// Use the user-specified grace period if --cleanup-orphans was explicitly set,
+	// otherwise use a short default (5s) for the automatic sweep.
+	graceSecs := defaultOrphanGraceSecs
 	if shutdownCleanupOrphans {
-		fmt.Printf("\nPhase 5: Cleaning up orphaned Claude processes...\n")
-		cleanupOrphanedClaude(shutdownCleanupOrphansGrace)
+		graceSecs = shutdownCleanupOrphansGrace
 	}
+	fmt.Printf("\nPhase 5: Cleaning up orphaned Claude processes...\n")
+	cleanupOrphanedClaude(graceSecs)
 
 	// Phase 6: Cleanup polecat worktrees and branches
 	fmt.Printf("\nPhase 6: Cleaning up polecats...\n")
@@ -606,6 +656,10 @@ func runGracefulShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) err
 		stopDaemonIfRunning(townRoot)
 	}
 
+	// Phase 8: Verify no Claude processes survived
+	fmt.Printf("\nPhase 8: Verifying shutdown...\n")
+	verifyNoOrphans()
+
 	fmt.Println()
 	fmt.Printf("%s Graceful shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
 	return nil
@@ -618,12 +672,17 @@ func runImmediateShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) er
 	deaconSession := getDeaconSessionName()
 	stopped := killSessionsInOrder(t, gtSessions, mayorSession, deaconSession)
 
-	// Cleanup orphaned Claude processes if requested
+	// Always clean up orphaned Claude processes after killing sessions.
+	// Processes can survive session kills if they caught/ignored SIGHUP or called setsid().
+	// Use the user-specified grace period if --cleanup-orphans was explicitly set,
+	// otherwise use a short default (5s) for the automatic sweep.
+	graceSecs := defaultOrphanGraceSecs
 	if shutdownCleanupOrphans {
-		fmt.Println()
-		fmt.Println("Cleaning up orphaned Claude processes...")
-		cleanupOrphanedClaude(shutdownCleanupOrphansGrace)
+		graceSecs = shutdownCleanupOrphansGrace
 	}
+	fmt.Println()
+	fmt.Println("Cleaning up orphaned Claude processes...")
+	cleanupOrphanedClaude(graceSecs)
 
 	// Cleanup polecat worktrees and branches
 	if townRoot != "" {
@@ -639,31 +698,61 @@ func runImmediateShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) er
 		stopDaemonIfRunning(townRoot)
 	}
 
+	// Verify no Claude processes survived
+	fmt.Println()
+	fmt.Println("Verifying shutdown...")
+	verifyNoOrphans()
+
 	fmt.Println()
 	fmt.Printf("%s Gas Town shutdown complete (%d sessions stopped)\n", style.Bold.Render("✓"), stopped)
 
 	return nil
 }
 
-// killSessionsInOrder stops sessions in the correct order:
-// 1. Deacon first (so it doesn't restart others)
-// 2. Everything except Mayor
-// 3. Mayor last
+// killSessionsInOrder stops sessions in the correct shutdown order, matching gt down:
+//  1. Polecats and crew (workers - stop before monitors can restart them)
+//  2. Refineries (work processors)
+//  3. Witnesses (monitors - stop before deacon so they can't restart workers)
+//  4. Town sessions: Mayor, Boot, Deacon
+//     Boot monitors Deacon, so must be stopped before Deacon.
+//
 // mayorSession and deaconSession are the dynamic session names for the current town.
 //
 // Returns the count of sessions that were successfully stopped (verified by checking
 // if the session no longer exists after the kill attempt).
 func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSession string) int {
 	stopped := 0
+	bootSession := session.BootSessionName()
 
-	// Helper to check if session is in our list
-	inList := func(sess string) bool {
-		for _, s := range sessions {
-			if s == sess {
-				return true
-			}
+	// Build a set for O(1) lookup of town-level sessions
+	sessionSet := make(map[string]bool, len(sessions))
+	for _, s := range sessions {
+		sessionSet[s] = true
+	}
+
+	// Categorize sessions by type for ordered shutdown.
+	var polecats, refineries, witnesses []string
+	for _, sess := range sessions {
+		// Skip town-level sessions (handled explicitly below)
+		if sess == mayorSession || sess == deaconSession || sess == bootSession {
+			continue
 		}
-		return false
+
+		// Categorize by role using proper session name parser
+		if identity, err := session.ParseSessionName(sess); err == nil {
+			switch identity.Role {
+			case session.RoleWitness:
+				witnesses = append(witnesses, sess)
+			case session.RoleRefinery:
+				refineries = append(refineries, sess)
+			default:
+				// Polecats, crew, and any other rig-level sessions
+				polecats = append(polecats, sess)
+			}
+		} else {
+			// Unknown pattern, treat as worker (stop early)
+			polecats = append(polecats, sess)
+		}
 	}
 
 	// Helper to kill a session and verify it was stopped
@@ -688,26 +777,40 @@ func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSe
 		return false
 	}
 
-	// 1. Stop Deacon first
-	if inList(deaconSession) {
-		if killAndVerify(deaconSession) {
-			stopped++
-		}
-	}
-
-	// 2. Stop others (except Mayor)
-	for _, sess := range sessions {
-		if sess == deaconSession || sess == mayorSession {
-			continue
-		}
+	// 1. Stop polecats and crew first (workers)
+	for _, sess := range polecats {
 		if killAndVerify(sess) {
 			stopped++
 		}
 	}
 
-	// 3. Stop Mayor last
-	if inList(mayorSession) {
+	// 2. Stop refineries (work processors)
+	for _, sess := range refineries {
+		if killAndVerify(sess) {
+			stopped++
+		}
+	}
+
+	// 3. Stop witnesses (monitors)
+	for _, sess := range witnesses {
+		if killAndVerify(sess) {
+			stopped++
+		}
+	}
+
+	// 4. Stop town sessions: Mayor, Boot, Deacon (matching TownSessions() order)
+	if sessionSet[mayorSession] {
 		if killAndVerify(mayorSession) {
+			stopped++
+		}
+	}
+	if sessionSet[bootSession] {
+		if killAndVerify(bootSession) {
+			stopped++
+		}
+	}
+	if sessionSet[deaconSession] {
+		if killAndVerify(deaconSession) {
 			stopped++
 		}
 	}

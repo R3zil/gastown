@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -194,9 +195,6 @@ func TestRigSettingsRoundTrip(t *testing.T) {
 	if !loaded.MergeQueue.Enabled {
 		t.Error("MergeQueue.Enabled = false, want true")
 	}
-	if loaded.MergeQueue.TargetBranch != "main" {
-		t.Errorf("MergeQueue.TargetBranch = %q, want 'main'", loaded.MergeQueue.TargetBranch)
-	}
 }
 
 func TestRigSettingsWithCustomMergeQueue(t *testing.T) {
@@ -209,12 +207,12 @@ func TestRigSettingsWithCustomMergeQueue(t *testing.T) {
 		Version: 1,
 		MergeQueue: &MergeQueueConfig{
 			Enabled:              true,
-			TargetBranch:         "develop",
-			IntegrationBranches:  false,
+			IntegrationBranchPolecatEnabled:  boolPtr(false),
+			IntegrationBranchRefineryEnabled: boolPtr(false),
 			OnConflict:           OnConflictAutoRebase,
-			RunTests:             true,
+			RunTests:             boolPtr(true),
 			TestCommand:          "make test",
-			DeleteMergedBranches: false,
+			DeleteMergedBranches: boolPtr(false),
 			RetryFlakyTests:      3,
 			PollInterval:         "1m",
 			MaxConcurrent:        2,
@@ -231,9 +229,6 @@ func TestRigSettingsWithCustomMergeQueue(t *testing.T) {
 	}
 
 	mq := loaded.MergeQueue
-	if mq.TargetBranch != "develop" {
-		t.Errorf("TargetBranch = %q, want 'develop'", mq.TargetBranch)
-	}
 	if mq.OnConflict != OnConflictAutoRebase {
 		t.Errorf("OnConflict = %q, want %q", mq.OnConflict, OnConflictAutoRebase)
 	}
@@ -344,6 +339,39 @@ func TestRigSettingsValidation(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "invalid stale_claim_timeout",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					StaleClaimTimeout: "not-a-duration",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "zero stale_claim_timeout",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					StaleClaimTimeout: "0s",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative stale_claim_timeout",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					StaleClaimTimeout: "-5m",
+				},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -363,23 +391,23 @@ func TestDefaultMergeQueueConfig(t *testing.T) {
 	if !cfg.Enabled {
 		t.Error("Enabled should be true by default")
 	}
-	if cfg.TargetBranch != "main" {
-		t.Errorf("TargetBranch = %q, want 'main'", cfg.TargetBranch)
+	if !cfg.IsPolecatIntegrationEnabled() {
+		t.Error("IsPolecatIntegrationEnabled should be true by default")
 	}
-	if !cfg.IntegrationBranches {
-		t.Error("IntegrationBranches should be true by default")
+	if !cfg.IsRefineryIntegrationEnabled() {
+		t.Error("IsRefineryIntegrationEnabled should be true by default")
 	}
 	if cfg.OnConflict != OnConflictAssignBack {
 		t.Errorf("OnConflict = %q, want %q", cfg.OnConflict, OnConflictAssignBack)
 	}
-	if !cfg.RunTests {
-		t.Error("RunTests should be true by default")
+	if !cfg.IsRunTestsEnabled() {
+		t.Error("IsRunTestsEnabled should be true by default")
 	}
 	if cfg.TestCommand != "go test ./..." {
 		t.Errorf("TestCommand = %q, want 'go test ./...'", cfg.TestCommand)
 	}
-	if !cfg.DeleteMergedBranches {
-		t.Error("DeleteMergedBranches should be true by default")
+	if !cfg.IsDeleteMergedBranchesEnabled() {
+		t.Error("IsDeleteMergedBranchesEnabled should be true by default")
 	}
 	if cfg.RetryFlakyTests != 1 {
 		t.Errorf("RetryFlakyTests = %d, want 1", cfg.RetryFlakyTests)
@@ -389,6 +417,9 @@ func TestDefaultMergeQueueConfig(t *testing.T) {
 	}
 	if cfg.MaxConcurrent != 1 {
 		t.Errorf("MaxConcurrent = %d, want 1", cfg.MaxConcurrent)
+	}
+	if cfg.StaleClaimTimeout != "30m" {
+		t.Errorf("StaleClaimTimeout = %q, want '30m'", cfg.StaleClaimTimeout)
 	}
 }
 
@@ -1497,26 +1528,28 @@ func TestExpectedPaneCommands(t *testing.T) {
 	})
 }
 
-func TestLoadRuntimeConfigFromSettings(t *testing.T) {
+func TestResolveRoleAgentConfigFromRigSettings(t *testing.T) {
 	t.Parallel()
-	// Create temp rig with custom runtime config
-	dir := t.TempDir()
-	settingsDir := filepath.Join(dir, "settings")
+	// Create temp town with rig containing custom runtime config
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+	settingsDir := filepath.Join(rigPath, "settings")
 	if err := os.MkdirAll(settingsDir, 0755); err != nil {
 		t.Fatalf("creating settings dir: %v", err)
 	}
 
 	settings := NewRigSettings()
 	settings.Runtime = &RuntimeConfig{
-		Command: "aider",
-		Args:    []string{"--no-git", "--model", "claude-3"},
+		Command:  "aider",
+		Provider: "aider",
+		Args:     []string{"--no-git", "--model", "claude-3"},
 	}
 	if err := SaveRigSettings(filepath.Join(settingsDir, "config.json"), settings); err != nil {
 		t.Fatalf("saving settings: %v", err)
 	}
 
-	// Load and verify
-	rc := LoadRuntimeConfig(dir)
+	// Load and verify using ResolveRoleAgentConfig
+	rc := ResolveRoleAgentConfig("polecat", townRoot, rigPath)
 	if rc.Command != "aider" {
 		t.Errorf("Command = %q, want %q", rc.Command, "aider")
 	}
@@ -1530,12 +1563,94 @@ func TestLoadRuntimeConfigFromSettings(t *testing.T) {
 	}
 }
 
-func TestLoadRuntimeConfigFallsBackToDefaults(t *testing.T) {
+func TestResolveRoleAgentConfigFallsBackToDefaults(t *testing.T) {
 	t.Parallel()
-	// Non-existent path should use defaults
-	rc := LoadRuntimeConfig("/nonexistent/path")
+	// Non-existent paths should use defaults
+	rc := ResolveRoleAgentConfig("polecat", "/nonexistent/town", "/nonexistent/rig")
 	if !isClaudeCommand(rc.Command) {
 		t.Errorf("Command = %q, want claude or path ending in /claude (default)", rc.Command)
+	}
+}
+
+func TestIsClaudeAgent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		rc       *RuntimeConfig
+		expected bool
+	}{
+		{"empty provider and command (defaults)", &RuntimeConfig{}, true},
+		{"explicit claude provider", &RuntimeConfig{Provider: "claude", Command: "anything"}, true},
+		{"explicit codex provider", &RuntimeConfig{Provider: "codex", Command: "claude"}, false},
+		{"bare claude command", &RuntimeConfig{Command: "claude"}, true},
+		{"path to claude binary", &RuntimeConfig{Command: "/usr/local/bin/claude"}, true},
+		{"aider command no provider", &RuntimeConfig{Command: "aider"}, false},
+		{"generic provider", &RuntimeConfig{Provider: "generic"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isClaudeAgent(tt.rc); got != tt.expected {
+				t.Errorf("isClaudeAgent(%+v) = %v, want %v", tt.rc, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestWithRoleSettingsFlag_SkipsNonClaude(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+	settingsDir := filepath.Join(rigPath, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatalf("creating settings dir: %v", err)
+	}
+
+	// Configure aider (non-Claude agent) for polecat role
+	settings := NewRigSettings()
+	settings.Runtime = &RuntimeConfig{
+		Command: "aider",
+		Args:    []string{"--no-git", "--model", "claude-3"},
+	}
+	if err := SaveRigSettings(filepath.Join(settingsDir, "config.json"), settings); err != nil {
+		t.Fatalf("saving settings: %v", err)
+	}
+
+	rc := ResolveRoleAgentConfig("polecat", townRoot, rigPath)
+	// Should NOT contain --settings since aider is not a Claude agent
+	for _, arg := range rc.Args {
+		if arg == "--settings" {
+			t.Errorf("non-Claude agent 'aider' should not get --settings flag, but Args = %v", rc.Args)
+			break
+		}
+	}
+}
+
+func TestWithRoleSettingsFlag_InjectsForClaude(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+	settingsDir := filepath.Join(rigPath, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatalf("creating settings dir: %v", err)
+	}
+
+	// Default config (Claude agent) for polecat role
+	settings := NewRigSettings()
+	if err := SaveRigSettings(filepath.Join(settingsDir, "config.json"), settings); err != nil {
+		t.Fatalf("saving settings: %v", err)
+	}
+
+	rc := ResolveRoleAgentConfig("polecat", townRoot, rigPath)
+	// Should contain --settings since default agent is Claude
+	found := false
+	for _, arg := range rc.Args {
+		if arg == "--settings" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("default Claude agent should get --settings flag for polecat role, but Args = %v", rc.Args)
 	}
 }
 
@@ -1751,6 +1866,184 @@ func TestNewDaemonPatrolConfig(t *testing.T) {
 			t.Errorf("%s patrol Agent = %q, want %q", name, patrol.Agent, name)
 		}
 	}
+}
+
+func TestAddRigToDaemonPatrols(t *testing.T) {
+	t.Parallel()
+
+	t.Run("adds rig to witness and refinery", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write a daemon.json with existing rigs
+		daemonJSON := `{
+  "type": "daemon-patrol-config",
+  "version": 1,
+  "heartbeat": {"enabled": true, "interval": "3m"},
+  "patrols": {
+    "witness": {"enabled": true, "interval": "5m", "agent": "witness", "rigs": ["gastown"]},
+    "refinery": {"enabled": true, "interval": "5m", "agent": "refinery", "rigs": ["gastown"]},
+    "deacon": {"enabled": true, "interval": "5m", "agent": "deacon"}
+  }
+}`
+		if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := AddRigToDaemonPatrols(townRoot, "newrig"); err != nil {
+			t.Fatalf("AddRigToDaemonPatrols: %v", err)
+		}
+
+		// Reload and verify
+		cfg, err := LoadDaemonPatrolConfig(DaemonPatrolConfigPath(townRoot))
+		if err != nil {
+			t.Fatalf("LoadDaemonPatrolConfig: %v", err)
+		}
+
+		witness := cfg.Patrols["witness"]
+		if len(witness.Rigs) != 2 || witness.Rigs[0] != "gastown" || witness.Rigs[1] != "newrig" {
+			t.Errorf("witness rigs = %v, want [gastown newrig]", witness.Rigs)
+		}
+
+		refinery := cfg.Patrols["refinery"]
+		if len(refinery.Rigs) != 2 || refinery.Rigs[0] != "gastown" || refinery.Rigs[1] != "newrig" {
+			t.Errorf("refinery rigs = %v, want [gastown newrig]", refinery.Rigs)
+		}
+
+		// Deacon should be untouched
+		deacon := cfg.Patrols["deacon"]
+		if len(deacon.Rigs) != 0 {
+			t.Errorf("deacon rigs = %v, want empty", deacon.Rigs)
+		}
+	})
+
+	t.Run("skips duplicate rig", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		daemonJSON := `{
+  "type": "daemon-patrol-config",
+  "version": 1,
+  "patrols": {
+    "witness": {"enabled": true, "rigs": ["gastown", "beads"]},
+    "refinery": {"enabled": true, "rigs": ["gastown", "beads"]}
+  }
+}`
+		if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := AddRigToDaemonPatrols(townRoot, "gastown"); err != nil {
+			t.Fatalf("AddRigToDaemonPatrols: %v", err)
+		}
+
+		cfg, err := LoadDaemonPatrolConfig(DaemonPatrolConfigPath(townRoot))
+		if err != nil {
+			t.Fatalf("LoadDaemonPatrolConfig: %v", err)
+		}
+
+		witness := cfg.Patrols["witness"]
+		if len(witness.Rigs) != 2 {
+			t.Errorf("witness rigs = %v, want [gastown beads] (no duplicate)", witness.Rigs)
+		}
+	})
+
+	t.Run("preserves dolt_server fields", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		daemonJSON := `{
+  "type": "daemon-patrol-config",
+  "version": 1,
+  "patrols": {
+    "dolt_server": {"enabled": true, "port": 3307, "host": "127.0.0.1", "data_dir": "/tmp/dolt"},
+    "witness": {"enabled": true, "rigs": ["gastown"]},
+    "refinery": {"enabled": true, "rigs": ["gastown"]}
+  }
+}`
+		path := filepath.Join(mayorDir, "daemon.json")
+		if err := os.WriteFile(path, []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := AddRigToDaemonPatrols(townRoot, "newrig"); err != nil {
+			t.Fatalf("AddRigToDaemonPatrols: %v", err)
+		}
+
+		// Read raw JSON to verify dolt_server fields are preserved
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+
+		var patrols map[string]json.RawMessage
+		if err := json.Unmarshal(raw["patrols"], &patrols); err != nil {
+			t.Fatal(err)
+		}
+
+		var doltServer map[string]interface{}
+		if err := json.Unmarshal(patrols["dolt_server"], &doltServer); err != nil {
+			t.Fatal(err)
+		}
+
+		if doltServer["port"].(float64) != 3307 {
+			t.Errorf("dolt_server port = %v, want 3307", doltServer["port"])
+		}
+		if doltServer["host"].(string) != "127.0.0.1" {
+			t.Errorf("dolt_server host = %v, want 127.0.0.1", doltServer["host"])
+		}
+		if doltServer["data_dir"].(string) != "/tmp/dolt" {
+			t.Errorf("dolt_server data_dir = %v, want /tmp/dolt", doltServer["data_dir"])
+		}
+	})
+
+	t.Run("no-op when daemon.json missing", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+
+		if err := AddRigToDaemonPatrols(townRoot, "newrig"); err != nil {
+			t.Fatalf("AddRigToDaemonPatrols: %v", err)
+		}
+		// Should not create the file
+		if _, err := os.Stat(filepath.Join(townRoot, "mayor", "daemon.json")); !os.IsNotExist(err) {
+			t.Error("expected daemon.json to not exist")
+		}
+	})
+
+	t.Run("no-op when no patrols section", func(t *testing.T) {
+		t.Parallel()
+		townRoot := t.TempDir()
+		mayorDir := filepath.Join(townRoot, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		daemonJSON := `{"type": "daemon-patrol-config", "version": 1}`
+		if err := os.WriteFile(filepath.Join(mayorDir, "daemon.json"), []byte(daemonJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := AddRigToDaemonPatrols(townRoot, "newrig"); err != nil {
+			t.Fatalf("AddRigToDaemonPatrols: %v", err)
+		}
+	})
 }
 
 func TestSaveTownSettings(t *testing.T) {
@@ -2294,7 +2587,7 @@ func TestFillRuntimeDefaults(t *testing.T) {
 		}
 	})
 
-	t.Run("nil nested structs remain nil", func(t *testing.T) {
+	t.Run("nil nested structs remain nil except auto-filled Hooks", func(t *testing.T) {
 		t.Parallel()
 		input := &RuntimeConfig{
 			Command: "claude",
@@ -2307,8 +2600,12 @@ func TestFillRuntimeDefaults(t *testing.T) {
 		if result.Session != nil {
 			t.Error("Session should remain nil when input has nil Session")
 		}
-		if result.Hooks != nil {
-			t.Error("Hooks should remain nil when input has nil Hooks")
+		// Hooks is auto-filled for known agents (claude, opencode) to ensure
+		// EnsureSettingsForRole creates the correct settings files
+		if result.Hooks == nil {
+			t.Error("Hooks should be auto-filled for claude command")
+		} else if result.Hooks.Provider != "claude" {
+			t.Errorf("Hooks.Provider = %q, want %q", result.Hooks.Provider, "claude")
 		}
 		if result.Tmux != nil {
 			t.Error("Tmux should remain nil when input has nil Tmux")
@@ -2446,6 +2743,7 @@ func TestBuildCommandWithPromptRespectsPromptModeNone(t *testing.T) {
 //  4. Run: GT_NUKE_ACKNOWLEDGED=1 gt down --nuke
 //  5. Repeat for all 7 built-in agents
 func TestRoleAgentConfigWithCustomAgent(t *testing.T) {
+	skipIfAgentBinaryMissing(t, "opencode", "claude")
 	t.Parallel()
 
 	townRoot := t.TempDir()
@@ -2627,6 +2925,7 @@ func TestMultipleAgentTypes(t *testing.T) {
 // TestCustomClaudeVariants tests that Claude model variants (opus, sonnet, haiku) need
 // to be explicitly defined as custom agents since they are NOT built-in presets.
 func TestCustomClaudeVariants(t *testing.T) {
+	skipIfAgentBinaryMissing(t, "claude")
 	t.Parallel()
 
 	// Verify that claude-opus/sonnet/haiku are NOT built-in presets
@@ -2980,7 +3279,7 @@ func TestEscalationConfigRoundTrip(t *testing.T) {
 			HumanSMS:   "+15551234567",
 		},
 		StaleThreshold:   "2h",
-		MaxReescalations: 3,
+		MaxReescalations: intPtr(3),
 	}
 
 	if err := SaveEscalationConfig(path, original); err != nil {
@@ -3001,8 +3300,8 @@ func TestEscalationConfigRoundTrip(t *testing.T) {
 	if loaded.StaleThreshold != original.StaleThreshold {
 		t.Errorf("StaleThreshold = %q, want %q", loaded.StaleThreshold, original.StaleThreshold)
 	}
-	if loaded.MaxReescalations != original.MaxReescalations {
-		t.Errorf("MaxReescalations = %d, want %d", loaded.MaxReescalations, original.MaxReescalations)
+	if *loaded.MaxReescalations != *original.MaxReescalations {
+		t.Errorf("MaxReescalations = %d, want %d", *loaded.MaxReescalations, *original.MaxReescalations)
 	}
 	if loaded.Contacts.HumanEmail != original.Contacts.HumanEmail {
 		t.Errorf("Contacts.HumanEmail = %q, want %q", loaded.Contacts.HumanEmail, original.Contacts.HumanEmail)
@@ -3040,8 +3339,8 @@ func TestEscalationConfigDefaults(t *testing.T) {
 	if cfg.StaleThreshold != "4h" {
 		t.Errorf("StaleThreshold = %q, want %q", cfg.StaleThreshold, "4h")
 	}
-	if cfg.MaxReescalations != 2 {
-		t.Errorf("MaxReescalations = %d, want %d", cfg.MaxReescalations, 2)
+	if cfg.MaxReescalations == nil || *cfg.MaxReescalations != 2 {
+		t.Errorf("MaxReescalations = %v, want %d", cfg.MaxReescalations, 2)
 	}
 
 	// Check default routes
@@ -3121,7 +3420,7 @@ func TestEscalationConfigValidation(t *testing.T) {
 			config: &EscalationConfig{
 				Type:             "escalation",
 				Version:          1,
-				MaxReescalations: -1,
+				MaxReescalations: intPtr(-1),
 			},
 			wantErr: true,
 			errMsg:  "max_reescalations must be non-negative",
@@ -3237,23 +3536,30 @@ func TestEscalationConfigGetMaxReescalations(t *testing.T) {
 		expected int
 	}{
 		{
-			name:     "default when zero",
+			name:     "default when nil",
 			config:   &EscalationConfig{},
 			expected: 2,
 		},
 		{
+			name: "explicit zero means never re-escalate",
+			config: &EscalationConfig{
+				MaxReescalations: intPtr(0),
+			},
+			expected: 0,
+		},
+		{
 			name: "custom value",
 			config: &EscalationConfig{
-				MaxReescalations: 5,
+				MaxReescalations: intPtr(5),
 			},
 			expected: 5,
 		},
 		{
-			name: "default when negative (should not happen after validation)",
+			name: "negative returns negative (should not happen after validation)",
 			config: &EscalationConfig{
-				MaxReescalations: -1,
+				MaxReescalations: intPtr(-1),
 			},
-			expected: 2,
+			expected: -1,
 		},
 	}
 
@@ -3486,6 +3792,56 @@ func TestBuildStartupCommandWithAgentOverride_SetsGTAgent(t *testing.T) {
 	}
 }
 
+// TestBuildStartupCommandWithAgentOverride_UsesOverrideWhenNoTownRoot tests that
+// agentOverride is respected even when findTownRootFromCwd fails.
+// This is a regression test for the bug where `gt deacon start --agent codex`
+// would still launch Claude if run from outside the town directory.
+func TestBuildStartupCommandWithAgentOverride_UsesOverrideWhenNoTownRoot(t *testing.T) {
+	t.Parallel()
+	ResetRegistryForTesting()
+
+	// Change to a directory that is definitely NOT in a Gas Town workspace
+	// by using a temp directory with no mayor/town.json
+	tmpDir := t.TempDir()
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWd)
+	})
+
+	// Call with rigPath="" (like deacon does) and agentOverride="codex"
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": "deacon"},
+		"",      // rigPath is empty for town-level roles
+		"",      // no prompt
+		"codex", // agent override
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	// Should use codex, NOT claude (the default)
+	if !strings.Contains(cmd, "codex") {
+		t.Errorf("expected command to contain 'codex' but got: %q", cmd)
+	}
+	if strings.Contains(cmd, "claude") {
+		t.Errorf("expected command to NOT contain 'claude' but got: %q", cmd)
+	}
+	// Should have the codex permissive approval/sandbox flag.
+	if !strings.Contains(cmd, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Errorf("expected command to contain '--dangerously-bypass-approvals-and-sandbox' (codex flag) but got: %q", cmd)
+	}
+	// Should set GT_AGENT=codex
+	if !strings.Contains(cmd, "GT_AGENT=codex") {
+		t.Errorf("expected command to contain 'GT_AGENT=codex' but got: %q", cmd)
+	}
+}
+
 func TestBuildStartupCommandWithAgentOverride_NoGTAgentWhenNoOverride(t *testing.T) {
 	t.Parallel()
 	townRoot := t.TempDir()
@@ -3513,5 +3869,194 @@ func TestBuildStartupCommandWithAgentOverride_NoGTAgentWhenNoOverride(t *testing
 	// Should NOT include GT_AGENT when no override is used
 	if strings.Contains(cmd, "GT_AGENT=") {
 		t.Errorf("expected no GT_AGENT in command when no override, got: %q", cmd)
+	}
+}
+
+// TestBuildStartupCommand_UsesGTRootFromEnvVars verifies that when rigPath is empty
+// but GT_ROOT is provided in envVars, the function uses GT_ROOT to resolve town
+// settings and respects role_agents configuration. This is the path hit when the
+// daemon spawns town-level agents (deacon, mayor) where rigPath is always empty.
+// Fixes #433
+func TestBuildStartupCommand_UsesGTRootFromEnvVars(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+
+	townSettings := NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	townSettings.Agents = map[string]*RuntimeConfig{
+		"claude-sonnet": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet"},
+		},
+	}
+	townSettings.RoleAgents = map[string]string{
+		constants.RoleDeacon: "claude-sonnet",
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	envVars := map[string]string{
+		"GT_ROLE": constants.RoleDeacon,
+		"GT_ROOT": townRoot,
+	}
+	cmd := BuildStartupCommand(envVars, "", "")
+
+	if !strings.Contains(cmd, "--model sonnet") {
+		t.Errorf("expected --model sonnet from role_agents[deacon], got: %q", cmd)
+	}
+}
+
+func TestBuildStartupCommandWithAgentOverride_UsesGTRootFromEnvVars(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+
+	townSettings := NewTownSettings()
+	townSettings.DefaultAgent = "claude"
+	townSettings.Agents = map[string]*RuntimeConfig{
+		"claude-sonnet": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet"},
+		},
+	}
+	townSettings.RoleAgents = map[string]string{
+		constants.RoleDeacon: "claude-sonnet",
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	envVars := map[string]string{
+		"GT_ROLE": constants.RoleDeacon,
+		"GT_ROOT": townRoot,
+	}
+	cmd, err := BuildStartupCommandWithAgentOverride(envVars, "", "", "")
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	if !strings.Contains(cmd, "--model sonnet") {
+		t.Errorf("expected --model sonnet from role_agents[deacon], got: %q", cmd)
+	}
+}
+
+// TestMergeQueueConfig_PartialJSON_BoolDefaults verifies that omitted *bool fields
+// in a partial merge_queue JSON config deserialize to nil (not false), and that the
+// nil-safe accessor methods return the correct defaults.
+//
+// This is a regression test for: "Partial merge_queue config silently disables
+// refinery tests — omitted booleans deserialize to Go zero values (false)".
+// The *bool pointer approach prevents this, and this test locks in that guarantee.
+func TestMergeQueueConfig_PartialJSON_BoolDefaults(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		json string
+		// Expected accessor results when *bool fields are omitted (nil)
+		wantRunTests               bool
+		wantDeleteMerged           bool
+		wantPolecatIntegration     bool
+		wantRefineryIntegration    bool
+		wantAutoLand               bool
+	}{
+		{
+			name: "minimal config — all *bool fields omitted",
+			json: `{"enabled": true, "on_conflict": "assign_back"}`,
+			// nil *bool → accessor defaults
+			wantRunTests:            true,
+			wantDeleteMerged:        true,
+			wantPolecatIntegration:  true,
+			wantRefineryIntegration: true,
+			wantAutoLand:            false,
+		},
+		{
+			name: "explicit false — should be respected",
+			json: `{
+				"enabled": true,
+				"on_conflict": "assign_back",
+				"run_tests": false,
+				"delete_merged_branches": false,
+				"integration_branch_polecat_enabled": false,
+				"integration_branch_refinery_enabled": false,
+				"integration_branch_auto_land": false
+			}`,
+			wantRunTests:            false,
+			wantDeleteMerged:        false,
+			wantPolecatIntegration:  false,
+			wantRefineryIntegration: false,
+			wantAutoLand:            false,
+		},
+		{
+			name: "explicit true — should be respected",
+			json: `{
+				"enabled": true,
+				"on_conflict": "assign_back",
+				"run_tests": true,
+				"delete_merged_branches": true,
+				"integration_branch_polecat_enabled": true,
+				"integration_branch_refinery_enabled": true,
+				"integration_branch_auto_land": true
+			}`,
+			wantRunTests:            true,
+			wantDeleteMerged:        true,
+			wantPolecatIntegration:  true,
+			wantRefineryIntegration: true,
+			wantAutoLand:            true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg MergeQueueConfig
+			if err := json.Unmarshal([]byte(tt.json), &cfg); err != nil {
+				t.Fatalf("json.Unmarshal: %v", err)
+			}
+
+			if got := cfg.IsRunTestsEnabled(); got != tt.wantRunTests {
+				t.Errorf("IsRunTestsEnabled() = %v, want %v", got, tt.wantRunTests)
+			}
+			if got := cfg.IsDeleteMergedBranchesEnabled(); got != tt.wantDeleteMerged {
+				t.Errorf("IsDeleteMergedBranchesEnabled() = %v, want %v", got, tt.wantDeleteMerged)
+			}
+			if got := cfg.IsPolecatIntegrationEnabled(); got != tt.wantPolecatIntegration {
+				t.Errorf("IsPolecatIntegrationEnabled() = %v, want %v", got, tt.wantPolecatIntegration)
+			}
+			if got := cfg.IsRefineryIntegrationEnabled(); got != tt.wantRefineryIntegration {
+				t.Errorf("IsRefineryIntegrationEnabled() = %v, want %v", got, tt.wantRefineryIntegration)
+			}
+			if got := cfg.IsIntegrationBranchAutoLandEnabled(); got != tt.wantAutoLand {
+				t.Errorf("IsIntegrationBranchAutoLandEnabled() = %v, want %v", got, tt.wantAutoLand)
+			}
+		})
+	}
+}
+
+// TestMergeQueueConfig_PartialJSON_NilPointers verifies that omitted *bool fields
+// deserialize to nil, not to a pointer to false. This is the underlying mechanism
+// that makes the accessor defaults work.
+func TestMergeQueueConfig_PartialJSON_NilPointers(t *testing.T) {
+	t.Parallel()
+
+	partialJSON := `{"enabled": true, "on_conflict": "assign_back"}`
+	var cfg MergeQueueConfig
+	if err := json.Unmarshal([]byte(partialJSON), &cfg); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	if cfg.RunTests != nil {
+		t.Errorf("RunTests should be nil when omitted, got %v", *cfg.RunTests)
+	}
+	if cfg.DeleteMergedBranches != nil {
+		t.Errorf("DeleteMergedBranches should be nil when omitted, got %v", *cfg.DeleteMergedBranches)
+	}
+	if cfg.IntegrationBranchPolecatEnabled != nil {
+		t.Errorf("IntegrationBranchPolecatEnabled should be nil when omitted, got %v", *cfg.IntegrationBranchPolecatEnabled)
+	}
+	if cfg.IntegrationBranchRefineryEnabled != nil {
+		t.Errorf("IntegrationBranchRefineryEnabled should be nil when omitted, got %v", *cfg.IntegrationBranchRefineryEnabled)
+	}
+	if cfg.IntegrationBranchAutoLand != nil {
+		t.Errorf("IntegrationBranchAutoLand should be nil when omitted, got %v", *cfg.IntegrationBranchAutoLand)
 	}
 }

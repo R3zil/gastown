@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -45,6 +44,8 @@ func buildAgentBeadID(identity string, role Role, townRoot string) string {
 			return beads.MayorBeadIDTown()
 		case identity == "deacon":
 			return beads.DeaconBeadIDTown()
+		case identity == "deacon-boot":
+			return beads.DogBeadIDTown("boot")
 		case len(parts) == 2 && parts[1] == "witness":
 			return beads.WitnessBeadIDWithPrefix(getPrefix(parts[0]), parts[0])
 		case len(parts) == 2 && parts[1] == "refinery":
@@ -92,6 +93,9 @@ func buildAgentBeadID(identity string, role Role, townRoot string) string {
 			return beads.CrewBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[2])
 		}
 		return ""
+	case RoleBoot:
+		// Boot is a deacon dog — uses town-level dog bead ID
+		return beads.DogBeadIDTown("boot")
 	default:
 		return ""
 	}
@@ -229,7 +233,7 @@ func runMoleculeProgress(cmd *cobra.Command, args []string) error {
 				deps = step.Dependencies
 			}
 			for _, dep := range deps {
-				if dep.DependencyType != "blocks" {
+				if !isBlockingDepType(dep.DependencyType) {
 					continue // Skip parent-child and other non-blocking relationships
 				}
 				hasBlockingDeps = true
@@ -246,6 +250,9 @@ func runMoleculeProgress(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+
+	// Sort ready steps by sequence number so step 1 comes before step 2, etc.
+	sortStepIDsBySequence(progress.ReadySteps)
 
 	// Calculate completion percentage
 	if progress.TotalSteps > 0 {
@@ -373,7 +380,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 
 		// Try to fetch the agent bead
 		agentBead, err := agentB.Show(agentBeadID)
-		if err == nil && agentBead != nil && agentBead.Type == "agent" {
+		if err == nil && beads.IsAgentBead(agentBead) {
 			status.AgentBeadID = agentBeadID
 
 			// Read hook_bead from the agent bead's database field (not description!)
@@ -507,6 +514,8 @@ func buildAgentIdentity(ctx RoleContext) string {
 		return "mayor/"
 	case RoleDeacon:
 		return "deacon/"
+	case RoleBoot:
+		return "deacon/boot"
 	case RoleWitness:
 		return ctx.Rig + "/witness"
 	case RoleRefinery:
@@ -602,7 +611,7 @@ func getMoleculeProgressInfo(b *beads.Beads, moleculeRootID string) (*MoleculePr
 				deps = step.Dependencies
 			}
 			for _, dep := range deps {
-				if dep.DependencyType != "blocks" {
+				if !isBlockingDepType(dep.DependencyType) {
 					continue // Skip parent-child and other non-blocking relationships
 				}
 				hasBlockingDeps = true
@@ -619,6 +628,9 @@ func getMoleculeProgressInfo(b *beads.Beads, moleculeRootID string) (*MoleculePr
 			}
 		}
 	}
+
+	// Sort ready steps by sequence number so step 1 comes before step 2, etc.
+	sortStepIDsBySequence(progress.ReadySteps)
 
 	// Calculate completion percentage
 	if progress.TotalSteps > 0 {
@@ -892,11 +904,10 @@ func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
 
 		// Check dependencies using Dependencies field (from bd show),
 		// not DependsOn (which is empty from bd list).
-		// Only "blocks" type dependencies block progress - ignore "parent-child".
 		allDepsClosed := true
 		hasBlockingDeps := false
 		for _, dep := range step.Dependencies {
-			if dep.DependencyType != "blocks" {
+			if !isBlockingDepType(dep.DependencyType) {
 				continue // Skip parent-child and other non-blocking relationships
 			}
 			hasBlockingDeps = true
@@ -909,6 +920,9 @@ func runMoleculeCurrent(cmd *cobra.Command, args []string) error {
 			readySteps = append(readySteps, step)
 		}
 	}
+
+	// Sort ready steps by sequence number so step 1 comes before step 2, etc.
+	sortStepsBySequence(readySteps)
 
 	// Determine current step and status
 	if info.StepsComplete == info.StepsTotal && info.StepsTotal > 0 {
@@ -977,23 +991,14 @@ func outputMoleculeCurrent(info MoleculeCurrentInfo) error {
 	return nil
 }
 
-// getGitRootForMolStatus returns the git root for hook file lookup.
-func getGitRootForMolStatus() (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 // isTownLevelRole returns true if the agent ID is a town-level role.
 // Town-level roles (Mayor, Deacon) operate from the town root and may have
 // pinned beads in any rig's beads directory.
 // Accepts both "mayor" and "mayor/" formats for compatibility.
 func isTownLevelRole(agentID string) bool {
 	return agentID == "mayor" || agentID == "mayor/" ||
-		agentID == "deacon" || agentID == "deacon/"
+		agentID == "deacon" || agentID == "deacon/" ||
+		agentID == "deacon/boot" || agentID == "deacon-boot"
 }
 
 // extractMailSender extracts the sender from mail bead labels.
@@ -1020,7 +1025,14 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 
 	// Scan each rig's beads directory
 	for _, route := range routes {
-		rigBeadsDir := filepath.Join(townRoot, route.Path)
+		// Handle both absolute and relative paths in routes.jsonl
+		// Go's filepath.Join doesn't replace with absolute paths like Python
+		var rigBeadsDir string
+		if filepath.IsAbs(route.Path) {
+			rigBeadsDir = route.Path
+		} else {
+			rigBeadsDir = filepath.Join(townRoot, route.Path)
+		}
 		if _, err := os.Stat(rigBeadsDir); os.IsNotExist(err) {
 			continue
 		}

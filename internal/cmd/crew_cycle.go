@@ -34,21 +34,21 @@ func cycleCrewSession(direction int, sessionOverride string) error {
 		}
 	}
 
-	// Parse rig name from current session
-	rigName, _, ok := parseCrewSessionName(currentSession)
+	// Parse rig name and prefix from current session
+	_, _, rigPrefix, ok := parseCrewSessionName(currentSession)
 	if !ok {
 		// Not a crew session (e.g., Mayor, Witness, Refinery) - no cycling, just stay put
 		return nil
 	}
 
 	// Find all crew sessions for this rig
-	sessions, err := findRigCrewSessions(rigName)
+	sessions, err := findRigCrewSessions(rigPrefix)
 	if err != nil {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
 
 	if len(sessions) == 0 {
-		return fmt.Errorf("no crew sessions found for rig %s", rigName)
+		return fmt.Errorf("no crew sessions found for prefix %s", rigPrefix)
 	}
 
 	// Sort for consistent ordering
@@ -79,7 +79,7 @@ func cycleCrewSession(direction int, sessionOverride string) error {
 	targetSession := sessions[targetIdx]
 
 	// Switch to target session
-	cmd := exec.Command("tmux", "switch-client", "-t", targetSession)
+	cmd := exec.Command("tmux", "-u", "switch-client", "-t", targetSession)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("switching to %s: %w", targetSession, err)
 	}

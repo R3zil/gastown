@@ -43,6 +43,10 @@ func (h *DefaultRefineryHandler) SetOutput(w io.Writer) {
 // HandleMergeReady handles a MERGE_READY message from Witness.
 // When a polecat's work is verified and ready, the Refinery acknowledges receipt.
 //
+// Belt-and-suspenders: if the message indicates this is from an owned+direct
+// convoy, the Refinery skips processing. These MRs shouldn't exist (gt done
+// skips MR creation for owned+direct), but this guards against edge cases.
+//
 // NOTE: The merge-request bead is created by `gt done`, so we no longer need
 // to add to the mrqueue here. The Refinery queries beads directly for ready MRs.
 func (h *DefaultRefineryHandler) HandleMergeReady(payload *MergeReadyPayload) error {
@@ -51,12 +55,11 @@ func (h *DefaultRefineryHandler) HandleMergeReady(payload *MergeReadyPayload) er
 	_, _ = fmt.Fprintf(h.Output, "  Issue: %s\n", payload.Issue)
 	_, _ = fmt.Fprintf(h.Output, "  Verified: %s\n", payload.Verified)
 
-	// Validate required fields
-	if payload.Branch == "" {
-		return fmt.Errorf("missing branch in MERGE_READY payload")
-	}
-	if payload.Polecat == "" {
-		return fmt.Errorf("missing polecat in MERGE_READY payload")
+	// Belt-and-suspenders: check if this is from an owned+direct convoy.
+	// The Verified field may contain "owned+direct" marker from witness.
+	if payload.Verified == "owned+direct: skip merge" {
+		_, _ = fmt.Fprintf(h.Output, "[Refinery] ⚠ Owned+direct convoy — skipping merge (belt-and-suspenders)\n")
+		return nil
 	}
 
 	// The merge-request bead is created by `gt done` with gt:merge-request label.

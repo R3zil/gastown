@@ -10,7 +10,7 @@ import (
 
 func TestSyncPreservesNonHooksFields(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setTestHome(t, tmpDir)
 
 	// Create a town with one crew member
 	crewDir := filepath.Join(tmpDir, "town", "rig1", "crew", "alice")
@@ -107,7 +107,7 @@ func TestSyncPreservesNonHooksFields(t *testing.T) {
 
 func TestSyncCreatesNewSettings(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
+	setTestHome(t, tmpDir)
 
 	// Save base config
 	base := &HooksConfig{
@@ -216,6 +216,55 @@ func TestMarshalSettingsEmpty(t *testing.T) {
 	// Should have hooks key
 	if _, ok := m["hooks"]; !ok {
 		t.Error("empty settings should still have hooks key")
+	}
+}
+
+func TestMarshalSettingsDoesNotMutateInput(t *testing.T) {
+	input := `{
+  "editorMode": "vim",
+  "hooks": {},
+  "customField": "value"
+}`
+	s, err := UnmarshalSettings([]byte(input))
+	if err != nil {
+		t.Fatalf("UnmarshalSettings: %v", err)
+	}
+
+	// Snapshot Extra before marshal
+	origLen := len(s.Extra)
+
+	_, err = MarshalSettings(s)
+	if err != nil {
+		t.Fatalf("MarshalSettings: %v", err)
+	}
+
+	// Extra should not have been modified
+	if len(s.Extra) != origLen {
+		t.Errorf("Extra was mutated: had %d keys, now has %d", origLen, len(s.Extra))
+	}
+}
+
+func TestMarshalSettingsDeletesZeroEditorMode(t *testing.T) {
+	input := `{
+  "editorMode": "vim",
+  "hooks": {}
+}`
+	s, err := UnmarshalSettings([]byte(input))
+	if err != nil {
+		t.Fatalf("UnmarshalSettings: %v", err)
+	}
+
+	// Clear editor mode
+	s.EditorMode = ""
+
+	output, err := MarshalSettings(s)
+	if err != nil {
+		t.Fatalf("MarshalSettings: %v", err)
+	}
+
+	// editorMode should NOT appear in output
+	if strings.Contains(string(output), "editorMode") {
+		t.Errorf("cleared editorMode still in output: %s", output)
 	}
 }
 
