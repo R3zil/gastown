@@ -120,6 +120,126 @@ func TestAgentFieldsModeOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+// --- Convoy fields in AttachmentFields (gt-7b6wf fix) ---
+
+func TestParseAttachmentFieldsConvoy(t *testing.T) {
+	tests := []struct {
+		name              string
+		desc              string
+		wantConvoyID      string
+		wantMergeStrategy string
+	}{
+		{
+			name:              "convoy_id and merge_strategy",
+			desc:              "attached_molecule: gt-wisp-abc\nconvoy_id: hq-cv-xyz\nmerge_strategy: direct",
+			wantConvoyID:      "hq-cv-xyz",
+			wantMergeStrategy: "direct",
+		},
+		{
+			name:              "hyphenated keys",
+			desc:              "convoy-id: hq-cv-123\nmerge-strategy: local",
+			wantConvoyID:      "hq-cv-123",
+			wantMergeStrategy: "local",
+		},
+		{
+			name:              "convoy key alias",
+			desc:              "convoy: hq-cv-456",
+			wantConvoyID:      "hq-cv-456",
+			wantMergeStrategy: "",
+		},
+		{
+			name:              "only merge_strategy (no convoy_id)",
+			desc:              "merge_strategy: mr",
+			wantConvoyID:      "",
+			wantMergeStrategy: "mr",
+		},
+		{
+			name:              "no convoy fields",
+			desc:              "attached_molecule: gt-wisp-abc\ndispatched_by: mayor/",
+			wantConvoyID:      "",
+			wantMergeStrategy: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issue := &Issue{Description: tt.desc}
+			fields := ParseAttachmentFields(issue)
+			if fields == nil {
+				if tt.wantConvoyID != "" || tt.wantMergeStrategy != "" {
+					t.Fatal("ParseAttachmentFields() = nil, want non-nil")
+				}
+				return
+			}
+			if fields.ConvoyID != tt.wantConvoyID {
+				t.Errorf("ConvoyID = %q, want %q", fields.ConvoyID, tt.wantConvoyID)
+			}
+			if fields.MergeStrategy != tt.wantMergeStrategy {
+				t.Errorf("MergeStrategy = %q, want %q", fields.MergeStrategy, tt.wantMergeStrategy)
+			}
+		})
+	}
+}
+
+func TestFormatAttachmentFieldsConvoy(t *testing.T) {
+	fields := &AttachmentFields{
+		AttachedMolecule: "gt-wisp-abc",
+		ConvoyID:         "hq-cv-xyz",
+		MergeStrategy:    "direct",
+	}
+	got := FormatAttachmentFields(fields)
+	if !strings.Contains(got, "convoy_id: hq-cv-xyz") {
+		t.Errorf("FormatAttachmentFields missing convoy_id, got:\n%s", got)
+	}
+	if !strings.Contains(got, "merge_strategy: direct") {
+		t.Errorf("FormatAttachmentFields missing merge_strategy, got:\n%s", got)
+	}
+}
+
+func TestConvoyFieldsRoundTrip(t *testing.T) {
+	original := &AttachmentFields{
+		AttachedMolecule: "gt-wisp-abc",
+		DispatchedBy:     "mayor/",
+		ConvoyID:         "hq-cv-xyz",
+		MergeStrategy:    "direct",
+	}
+	formatted := FormatAttachmentFields(original)
+	parsed := ParseAttachmentFields(&Issue{Description: formatted})
+	if parsed == nil {
+		t.Fatal("round-trip parse returned nil")
+	}
+	if parsed.ConvoyID != original.ConvoyID {
+		t.Errorf("ConvoyID: got %q, want %q", parsed.ConvoyID, original.ConvoyID)
+	}
+	if parsed.MergeStrategy != original.MergeStrategy {
+		t.Errorf("MergeStrategy: got %q, want %q", parsed.MergeStrategy, original.MergeStrategy)
+	}
+	if parsed.AttachedMolecule != original.AttachedMolecule {
+		t.Errorf("AttachedMolecule: got %q, want %q", parsed.AttachedMolecule, original.AttachedMolecule)
+	}
+}
+
+func TestSetAttachmentFieldsPreservesConvoy(t *testing.T) {
+	issue := &Issue{
+		Description: "convoy_id: hq-cv-old\nmerge_strategy: direct\nattached_molecule: gt-wisp-old\nSome other content",
+	}
+	fields := &AttachmentFields{
+		AttachedMolecule: "gt-wisp-new",
+		ConvoyID:         "hq-cv-new",
+		MergeStrategy:    "local",
+	}
+	newDesc := SetAttachmentFields(issue, fields)
+	if !strings.Contains(newDesc, "convoy_id: hq-cv-new") {
+		t.Errorf("SetAttachmentFields lost convoy_id field, got:\n%s", newDesc)
+	}
+	if !strings.Contains(newDesc, "merge_strategy: local") {
+		t.Errorf("SetAttachmentFields lost merge_strategy field, got:\n%s", newDesc)
+	}
+	if !strings.Contains(newDesc, "Some other content") {
+		t.Errorf("SetAttachmentFields lost non-attachment content, got:\n%s", newDesc)
+	}
+}
+
 // --- ParseAgentFieldsFromDescription alias (not covered in beads_test.go) ---
 
 func TestParseAgentFieldsFromDescription(t *testing.T) {

@@ -24,6 +24,8 @@ type AttachmentFields struct {
 	DispatchedBy     string // Agent ID that dispatched this work (for completion notification)
 	NoMerge          bool   // If true, gt done skips merge queue (for upstream PRs/human review)
 	Mode             string // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
+	ConvoyID         string // Convoy bead ID tracking this issue (e.g., "hq-cv-abc")
+	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local", or "" (default = mr)
 }
 
 // ParseAttachmentFields extracts attachment fields from an issue's description.
@@ -74,6 +76,12 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 		case "mode":
 			fields.Mode = value
 			hasFields = true
+		case "convoy_id", "convoy-id", "convoyid", "convoy":
+			fields.ConvoyID = value
+			hasFields = true
+		case "merge_strategy", "merge-strategy", "mergestrategy":
+			fields.MergeStrategy = value
+			hasFields = true
 		}
 	}
 
@@ -110,6 +118,12 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 	if fields.Mode != "" {
 		lines = append(lines, "mode: "+fields.Mode)
 	}
+	if fields.ConvoyID != "" {
+		lines = append(lines, "convoy_id: "+fields.ConvoyID)
+	}
+	if fields.MergeStrategy != "" {
+		lines = append(lines, "merge_strategy: "+fields.MergeStrategy)
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -136,6 +150,13 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 		"no-merge":          true,
 		"nomerge":           true,
 		"mode":              true,
+		"convoy_id":         true,
+		"convoy-id":         true,
+		"convoyid":          true,
+		"convoy":            true,
+		"merge_strategy":    true,
+		"merge-strategy":    true,
+		"mergestrategy":     true,
 	}
 
 	// Collect non-attachment lines from existing description

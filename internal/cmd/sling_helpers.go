@@ -217,6 +217,8 @@ type beadFieldUpdates struct {
 	AttachedMolecule string // Wisp root ID
 	NoMerge          bool   // Skip merge queue on completion
 	Mode             string // Execution mode: "" (normal) or "ralph"
+	ConvoyID         string // Convoy bead ID (e.g., "hq-cv-abc")
+	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local"
 }
 
 // storeFieldsInBead performs a single read-modify-write to update all attachment fields
@@ -273,6 +275,12 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	}
 	if updates.Mode != "" {
 		fields.Mode = updates.Mode
+	}
+	if updates.ConvoyID != "" {
+		fields.ConvoyID = updates.ConvoyID
+	}
+	if updates.MergeStrategy != "" {
+		fields.MergeStrategy = updates.MergeStrategy
 	}
 
 	// Write back once

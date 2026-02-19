@@ -477,6 +477,12 @@ func runSling(cmd *cobra.Command, args []string) error {
 
 	// Auto-convoy: check if issue is already tracked by a convoy
 	// If not, create one for dashboard visibility (unless --no-convoy is set)
+	//
+	// Also captures convoy ID and merge strategy for storage on the issue bead.
+	// This enables gt done to find the convoy without cross-rig dep resolution
+	// (fix for gt-7b6wf: convoy merge=direct not propagated).
+	var slingConvoyID string
+	var slingConvoyMergeStrategy string
 	if !slingNoConvoy && formulaName == "" {
 		existingConvoy := isTrackedByConvoy(beadID)
 		if existingConvoy == "" {
@@ -492,6 +498,8 @@ func runSling(cmd *cobra.Command, args []string) error {
 					// Log warning but don't fail - convoy is optional
 					fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 				} else {
+					slingConvoyID = convoyID
+					slingConvoyMergeStrategy = slingMerge
 					fmt.Printf("%s Created convoy 🚚 %s\n", style.Bold.Render("→"), convoyID)
 					fmt.Printf("  Tracking: %s\n", beadID)
 					if slingOwned {
@@ -503,6 +511,11 @@ func runSling(cmd *cobra.Command, args []string) error {
 				}
 			}
 		} else {
+			slingConvoyID = existingConvoy
+			// Look up merge strategy from existing convoy
+			if convoyInfo := getConvoyInfoForIssue(beadID); convoyInfo != nil {
+				slingConvoyMergeStrategy = convoyInfo.MergeStrategy
+			}
 			fmt.Printf("%s Already tracked by convoy %s\n", style.Dim.Render("○"), existingConvoy)
 		}
 	}
@@ -645,6 +658,8 @@ func runSling(cmd *cobra.Command, args []string) error {
 		AttachedMolecule: attachedMoleculeID,
 		NoMerge:          slingNoMerge,
 		Mode:             slingMode,
+		ConvoyID:         slingConvoyID,
+		MergeStrategy:    slingConvoyMergeStrategy,
 	}
 	if err := storeFieldsInBead(beadID, fieldUpdates); err != nil {
 		// Warn but don't fail - polecat will still complete work
