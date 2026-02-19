@@ -304,41 +304,50 @@ func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
 	return stranded, nil
 }
 
-// feedFirstReady dispatches the first ready issue to its rig via gt sling.
+// feedFirstReady iterates through all ready issues in a stranded convoy and
+// dispatches the first one that can be successfully slung. Issues are skipped
+// (with logging) when the prefix is unresolvable, the rig has no route, the
+// rig is parked, or the sling command fails. This ensures convoys progress
+// even when some issues target unavailable rigs.
 func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 	if len(c.ReadyIssues) == 0 {
 		return
 	}
-	issueID := c.ReadyIssues[0]
 
-	prefix := beads.ExtractPrefix(issueID)
-	if prefix == "" {
-		m.logger("Convoy %s: no prefix for %s, skipping", c.ID, issueID)
-		return
+	for _, issueID := range c.ReadyIssues {
+		prefix := beads.ExtractPrefix(issueID)
+		if prefix == "" {
+			m.logger("Convoy %s: no prefix for %s, skipping", c.ID, issueID)
+			continue
+		}
+
+		rig := beads.GetRigNameForPrefix(m.townRoot, prefix)
+		if rig == "" {
+			m.logger("Convoy %s: no rig for %s (prefix %s), skipping", c.ID, issueID, prefix)
+			continue
+		}
+
+		if m.isRigParked(rig) {
+			m.logger("Convoy %s: rig %s is parked, skipping %s", c.ID, rig, issueID)
+			continue
+		}
+
+		m.logger("Convoy %s: feeding %s to %s", c.ID, issueID, rig)
+
+		cmd := exec.CommandContext(m.ctx, m.gtPath, "sling", issueID, rig, "--no-boot")
+		cmd.Dir = m.townRoot
+		util.SetProcessGroup(cmd)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+
+		if err := cmd.Run(); err != nil {
+			m.logger("Convoy %s: sling %s failed: %s", c.ID, issueID, util.FirstLine(stderr.String()))
+			continue
+		}
+		return // Successfully dispatched one issue
 	}
 
-	rig := beads.GetRigNameForPrefix(m.townRoot, prefix)
-	if rig == "" {
-		m.logger("Convoy %s: no rig for %s (prefix %s), skipping", c.ID, issueID, prefix)
-		return
-	}
-
-	if m.isRigParked(rig) {
-		m.logger("Convoy %s: rig %s is parked, skipping %s", c.ID, rig, issueID)
-		return
-	}
-
-	m.logger("Convoy %s: feeding %s to %s", c.ID, issueID, rig)
-
-	cmd := exec.CommandContext(m.ctx, m.gtPath, "sling", issueID, rig, "--no-boot")
-	cmd.Dir = m.townRoot
-	util.SetProcessGroup(cmd)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		m.logger("Convoy %s: sling %s failed: %s", c.ID, issueID, util.FirstLine(stderr.String()))
-	}
+	m.logger("Convoy %s: no dispatchable issues (all %d skipped)", c.ID, len(c.ReadyIssues))
 }
 
 // closeEmptyConvoy runs gt convoy check to auto-close an empty convoy.

@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tui/convoy"
@@ -1262,11 +1263,15 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 		// Find ready issues (open, not blocked, no live assignee, slingable).
 		// Town-level beads (hq- prefix with path=".") are excluded because
 		// they can't be dispatched via gt sling -- they're handled by the deacon.
+		// Non-slingable types (epics, convoys, etc.) are also excluded.
 		townRoot := filepath.Dir(townBeads)
 		var readyIssues []string
 		for _, t := range tracked {
 			if isReadyIssue(t) {
 				if !isSlingableBead(townRoot, t.ID) {
+					continue
+				}
+				if !convoyops.IsSlingableType(t.IssueType) {
 					continue
 				}
 				readyIssues = append(readyIssues, t.ID)
