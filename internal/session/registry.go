@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // PrefixRegistry maps beads prefixes to rig names and vice versa.
@@ -83,16 +84,22 @@ func (r *PrefixRegistry) Prefixes() []string {
 }
 
 // defaultRegistry is the package-level registry used by convenience functions.
-var defaultRegistry = NewPrefixRegistry()
+// Access is synchronized via atomic.Pointer to eliminate data races between
+// concurrent readers (e.g., patrol goroutines) and writers (e.g., InitRegistry).
+var defaultRegistry atomic.Pointer[PrefixRegistry]
+
+func init() {
+	defaultRegistry.Store(NewPrefixRegistry())
+}
 
 // DefaultRegistry returns the package-level prefix registry.
 func DefaultRegistry() *PrefixRegistry {
-	return defaultRegistry
+	return defaultRegistry.Load()
 }
 
 // SetDefaultRegistry replaces the package-level prefix registry.
 func SetDefaultRegistry(r *PrefixRegistry) {
-	defaultRegistry = r
+	defaultRegistry.Store(r)
 }
 
 // InitRegistry populates the default registry from the town's rigs.json.
@@ -110,7 +117,7 @@ func InitRegistry(townRoot string) error {
 // PrefixFor returns the beads prefix for a rig, using the default registry.
 // Returns DefaultPrefix if the rig is unknown.
 func PrefixFor(rigName string) string {
-	return defaultRegistry.PrefixForRig(rigName)
+	return defaultRegistry.Load().PrefixForRig(rigName)
 }
 
 // BuildPrefixRegistryFromTown reads rigs.json from a town root directory
@@ -177,7 +184,7 @@ func IsKnownSession(sess string) bool {
 	if strings.HasPrefix(sess, HQPrefix) {
 		return true
 	}
-	return defaultRegistry.HasPrefix(sess)
+	return defaultRegistry.Load().HasPrefix(sess)
 }
 
 // matchPrefix finds the prefix in a session name suffix using the registry.
