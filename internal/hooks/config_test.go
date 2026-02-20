@@ -435,18 +435,13 @@ func TestComputeExpectedNoBase(t *testing.T) {
 		t.Error("expected DefaultBase for mayor when no configs exist")
 	}
 
-	// Crew should get DefaultBase + built-in crew override (PreCompact)
+	// Non-mayor target should also just get DefaultBase
 	crew, err := ComputeExpected("crew")
 	if err != nil {
 		t.Fatalf("ComputeExpected(crew) failed: %v", err)
 	}
-	// Crew has a built-in PreCompact override, so it won't equal bare DefaultBase
-	if len(crew.PreCompact) == 0 {
-		t.Error("expected crew to have PreCompact hook from DefaultOverrides")
-	}
-	// But it should still have the base SessionStart hooks
-	if len(crew.SessionStart) != len(defaultBase.SessionStart) {
-		t.Error("expected crew to inherit SessionStart from DefaultBase")
+	if !HooksEqual(crew, defaultBase) {
+		t.Error("expected DefaultBase for crew when no configs exist")
 	}
 }
 

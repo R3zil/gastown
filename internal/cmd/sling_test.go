@@ -2,15 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"github.com/steveyegge/gastown/internal/config"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/config"
 )
 
 func writeBDStub(t *testing.T, binDir string, unixScript string, windowsScript string) string {
@@ -108,9 +106,9 @@ func TestExtractIssueID(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := beads.ExtractIssueID(tt.id)
+			got := extractIssueID(tt.id)
 			if got != tt.want {
-				t.Errorf("ExtractIssueID(%q) = %q, want %q", tt.id, got, tt.want)
+				t.Errorf("extractIssueID(%q) = %q, want %q", tt.id, got, tt.want)
 			}
 		})
 	}
@@ -1694,7 +1692,7 @@ cmd="$1"
 shift || true
 case "$cmd" in
   show)
-    echo '[{"title":"Test issue","status":"hooked","assignee":"gastown/polecats/test-dead-polecat-xxxx","description":""}]'
+    echo '[{"title":"Test issue","status":"hooked","assignee":"gastown/polecats/toast","description":""}]'
     ;;
   update)
     exit 0
@@ -1706,7 +1704,7 @@ exit 0
 echo %*>>"%BD_LOG%"
 set "cmd=%1"
 if "%cmd%"=="show" (
-  echo [{"title":"Test issue","status":"hooked","assignee":"gastown/polecats/test-dead-polecat-xxxx","description":""}]
+  echo [{"title":"Test issue","status":"hooked","assignee":"gastown/polecats/toast","description":""}]
   exit /b 0
 )
 exit /b 0
@@ -1756,9 +1754,9 @@ exit /b 0
 
 	// Sling with matching target but dead agent — should NOT no-op.
 	// The auto-force path proceeds into resolveTarget which will fail
-	// because the polecat doesn't exist in tmux. Use a unique name that
-	// will never collide with a real running polecat session.
-	err = runSling(nil, []string{"gt-test456", "gastown/polecats/test-dead-polecat-xxxx"})
+	// because the rig doesn't exist in the test environment. The key
+	// assertion: we must NOT get an idempotent no-op (nil error).
+	err = runSling(nil, []string{"gt-test456", "gastown/polecats/toast"})
 
 	w.Close()
 	os.Stdout = origStdout
@@ -2125,142 +2123,6 @@ func TestSlingPolecatEnvCheck(t *testing.T) {
 				} else {
 					t.Errorf("unexpected polecat block with GT_ROLE=%q GT_POLECAT=%q", tt.role, tt.polecat)
 				}
-			}
-		})
-	}
-}
-
-// TestSlingNudgeCrewAndMayor verifies that slinging to crew or mayor targets
-// with an active session includes the nudge (inject start prompt) step.
-// This is a regression test for gt-in7b: the generic resolveTarget + nudge
-// flow handles all target types, not just polecats.
-func TestSlingNudgeCrewAndMayor(t *testing.T) {
-	tests := []struct {
-		name       string
-		target     string
-		wantAgent  string
-		wantPaneIn string // substring expected in dry-run "Would inject" output
-	}{
-		{
-			name:       "crew target gets nudge pane",
-			target:     "gastown/crew/max",
-			wantAgent:  "gastown/crew/max",
-			wantPaneIn: "%99",
-		},
-		{
-			name:       "mayor target gets nudge pane",
-			target:     "mayor",
-			wantAgent:  "mayor/",
-			wantPaneIn: "%99",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			townRoot := t.TempDir()
-
-			if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
-				t.Fatalf("mkdir: %v", err)
-			}
-			if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
-				t.Fatalf("mkdir .beads: %v", err)
-			}
-			rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
-			if err := os.MkdirAll(rigDir, 0755); err != nil {
-				t.Fatalf("mkdir rigDir: %v", err)
-			}
-			routes := `{"prefix":"gt-","path":"gastown/mayor/rig"}` + "\n" +
-				`{"prefix":"hq-","path":"."}` + "\n"
-			if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
-				t.Fatalf("write routes: %v", err)
-			}
-
-			binDir := filepath.Join(townRoot, "bin")
-			if err := os.MkdirAll(binDir, 0755); err != nil {
-				t.Fatalf("mkdir binDir: %v", err)
-			}
-			bdScript := `#!/bin/sh
-cmd="$1"
-shift || true
-case "$cmd" in
-  show)
-    echo '[{"title":"Test issue","status":"open","assignee":"","description":""}]'
-    ;;
-  update)
-    exit 0
-    ;;
-esac
-exit 0
-`
-			bdScriptWindows := `@echo off
-set "cmd=%1"
-if "%cmd%"=="show" (
-  echo [{"title":"Test issue","status":"open","assignee":"","description":""}]
-  exit /b 0
-)
-exit /b 0
-`
-			_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
-
-			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			t.Setenv(EnvGTRole, "mayor")
-			t.Setenv("GT_POLECAT", "")
-			t.Setenv("GT_CREW", "")
-			t.Setenv("TMUX_PANE", "")
-			t.Setenv("GT_TEST_NO_NUDGE", "1")
-			t.Setenv("GT_TEST_SKIP_HOOK_VERIFY", "1")
-
-			cwd, err := os.Getwd()
-			if err != nil {
-				t.Fatalf("getwd: %v", err)
-			}
-			t.Cleanup(func() { _ = os.Chdir(cwd) })
-			if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
-				t.Fatalf("chdir: %v", err)
-			}
-
-			// Mock resolveTargetAgentFn to return a fake pane (no real tmux needed)
-			prevFn := resolveTargetAgentFn
-			t.Cleanup(func() { resolveTargetAgentFn = prevFn })
-			resolveTargetAgentFn = func(target string) (string, string, string, error) {
-				return tt.wantAgent, "%99", townRoot, nil
-			}
-
-			prevDryRun := slingDryRun
-			prevNoConvoy := slingNoConvoy
-			t.Cleanup(func() {
-				slingDryRun = prevDryRun
-				slingNoConvoy = prevNoConvoy
-			})
-			slingDryRun = true
-			slingNoConvoy = true
-
-			// Capture stdout
-			origStdout := os.Stdout
-			r, w, _ := os.Pipe()
-			os.Stdout = w
-			t.Cleanup(func() { os.Stdout = origStdout })
-
-			err = runSling(nil, []string{"gt-abc123", tt.target})
-
-			w.Close()
-			os.Stdout = origStdout
-			var captured bytes.Buffer
-			_, _ = captured.ReadFrom(r)
-			stdout := captured.String()
-
-			if err != nil {
-				t.Fatalf("runSling: %v", err)
-			}
-
-			// Verify the dry-run output includes the nudge pane
-			if !strings.Contains(stdout, "Would inject start prompt to pane: "+tt.wantPaneIn) {
-				t.Errorf("expected nudge pane %q in output, got:\n%s", tt.wantPaneIn, stdout)
-			}
-
-			// Verify correct agent was resolved
-			if !strings.Contains(stdout, tt.wantAgent) {
-				t.Errorf("expected agent %q in output, got:\n%s", tt.wantAgent, stdout)
 			}
 		})
 	}

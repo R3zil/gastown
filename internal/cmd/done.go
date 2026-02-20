@@ -456,16 +456,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		//   direct: push commits straight to target branch, bypass refinery
 		//   mr:     default — create merge-request bead, refinery merges
 		//   local:  keep on feature branch, no push, no MR (for human review/upstream PRs)
-		//
-		// Primary: read convoy info from the issue's attachment fields (gt-7b6wf fix).
-		// gt sling stores convoy_id and merge_strategy on the issue when dispatching,
-		// which avoids unreliable cross-rig dep resolution at gt done time.
-		// Fallback: dep-based lookup via getConvoyInfoForIssue (for issues dispatched
-		// before this fix, or where attachment fields weren't set).
-		convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
-		if convoyInfo == nil {
-			convoyInfo = getConvoyInfoForIssue(issueID)
-		}
+		convoyInfo = getConvoyInfoForIssue(issueID)
 
 		// Handle "local" strategy: skip push and MR entirely
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "local" {
@@ -653,50 +644,37 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
-		// Fallback: check if issue belongs to a direct-merge convoy that the
-		// primary check (line ~483) missed — e.g., issues dispatched before the
-		// attachment-field fix, or where dep-based lookup failed at that point.
-		// At this stage the branch was pushed to origin/<branch> (feature branch),
-		// NOT to main. So we must push to main now before skipping MR creation.
-		convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
-		if convoyInfo == nil {
-			convoyInfo = getConvoyInfoForIssue(issueID)
-		}
-		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
-			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
+		// Check if issue belongs to an owned+direct convoy.
+		// Owned convoys with direct merge strategy bypass the refinery pipeline —
+		// the polecat already pushed to main. Skip MR creation and close directly.
+		convoyInfo = getConvoyInfoForIssue(issueID)
+		if convoyInfo.IsOwnedDirect() {
+			fmt.Printf("%s Owned convoy (direct merge): skipping merge queue\n", style.Bold.Render("→"))
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
+			fmt.Printf("  Branch: %s\n", branch)
+			fmt.Printf("  Issue: %s\n", issueID)
+			fmt.Println()
+			fmt.Printf("%s\n", style.Dim.Render("Polecat already pushed to main. No MR needed."))
 
-			// Push branch directly to main (the earlier push went to origin/<branch>)
-			directRefspec := branch + ":" + defaultBranch
-			directPushErr := g.Push("origin", directRefspec, false)
-			if directPushErr != nil {
-				// Direct push failed — fall through to normal MR creation
-				style.PrintWarning("late direct push to %s failed: %v — falling through to MR", defaultBranch, directPushErr)
-			} else {
-				fmt.Printf("%s Branch pushed directly to %s\n", style.Bold.Render("✓"), defaultBranch)
-
-				// Close the issue directly — refinery won't process it.
-				if issueID != "" {
-					var closeErr error
-					for attempt := 1; attempt <= 3; attempt++ {
-						closeErr = bd.ForceCloseWithReason(
-							fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID)
-						if closeErr == nil {
-							fmt.Printf("%s Issue %s closed (direct merge)\n", style.Bold.Render("✓"), issueID)
-							break
-						}
-						if attempt < 3 {
-							style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
-							time.Sleep(time.Duration(attempt*2) * time.Second)
-						}
-					}
-					if closeErr != nil {
-						style.PrintWarning("could not close issue %s after 3 attempts: %v", issueID, closeErr)
-					}
+			// Close the issue directly — refinery won't process it.
+			// Retry with backoff handles transient dolt lock contention.
+			var closeErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				closeErr = bd.ForceCloseWithReason("Completed via owned+direct convoy (no MR needed)", issueID)
+				if closeErr == nil {
+					fmt.Printf("%s Issue %s closed (owned+direct)\n", style.Bold.Render("✓"), issueID)
+					break
 				}
-
-				goto notifyWitness
+				if attempt < 3 {
+					style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
+					time.Sleep(time.Duration(attempt*2) * time.Second)
+				}
 			}
+			if closeErr != nil {
+				style.PrintWarning("could not close issue %s after 3 attempts: %v", issueID, closeErr)
+			}
+
+			goto notifyWitness
 		}
 
 		// Determine target branch (auto-detect integration branch if applicable)
@@ -853,7 +831,7 @@ afterDoltMerge:
 	// on the polecat branch and refinery won't find it on main.
 	// If no branch existed (crew worker), MR bead is already on main.
 	if mrID != "" && !mergeFailed {
-		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
+		nudgeRefinery(rigName, fmt.Sprintf("MR submitted: %s branch=%s", mrID, branch))
 	}
 
 	// Notify Witness about completion

@@ -6,10 +6,9 @@ import (
 
 // Molecule command flags
 var (
-	moleculeJSON      bool
-	moleculeJitter    string // jitter duration for squash (e.g. "10s")
-	moleculeSummary   string // optional summary for squash digest
-	moleculeNoDigest  bool   // skip digest bead creation on squash
+	moleculeJSON    bool
+	moleculeJitter  string // jitter duration for squash (e.g. "10s")
+	moleculeSummary string // optional summary for squash digest
 )
 
 var moleculeCmd = &cobra.Command{
@@ -247,7 +246,6 @@ func init() {
 	moleculeSquashCmd.Flags().BoolVar(&moleculeJSON, "json", false, "Output as JSON")
 	moleculeSquashCmd.Flags().StringVar(&moleculeJitter, "jitter", "", "Sleep a random duration from 0 to this value before squashing (e.g. '10s') to reduce concurrent Dolt lock contention")
 	moleculeSquashCmd.Flags().StringVar(&moleculeSummary, "summary", "", "Optional summary for the squash digest (e.g. patrol observations)")
-	moleculeSquashCmd.Flags().BoolVar(&moleculeNoDigest, "no-digest", false, "Skip digest bead creation (for patrol molecules that run frequently)")
 
 	// Add step subcommand with its children
 	moleculeStepCmd.AddCommand(moleculeStepDoneCmd)

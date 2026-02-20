@@ -12,7 +12,6 @@ type Role string
 const (
 	RoleMayor    Role = "mayor"
 	RoleDeacon   Role = "deacon"
-	RoleOverseer Role = "overseer"
 	RoleWitness  Role = "witness"
 	RoleRefinery Role = "refinery"
 	RoleCrew     Role = "crew"
@@ -118,7 +117,7 @@ func ParseSessionNameWithRegistry(session string, registry *PrefixRegistry) (*Ag
 		case "boot":
 			return &AgentIdentity{Role: RoleDeacon, Name: "boot"}, nil
 		case "overseer":
-			return &AgentIdentity{Role: RoleOverseer}, nil
+			return &AgentIdentity{Role: RolePolecat, Name: "overseer"}, nil
 		default:
 			return nil, fmt.Errorf("invalid session name %q: unknown hq- role", session)
 		}
@@ -170,8 +169,6 @@ func (a *AgentIdentity) SessionName() string {
 			return BootSessionName()
 		}
 		return DeaconSessionName()
-	case RoleOverseer:
-		return OverseerSessionName()
 	case RoleWitness:
 		return WitnessSessionName(a.prefix())
 	case RoleRefinery:
@@ -211,8 +208,6 @@ func (a *AgentIdentity) BeaconAddress() string {
 		return "mayor"
 	case RoleDeacon:
 		return "deacon"
-	case RoleOverseer:
-		return "overseer"
 	case RoleWitness:
 		return BeaconRecipient("witness", "", a.Rig)
 	case RoleRefinery:
@@ -240,8 +235,6 @@ func (a *AgentIdentity) Address() string {
 		return "mayor"
 	case RoleDeacon:
 		return "deacon"
-	case RoleOverseer:
-		return "overseer"
 	case RoleWitness:
 		return fmt.Sprintf("%s/witness", a.Rig)
 	case RoleRefinery:

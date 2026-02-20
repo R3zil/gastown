@@ -936,11 +936,8 @@ func resolveAgentConfigInternal(townRoot, rigPath string) *RuntimeConfig {
 
 	// Backwards compatibility: if Runtime is set directly, use it
 	if rigSettings != nil && rigSettings.Runtime != nil {
-		rc := fillRuntimeDefaults(rigSettings.Runtime)
-		if rc.ResolvedAgent == "" {
-			rc.ResolvedAgent = inferAgentName(rc)
-		}
-		return rc
+		rc := rigSettings.Runtime
+		return fillRuntimeDefaults(rc)
 	}
 
 	// Load town settings for agent lookup
@@ -965,9 +962,7 @@ func resolveAgentConfigInternal(townRoot, rigPath string) *RuntimeConfig {
 		agentName = "claude" // ultimate fallback
 	}
 
-	rc := lookupAgentConfig(agentName, townSettings, rigSettings)
-	rc.ResolvedAgent = agentName
-	return rc
+	return lookupAgentConfig(agentName, townSettings, rigSettings)
 }
 
 // ResolveAgentConfigWithOverride resolves the agent configuration for a rig, with an optional override.
@@ -991,11 +986,8 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 
 	// Backwards compatibility: if Runtime is set directly, use it (but still report agentOverride if present)
 	if rigSettings != nil && rigSettings.Runtime != nil && agentOverride == "" {
-		rc := fillRuntimeDefaults(rigSettings.Runtime)
-		if rc.ResolvedAgent == "" {
-			rc.ResolvedAgent = inferAgentName(rc)
-		}
-		return rc, "", nil
+		rc := rigSettings.Runtime
+		return fillRuntimeDefaults(rc), "", nil
 	}
 
 	// Load town settings for agent lookup
@@ -1044,9 +1036,7 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 	}
 
 	// Normal lookup path (no override)
-	rc := lookupAgentConfig(agentName, townSettings, rigSettings)
-	rc.ResolvedAgent = agentName
-	return rc, agentName, nil
+	return lookupAgentConfig(agentName, townSettings, rigSettings), agentName, nil
 }
 
 // ValidateAgentConfig checks if an agent configuration is valid and the binary exists.
@@ -1213,9 +1203,7 @@ func tryResolveFromEphemeralTier(role string) (*RuntimeConfig, bool) {
 	agents := CostTierAgents(tier)
 	if agents != nil {
 		if rc, found := agents[agentName]; found && rc != nil {
-			filled := fillRuntimeDefaults(rc)
-			filled.ResolvedAgent = agentName
-			return filled, true
+			return fillRuntimeDefaults(rc), true
 		}
 	}
 
@@ -1298,15 +1286,12 @@ func resolveRoleAgentConfigCore(role, townRoot, rigPath string) *RuntimeConfig {
 	if rigSettings != nil && rigSettings.RoleAgents != nil {
 		if agentName, ok := rigSettings.RoleAgents[role]; ok && agentName != "" {
 			if rc := lookupCustomAgentConfig(agentName, townSettings, rigSettings); rc != nil {
-				rc.ResolvedAgent = agentName
 				return rc
 			}
 			if err := ValidateAgentConfig(agentName, townSettings, rigSettings); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: role_agents[%s]=%s - %v, falling back to default\n", role, agentName, err)
 			} else {
-				rc := lookupAgentConfig(agentName, townSettings, rigSettings)
-				rc.ResolvedAgent = agentName
-				return rc
+				return lookupAgentConfig(agentName, townSettings, rigSettings)
 			}
 		}
 	}
@@ -1315,15 +1300,12 @@ func resolveRoleAgentConfigCore(role, townRoot, rigPath string) *RuntimeConfig {
 	if townSettings.RoleAgents != nil {
 		if agentName, ok := townSettings.RoleAgents[role]; ok && agentName != "" {
 			if rc := lookupCustomAgentConfig(agentName, townSettings, rigSettings); rc != nil {
-				rc.ResolvedAgent = agentName
 				return rc
 			}
 			if err := ValidateAgentConfig(agentName, townSettings, rigSettings); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: role_agents[%s]=%s - %v, falling back to default\n", role, agentName, err)
 			} else {
-				rc := lookupAgentConfig(agentName, townSettings, rigSettings)
-				rc.ResolvedAgent = agentName
-				return rc
+				return lookupAgentConfig(agentName, townSettings, rigSettings)
 			}
 		}
 	}
@@ -1447,7 +1429,6 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 		Command:       rc.Command,
 		InitialPrompt: rc.InitialPrompt,
 		PromptMode:    rc.PromptMode,
-		ResolvedAgent: rc.ResolvedAgent,
 	}
 
 	// Deep copy Args slice to avoid sharing backing array
@@ -1552,19 +1533,6 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 	}
 
 	return result
-}
-
-// inferAgentName determines the agent name from a legacy RuntimeConfig.
-// It mirrors the preset resolution logic in fillRuntimeDefaults:
-// use Provider if set, otherwise Command, falling back to "claude".
-func inferAgentName(rc *RuntimeConfig) string {
-	if rc.Provider != "" {
-		return rc.Provider
-	}
-	if rc.Command != "" {
-		return rc.Command
-	}
-	return "claude"
 }
 
 // GetRuntimeCommand is a convenience function that returns the full command string
@@ -1764,13 +1732,6 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 	if rc.Session != nil && rc.Session.SessionIDEnv != "" {
 		resolvedEnv["GT_SESSION_ID_ENV"] = rc.Session.SessionIDEnv
 	}
-	// Set GT_AGENT from resolved agent name so IsAgentAlive can detect
-	// non-Claude processes (e.g., opencode). Without this, witness patrol
-	// falls back to ["node", "claude"] process detection and auto-nukes
-	// polecats running non-Claude agents. See: gt-agent-role-agents.
-	if rc.ResolvedAgent != "" {
-		resolvedEnv["GT_AGENT"] = rc.ResolvedAgent
-	}
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {
 		resolvedEnv[k] = v
@@ -1935,12 +1896,9 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 	if rc.Session != nil && rc.Session.SessionIDEnv != "" {
 		resolvedEnv["GT_SESSION_ID_ENV"] = rc.Session.SessionIDEnv
 	}
-	// Record agent name so IsAgentAlive can detect the running process.
-	// Explicit override takes priority; fall back to resolved agent name.
+	// Record agent override so handoff can preserve it
 	if agentOverride != "" {
 		resolvedEnv["GT_AGENT"] = agentOverride
-	} else if rc.ResolvedAgent != "" {
-		resolvedEnv["GT_AGENT"] = rc.ResolvedAgent
 	}
 	// Merge agent-specific env vars (e.g., OPENCODE_PERMISSION for yolo mode)
 	for k, v := range rc.Env {
