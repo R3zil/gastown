@@ -247,13 +247,27 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		}
 	}
 
-	// Batch mode detection: multiple beads with rig target
-	// Pattern: gt sling gt-abc gt-def gt-ghi gastown
-	// When len(args) > 2 and last arg is a rig, sling each bead to its own polecat
+	// Batch mode detection: multiple beads with optional rig target
+	// Pattern A (explicit rig):  gt sling gt-abc gt-def gt-ghi gastown
+	// Pattern B (auto-resolve):  gt sling gt-abc gt-def gt-ghi
+	// When len(args) > 2 and last arg is a rig, sling each bead to its own polecat.
+	// When all args look like bead IDs, auto-resolve the rig from their prefix.
 	if len(args) > 2 {
 		lastArg := args[len(args)-1]
 		if rigName, isRig := IsRigName(lastArg); isRig {
+			// Explicit rig: print deprecation warning
+			fmt.Printf("  %s gt sling now auto-resolves the rig from bead prefixes. "+
+				"You no longer need to explicitly specify <%s>.\n",
+				style.Warning.Render("Deprecation:"), rigName)
 			return runBatchSling(args[:len(args)-1], rigName, townBeadsDir)
+		}
+		// No explicit rig -- try auto-resolving from bead prefixes
+		if allBeadIDs(args) {
+			rigName, err := resolveRigFromBeadIDs(args, filepath.Dir(townBeadsDir))
+			if err != nil {
+				return err
+			}
+			return runBatchSling(args, rigName, townBeadsDir)
 		}
 	}
 

@@ -623,6 +623,145 @@ exit 0
 	}
 }
 
+func TestFeedFirstReady_IteratesPastDispatchFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	// Convoy has 3 ready issues. First sling fails, second succeeds.
+	// Verifies feedFirstReady iterates past dispatch failure within a single convoy.
+	binDir := t.TempDir()
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	routes := `{"prefix":"gt-","path":"gt/.beads"}` + "\n"
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	slingLogPath := filepath.Join(binDir, "sling.log")
+	slingCountPath := filepath.Join(binDir, "sling_count")
+	// First sling call exits 1 (failure), subsequent succeed
+	gtScript := `#!/bin/sh
+if [ "$1" = "sling" ]; then
+  echo "$@" >> "` + slingLogPath + `"
+  if [ ! -f "` + slingCountPath + `" ]; then
+    echo "1" > "` + slingCountPath + `"
+    echo "dispatch failed" >&2
+    exit 1
+  fi
+  exit 0
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0755); err != nil {
+		t.Fatalf("write mock gt: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	m := NewConvoyManager(townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+
+	c := strandedConvoyInfo{
+		ID:          "hq-cv1",
+		Title:       "Iterate Past Failure",
+		ReadyCount:  3,
+		ReadyIssues: []string{"gt-fail1", "gt-succeed2", "gt-notreached3"},
+	}
+	m.feedFirstReady(c)
+
+	data, err := os.ReadFile(slingLogPath)
+	if err != nil {
+		t.Fatalf("read sling log: %v", err)
+	}
+	logContent := string(data)
+
+	// First issue was attempted (and failed)
+	if !strings.Contains(logContent, "gt-fail1") {
+		t.Errorf("expected sling attempt for gt-fail1, got: %q", logContent)
+	}
+	// Second issue should succeed
+	if !strings.Contains(logContent, "gt-succeed2") {
+		t.Errorf("expected sling for gt-succeed2 (iterate past failure), got: %q", logContent)
+	}
+	// Third issue should NOT be reached (second succeeded)
+	if strings.Contains(logContent, "gt-notreached3") {
+		t.Errorf("unexpected dispatch of gt-notreached3 (should stop after first success): %q", logContent)
+	}
+
+	// Verify failure was logged
+	hasFailure := false
+	for _, l := range logged {
+		if strings.Contains(l, "gt-fail1") && strings.Contains(l, "failed") {
+			hasFailure = true
+			break
+		}
+	}
+	if !hasFailure {
+		t.Errorf("expected sling failure log for gt-fail1, got: %v", logged)
+	}
+}
+
+func TestFeedFirstReady_AllIssuesFail_LogsNoneDispatchable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	// All sling calls fail. Verify the "no dispatchable issues" log message.
+	binDir := t.TempDir()
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	routes := `{"prefix":"gt-","path":"gt/.beads"}` + "\n"
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	gtScript := `#!/bin/sh
+if [ "$1" = "sling" ]; then
+  echo "always fail" >&2
+  exit 1
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0755); err != nil {
+		t.Fatalf("write mock gt: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	m := NewConvoyManager(townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+
+	c := strandedConvoyInfo{
+		ID:          "hq-cv1",
+		Title:       "All Fail",
+		ReadyCount:  2,
+		ReadyIssues: []string{"gt-fail1", "gt-fail2"},
+	}
+	m.feedFirstReady(c)
+
+	found := false
+	for _, l := range logged {
+		if strings.Contains(l, "no dispatchable issues") && strings.Contains(l, "2 skipped") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected 'no dispatchable issues (all 2 skipped)' in logs, got: %v", logged)
+	}
+}
+
 func TestFeedFirstReady_UnknownPrefix_Skips(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on Windows")
