@@ -173,6 +173,28 @@ func TestMergeRuntimeLivenessEnv_RespectsExistingValues(t *testing.T) {
 	}
 }
 
+func TestMergeRuntimeLivenessEnv_UsesEffectiveAgentForProcessNames(t *testing.T) {
+	// When AgentOverride sets GT_AGENT to a different agent than
+	// runtimeConfig.ResolvedAgent, process names must be resolved from
+	// the effective agent (GT_AGENT), not the workspace-default resolved agent.
+	env := map[string]string{
+		"GT_AGENT": "codex", // set by AgentEnv from AgentOverride
+	}
+	rc := &config.RuntimeConfig{
+		Command:       "claude",
+		ResolvedAgent: "claude", // workspace default, NOT the override
+	}
+
+	got := mergeRuntimeLivenessEnv(env, rc)
+
+	if got["GT_AGENT"] != "codex" {
+		t.Fatalf("GT_AGENT = %q, want %q", got["GT_AGENT"], "codex")
+	}
+	if got["GT_PROCESS_NAMES"] != "codex" {
+		t.Fatalf("GT_PROCESS_NAMES = %q, want %q (should resolve from effective agent, not runtimeConfig)", got["GT_PROCESS_NAMES"], "codex")
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
 }
