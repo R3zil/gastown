@@ -1,11 +1,15 @@
 package cmd
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestTryAcquireSlingBeadLock_Contention(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("advisory flock is a no-op on Windows")
+	}
 	t.Parallel()
 
 	townRoot := t.TempDir()

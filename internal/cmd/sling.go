@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -775,9 +775,8 @@ func tryAcquireSlingBeadLock(townRoot, beadID string) (func(), error) {
 	}
 
 	safeBeadID := strings.NewReplacer("/", "_", ":", "_").Replace(beadID)
-	lockPath := filepath.Join(lockDir, safeBeadID+".lock")
-	fl := flock.New(lockPath)
-	locked, err := fl.TryLock()
+	lockPath := filepath.Join(lockDir, safeBeadID+".flock")
+	release, locked, err := lock.FlockTryAcquire(lockPath)
 	if err != nil {
 		return nil, fmt.Errorf("acquiring sling lock for bead %s: %w", beadID, err)
 	}
@@ -785,9 +784,7 @@ func tryAcquireSlingBeadLock(townRoot, beadID string) (func(), error) {
 		return nil, fmt.Errorf("bead %s is already being slung; retry after the current assignment completes", beadID)
 	}
 
-	return func() {
-		_ = fl.Unlock()
-	}, nil
+	return release, nil
 }
 
 // rollbackSlingArtifacts cleans up artifacts left by a partial sling when session start fails.
