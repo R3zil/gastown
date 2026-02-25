@@ -7,10 +7,14 @@ import (
 
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // spawnPolecatForSling is a seam for tests. Production uses SpawnPolecatForSling.
 var spawnPolecatForSling = SpawnPolecatForSling
+
+// resolveTargetAgentFn is a seam for tests. Production uses resolveTargetAgent.
+var resolveTargetAgentFn = resolveTargetAgent
 
 // resolveTargetAgent converts a target spec to agent ID, pane, and hook root.
 func resolveTargetAgent(target string) (agentID string, pane string, hookRoot string, err error) {
@@ -160,6 +164,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			Create:            opts.Create,
 			WorkDesc:          workDesc,
 			DelaySessionStart: true,
+			AgentOverride:     opts.Agent,
 		}
 		dispatchInfo, err := DispatchToDog(dogName, dispatchOpts)
 		if err != nil {
@@ -173,6 +178,15 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 
 	// Rig target (auto-spawn polecat)
 	if rigName, isRig := IsRigName(target); isRig {
+		// Check if rig is parked before dispatching (gt-4owfd.1)
+		townRoot := opts.TownRoot
+		if townRoot == "" {
+			townRoot, _ = workspace.FindFromCwd()
+		}
+		if townRoot != "" && IsRigParked(townRoot, rigName) {
+			return nil, fmt.Errorf("cannot sling to parked rig %q\nUnpark with: gt rig unpark %s", rigName, rigName)
+		}
+
 		if opts.BeadID != "" && !opts.Force {
 			if err := checkCrossRigGuard(opts.BeadID, rigName+"/polecats/_", opts.TownRoot); err != nil {
 				return nil, err
@@ -207,8 +221,10 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 		return result, nil
 	}
 
-	// Existing agent (with dead polecat fallback)
-	agentID, pane, workDir, err := resolveTargetAgent(target)
+	// Existing agent (with dead polecat fallback).
+	// Uses resolveTargetAgentFn seam — crew, mayor, and all existing agents
+	// resolve here, getting their pane for nudge delivery (gt-in7b).
+	agentID, pane, workDir, err := resolveTargetAgentFn(target)
 	if err != nil {
 		if isPolecatTarget(target) {
 			parts := strings.Split(target, "/")

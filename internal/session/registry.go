@@ -3,11 +3,18 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+
+	"regexp"
+
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // PrefixRegistry maps beads prefixes to rig names and vice versa.
@@ -56,6 +63,18 @@ func (r *PrefixRegistry) PrefixForRig(rigName string) string {
 	return DefaultPrefix
 }
 
+// AllRigs returns a copy of the rig-name → prefix mapping for all registered rigs.
+// Callers can iterate it to find known rig names embedded in session strings.
+func (r *PrefixRegistry) AllRigs() map[string]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]string, len(r.rigToPrefix))
+	for rig, prefix := range r.rigToPrefix {
+		out[rig] = prefix
+	}
+	return out
+}
+
 // Prefixes returns all registered prefixes, sorted longest-first for matching.
 func (r *PrefixRegistry) Prefixes() []string {
 	r.mu.RLock()
@@ -83,16 +102,58 @@ func SetDefaultRegistry(r *PrefixRegistry) {
 	defaultRegistry = r
 }
 
-// InitRegistry populates the default registry from the town's rigs.json.
+// InitRegistry populates the default registry from the town's rigs.json and
+// loads the agent registry from settings/agents.json.
+// Both registries are loaded independently — a failure in one does not
+// prevent the other from loading.
 // Should be called early in the process lifecycle.
 // Safe to call multiple times; later calls replace earlier data.
 func InitRegistry(townRoot string) error {
+	var errs []error
+
+	// Set tmux socket for session discovery.
+	// If we're inside tmux, parse the socket from $TMUX (e.g. /tmp/tmux-501/default,pid,idx)
+	// so we query the same server our session lives on. When not inside tmux
+	// (e.g., daemon process), leave the socket unset so tmux uses its default
+	// server — the same one the user's interactive sessions live on.
+	// Session names already include rig prefixes (hq-deacon, gt-witness, etc.)
+	// so there's no collision risk on the default server.
+	if tmuxEnv := os.Getenv("TMUX"); tmuxEnv != "" {
+		// $TMUX format: /path/to/socket,server_pid,session_index
+		if socketPath, _, ok := strings.Cut(tmuxEnv, ","); ok && socketPath != "" {
+			tmux.SetDefaultSocket(filepath.Base(socketPath))
+		}
+	}
+
 	r, err := BuildPrefixRegistryFromTown(townRoot)
 	if err != nil {
-		return err
+		errs = append(errs, fmt.Errorf("prefix registry: %w", err))
+	} else {
+		SetDefaultRegistry(r)
 	}
-	SetDefaultRegistry(r)
-	return nil
+
+	// Load agent registry so all entry points (CLI, daemon, witness) respect
+	// user-configured overrides like custom process_names.
+	if err := config.LoadAgentRegistry(config.DefaultAgentRegistryPath(townRoot)); err != nil {
+		errs = append(errs, fmt.Errorf("agent registry: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
+// sanitizeRe matches non-alphanumeric, non-hyphen characters.
+var sanitizeRe = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// sanitizeTownName cleans a town name to be a valid tmux socket name.
+// Lowercases, replaces non-alphanumeric characters with hyphens, trims hyphens.
+func sanitizeTownName(name string) string {
+	name = strings.ToLower(name)
+	name = sanitizeRe.ReplaceAllString(name, "-")
+	name = strings.Trim(name, "-")
+	if name == "" {
+		return "default"
+	}
+	return name
 }
 
 // PrefixFor returns the beads prefix for a rig, using the default registry.
@@ -145,6 +206,25 @@ func BuildPrefixRegistryFromFile(path string) (*PrefixRegistry, error) {
 	}
 
 	return r, nil
+}
+
+// LegacyPrefixes are prefixes accepted as valid even when the registry is empty.
+// gt = default rig, bd = beads, hq = town-level HQ services, gthq = gastown HQ.
+var LegacyPrefixes = []string{"gt", "bd", "hq", "gthq"}
+
+// HasKnownPrefix returns true if s starts with a registered or legacy prefix
+// followed by "-". Use this instead of hand-rolling prefix checks so that
+// all call-sites agree on what constitutes a valid prefix.
+func HasKnownPrefix(s string) bool {
+	if defaultRegistry.HasPrefix(s) {
+		return true
+	}
+	for _, p := range LegacyPrefixes {
+		if strings.HasPrefix(s, p+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // HasPrefix returns true if the session name starts with a registered prefix followed by a dash.

@@ -31,6 +31,8 @@ type tmuxOps interface {
 	ConfigureGasTownSession(session string, theme tmux.Theme, rig, worker, role string) error
 	WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error
 	SetAutoRespawnHook(session string) error
+	AcceptStartupDialogs(session string) error
+	AcceptWorkspaceTrustDialog(session string) error
 	AcceptBypassPermissionsWarning(session string) error
 	SendKeysRaw(session, keys string) error
 	GetSessionInfo(name string) (*tmux.SessionInfo, error)
@@ -104,7 +106,13 @@ func (m *Manager) Start(agentOverride string) error {
 		Sender:    "daemon",
 		Topic:     "patrol",
 	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, create mol-deacon-patrol wisp and execute it.")
-	startupCmd, err := config.BuildAgentStartupCommandWithAgentOverride("deacon", "", m.townRoot, "", initialPrompt, agentOverride)
+	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
+		Role:        "deacon",
+		TownRoot:    m.townRoot,
+		Prompt:      initialPrompt,
+		Topic:       "patrol",
+		SessionName: sessionID,
+	}, "", initialPrompt, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
 	}
@@ -125,7 +133,9 @@ func (m *Manager) Start(agentOverride string) error {
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:     "deacon",
 		TownRoot: m.townRoot,
+		Agent:    agentOverride,
 	})
+	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
 	}
@@ -156,8 +166,8 @@ func (m *Manager) Start(agentOverride string) error {
 		fmt.Printf("warning: failed to set auto-respawn hook for deacon: %v\n", err)
 	}
 
-	// Accept bypass permissions warning dialog if it appears.
-	_ = t.AcceptBypassPermissionsWarning(sessionID)
+	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
+	_ = t.AcceptStartupDialogs(sessionID)
 
 	time.Sleep(constants.ShutdownNotifyDelay)
 

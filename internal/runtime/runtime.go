@@ -4,14 +4,15 @@ package runtime
 import (
 	"os"
 	"strings"
-	"time"
 
 	"github.com/steveyegge/gastown/internal/claude"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/copilot"
 	"github.com/steveyegge/gastown/internal/gemini"
+	"github.com/steveyegge/gastown/internal/omp"
 	"github.com/steveyegge/gastown/internal/opencode"
+	"github.com/steveyegge/gastown/internal/pi"
 	"github.com/steveyegge/gastown/internal/templates/commands"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -34,6 +35,14 @@ func init() {
 	config.RegisterHookInstaller("copilot", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
 		// Copilot custom instructions stay in workDir — no --settings equivalent.
 		return copilot.EnsureSettingsAt(workDir, hooksDir, hooksFile)
+	})
+	config.RegisterHookInstaller("omp", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
+		// OMP hooks stay in workDir — loaded via --hook flag.
+		return omp.EnsureHookAt(workDir, hooksDir, hooksFile)
+	})
+	config.RegisterHookInstaller("pi", func(settingsDir, workDir, role, hooksDir, hooksFile string) error {
+		// Pi extensions stay in workDir — loaded via -e flag.
+		return pi.EnsureHookAt(workDir, hooksDir, hooksFile)
 	})
 }
 
@@ -95,17 +104,6 @@ func SessionIDFromEnv() string {
 	}
 	// Backwards-compatible fallback for sessions without GT_AGENT
 	return os.Getenv("CLAUDE_SESSION_ID")
-}
-
-// SleepForReadyDelay sleeps for the runtime's configured readiness delay.
-func SleepForReadyDelay(rc *config.RuntimeConfig) {
-	if rc == nil || rc.Tmux == nil {
-		return
-	}
-	if rc.Tmux.ReadyDelayMs <= 0 {
-		return
-	}
-	time.Sleep(time.Duration(rc.Tmux.ReadyDelayMs) * time.Millisecond)
 }
 
 // StartupFallbackCommands returns commands that approximate Claude hooks when hooks are unavailable.
@@ -230,4 +228,31 @@ func StartupNudgeContent() string {
 // BeaconPrimeInstruction returns the instruction to add to beacon for non-hook agents.
 func BeaconPrimeInstruction() string {
 	return "\n\nRun `" + cli.Name() + " prime` to initialize your context."
+}
+
+// RuntimeConfigWithMinDelay returns a shallow copy of rc with ReadyDelayMs set to
+// at least minMs, and ReadyPromptPrefix cleared. This forces WaitForRuntimeReady
+// to use the delay-based fallback path, ensuring the minimum wall-clock wait is
+// always enforced. Used for the gt prime wait where we need a guaranteed delay for
+// the agent to process the beacon and run gt prime — prompt detection would
+// short-circuit immediately (seeing the still-present prompt from the initial
+// readiness check) and bypass the intended delay floor.
+func RuntimeConfigWithMinDelay(rc *config.RuntimeConfig, minMs int) *config.RuntimeConfig {
+	if rc == nil {
+		return &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyDelayMs: minMs}}
+	}
+	cp := *rc
+	if cp.Tmux == nil {
+		cp.Tmux = &config.RuntimeTmuxConfig{ReadyDelayMs: minMs}
+	} else {
+		tmuxCp := *cp.Tmux
+		if tmuxCp.ReadyDelayMs < minMs {
+			tmuxCp.ReadyDelayMs = minMs
+		}
+		// Clear prompt prefix to force the delay-based path in WaitForRuntimeReady.
+		// The prime wait needs a guaranteed wall-clock delay, not prompt detection.
+		tmuxCp.ReadyPromptPrefix = ""
+		cp.Tmux = &tmuxCp
+	}
+	return &cp
 }

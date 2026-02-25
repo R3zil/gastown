@@ -14,6 +14,17 @@ The Deacon is the Mayor's background process that runs continuously, handling ca
 
 This prevents flooding idle agents with health checks every few seconds.
 
+## Mayor Nudge Policy
+
+**NEVER nudge the Mayor for health checks, pings, or routine status.**
+The Mayor should ONLY be nudged for genuine emergencies:
+- Escalations that require Mayor decision-making
+- Sending mail to mayor/ (which is non-interruptive)
+
+Health pings to the Mayor are a ZFC violation — they burn Mayor context
+on ceremony instead of work. The Mayor is your boss, not a subordinate
+to be monitored. Use `gt mail send mayor/` for non-urgent communication.
+
 ## Second-Order Monitoring
 
 Witnesses passively monitor Deacon health by checking the Deacon's agent bead
@@ -24,7 +35,7 @@ No WITNESS_PING mail is sent. Witnesses observe the Deacon's last_activity
 timestamp instead, and only send an alert to the Mayor if the Deacon appears
 unresponsive (>5 minutes stale). This avoids heartbeat mail spam."""
 formula = "mol-deacon-patrol"
-version = 11
+version = 12
 
 [vars]
 [vars.wisp_type]
@@ -35,7 +46,13 @@ default = "patrol"
 id = "inbox-check"
 title = "Handle callbacks from agents"
 description = """
-Handle callbacks from agents.
+First, clean up wisps from previous cycles (closed wisps + abandoned wisps):
+```bash
+bd mol wisp gc --closed --force
+bd mol wisp gc --age 1h --force
+```
+
+Then handle callbacks from agents.
 
 Check the Mayor's inbox for messages from:
 - Witnesses reporting polecat status
@@ -76,6 +93,15 @@ gt mail archive <message-id>
 ```
 Dogs return to idle automatically. The report is informational - no action needed
 unless the dog reports errors that require escalation.
+
+**CONVOY_NEEDS_FEEDING messages** (from Refinery):
+The daemon's ConvoyManager handles convoy feeding (event-driven, 5s poll).
+Simply archive these messages — no deacon action needed.
+```bash
+# For each CONVOY_NEEDS_FEEDING message:
+gt mail read <id>
+gt mail archive <message-id>
+```
 
 **RECOVERED_BEAD messages** (from Witness):
 When a Witness detects a dead polecat with abandoned work, it resets the bead
@@ -140,39 +166,111 @@ Log the error but continue patrol - this is best-effort cleanup.
 **Exit criteria:** Orphan cleanup attempted (success or logged failure)."""
 
 [[steps]]
-id = "trigger-pending-spawns"
-title = "Nudge newly spawned polecats"
-needs = ["orphan-process-cleanup"]
+id = "test-pollution-cleanup"
+title = "Detect and clean runtime test pollution"
+needs = ["inbox-check"]
 description = """
-Nudge newly spawned polecats that are ready for input.
+Detect and clean runtime pollution left by tests and dead processes.
 
-When polecats are spawned, their Claude session takes 10-20 seconds to initialize. The spawn command returns immediately without waiting. This step finds spawned polecats that are now ready and sends them a trigger to start working.
+This step cleans up four categories of pollution. **Only clean items where the
+owning process is confirmed dead** — never kill or remove resources owned by
+live processes.
 
-**ZFC-Compliant Observation** (AI observes AI):
+**1. Rogue dolt servers**
+
+Any `dolt sql-server` process NOT on port 3307 (the shared server) is a leaked
+test server. Kill and log.
 
 ```bash
-# View pending spawns with captured terminal output
-gt deacon pending
+# Find all dolt sql-server processes
+ps aux | grep 'dolt sql-server' | grep -v grep | while read -r line; do
+  PID=$(echo "$line" | awk '{print $2}')
+  # Check if this is the shared server (port 3307)
+  if echo "$line" | grep -q -- '--port 3307'; then
+    continue  # Skip the shared server
+  fi
+  # Kill rogue server
+  kill "$PID" 2>/dev/null && echo "Killed rogue dolt server PID=$PID"
+done
 ```
 
-For each pending session, analyze the captured output:
-- Look for Claude's prompt indicator "> " at the start of a line
-- If prompt is visible, Claude is ready for input
-- Make the judgment call yourself - you're the AI observer
+**2. Stale test temp dirs**
 
-For each ready polecat:
+Glob `beads-test-dolt-*` and `beads-bd-tests-*` in TMPDIR. If the directory
+name contains a PID and that PID is dead, clean up.
+
 ```bash
-# 1. Trigger the polecat
-gt nudge <session> "Begin."
-
-# 2. Clear from pending list
-gt deacon pending <session>
+TMPDIR="${TMPDIR:-/tmp}"
+for dir in "$TMPDIR"/beads-test-dolt-* "$TMPDIR"/beads-bd-tests-*; do
+  [ -d "$dir" ] || continue
+  # Extract PID from dir name if present, or check if any process has it open
+  # Use lsof to check if any process is using files in this dir
+  if ! lsof +D "$dir" >/dev/null 2>&1; then
+    chmod -R u+w "$dir" 2>/dev/null
+    rm -rf "$dir" && echo "Cleaned stale test dir: $(basename "$dir")"
+  fi
+done
 ```
 
-This triggers the UserPromptSubmit hook, which injects mail so the polecat sees its assignment.
+**3. Stale PID/lock files**
 
-**Bootstrap mode** (daemon-only, no AI available):
-The daemon uses `gt deacon trigger-pending` with regex detection. This ZFC violation is acceptable during cold startup when no AI agent is running yet."""
+Scan for dead PID files in /tmp:
+
+```bash
+for pidfile in /tmp/dolt-test-server-*.pid /tmp/beads-test-dolt-*.pid; do
+  [ -f "$pidfile" ] || continue
+  PID=$(cat "$pidfile" 2>/dev/null)
+  if [ -n "$PID" ] && ! kill -0 "$PID" 2>/dev/null; then
+    rm -f "$pidfile" && echo "Removed stale PID file: $(basename "$pidfile") (PID=$PID dead)"
+  fi
+done
+```
+
+**4. Dead dog worktrees**
+
+If a dog's tmux session is dead but worktree dirs remain, prune them.
+
+```bash
+# For each dog directory
+for dogdir in ~/gt/deacon/dogs/*/; do
+  DOG=$(basename "$dogdir")
+  # Check if dog has a live tmux session
+  if ! tmux has-session -t "dog-$DOG" 2>/dev/null; then
+    # Dog session is dead - check for leftover worktree dirs
+    for rigrepo in "$dogdir"*/; do
+      [ -d "$rigrepo/.git" ] || continue
+      # Worktree exists but session is dead - prune it
+      git -C "$rigrepo" worktree list 2>/dev/null
+      echo "Dead dog worktree: $DOG/$(basename "$rigrepo") (session dead)"
+      # Use git worktree remove to clean up properly
+      MAIN_REPO=$(git -C "$rigrepo" rev-parse --git-common-dir 2>/dev/null)
+      if [ -n "$MAIN_REPO" ]; then
+        git worktree remove --force "$rigrepo" 2>/dev/null && \
+          echo "Pruned worktree: $rigrepo"
+      fi
+    done
+  fi
+done
+```
+
+**5. Report**
+
+Log counts of cleaned items. If any items were cleaned, include counts in a
+brief summary for the patrol digest:
+
+```
+Test pollution cleanup: rogue_dolt=N stale_dirs=N stale_pids=N dead_worktrees=N
+```
+
+If all counts are 0, log "Test pollution cleanup: clean" and move on.
+
+**Safety:**
+- NEVER kill the shared dolt server (port 3307)
+- NEVER remove dirs where lsof shows active file handles
+- NEVER remove PID files where the PID is still alive
+- NEVER prune worktrees for dogs with live tmux sessions
+
+**Exit criteria:** All dead-process pollution cleaned and counts logged."""
 
 [[steps]]
 id = "gate-evaluation"
@@ -278,66 +376,13 @@ This command:
 **Note**: Convoys support cross-prefix tracking (e.g., hq-* convoy can track gt-*, bd-* issues).
 The `gt convoy` commands handle cross-rig issue resolution automatically.
 
-Stranded convoy detection (ready work, no workers) is handled by the separate
-`feed-stranded-convoys` step."""
-
-[[steps]]
-id = "feed-stranded-convoys"
-title = "Feed stranded convoys"
-needs = ["check-convoy-completion"]
-description = """
-Detect stranded convoys and dispatch dogs to feed them, or auto-close empty convoys.
-
-A convoy is "stranded" when it is open AND either:
-- Has ready issues (open, unblocked, no assignee) but no workers, OR
-- Has 0 tracked issues (empty — needs auto-close via convoy check)
-
-This step ensures work doesn't stall and empty convoys get cleaned up.
-
-**Step 1: Check for stranded convoys**
-```bash
-gt convoy stranded --json
-```
-
-If no stranded convoys, skip to exit criteria.
-
-**Step 2: Handle each stranded convoy based on ready_count**
-
-For convoys with `ready_count > 0` (has ready work), dispatch a dog to feed:
-```bash
-gt sling mol-convoy-feed deacon/dogs --var convoy=<convoy-id>
-```
-
-For convoys with `ready_count == 0` (empty, needs cleanup), auto-close directly:
-```bash
-gt convoy check <convoy-id>
-```
-
-The feed dog will:
-1. Load the convoy and find ready issues
-2. Check polecat capacity across rigs
-3. Dispatch ready issues using `gt sling`
-4. Return to kennel
-
-**Step 3: Log dispatches**
-Note which convoys were handled for observability:
-```bash
-# Convoy <convoy-id> dispatched to dog for feeding (<N> ready issues)
-# Convoy <convoy-id> auto-closed (empty, 0 tracked issues)
-```
-
-**If no idle dogs available (for feedable convoys only):**
-Pool dispatch auto-creates a dog when the pool is under capacity (max 4).
-If the pool is at capacity, log warning and continue - the convoy will be
-detected again next cycle when a dog becomes idle.
-Note: empty convoy cleanup (`gt convoy check`) does not require a dog — run it directly regardless of pool capacity.
-
-**Exit criteria:** All stranded convoys have been handled — feedable ones dispatched to dogs, empty ones auto-closed directly via `gt convoy check`."""
+Stranded convoy feeding is handled by the daemon's ConvoyManager (event-driven + 30s periodic scan).
+The deacon no longer feeds convoys directly — this avoids double-dispatch races between deacon dogs and daemon."""
 
 [[steps]]
 id = "resolve-external-deps"
 title = "Resolve external dependencies"
-needs = ["feed-stranded-convoys"]
+needs = ["check-convoy-completion"]
 description = """
 Resolve external dependencies across rigs.
 
@@ -410,7 +455,7 @@ Keep notifications brief and actionable. The recipient can run bd show for detai
 [[steps]]
 id = "health-scan"
 title = "Check Witness and Refinery health"
-needs = ["trigger-pending-spawns", "dispatch-gated-molecules", "fire-notifications"]
+needs = ["orphan-process-cleanup", "test-pollution-cleanup", "dispatch-gated-molecules", "fire-notifications"]
 description = """
 Check Witness and Refinery health for each rig.
 
@@ -700,7 +745,7 @@ bd list --status=in_progress --json | head -20
 
 For each in_progress issue, check if assignee session exists:
 ```bash
-tmux has-session -t <session> 2>/dev/null && echo "alive" || echo "orphan"
+gt session status <rig>/<name> --json | jq -r '.running' | grep -q true && echo "alive" || echo "orphan"
 ```
 
 **Step 2: If orphans detected, dispatch to dog**
@@ -791,7 +836,7 @@ needs = ["wisp-compact"]
 description = """
 Generate and send the daily compaction digest.
 
-**Step 1: Send daily digest**
+**Step 1: Send daily digest (idempotent — safe to run every cycle)**
 ```bash
 gt compact report
 ```
@@ -801,8 +846,9 @@ builds a per-category breakdown (Heartbeats, Patrols, Errors, Untyped),
 detects anomalies, and sends the digest to deacon/ (cc mayor/).
 
 A permanent event bead (wisp.compaction) is created for audit trail.
+Skips automatically if today's digest was already sent.
 
-**Step 2: Weekly rollup (Mondays only)**
+**Step 2: Weekly rollup (Mondays only, idempotent)**
 If today is Monday, also send the weekly rollup:
 ```bash
 gt compact report --weekly
@@ -810,6 +856,7 @@ gt compact report --weekly
 
 This aggregates the past 7 days of compaction event beads and sends
 trend data (totals, promotion rate, avg deleted/day) to mayor/.
+Skips automatically if this week's rollup was already sent.
 
 **Exit criteria:** Compaction digest sent (or nothing to report)."""
 
@@ -1011,7 +1058,7 @@ After await-signal returns (either by signal or timeout):
 1. Generate a brief summary of this patrol cycle
 2. Squash the current wisp:
 ```bash
-bd mol squash <mol-id> --summary "<patrol-summary>"
+gt mol squash --jitter 10s --summary "<patrol-summary>"
 ```
 3. Create and hook a new patrol wisp:
 ```bash

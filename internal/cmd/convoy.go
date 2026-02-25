@@ -6,6 +6,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,10 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/tui/convoy"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -33,29 +37,23 @@ func generateShortID() string {
 // looksLikeIssueID checks if a string looks like a beads issue ID.
 // Issue IDs have the format: prefix-id (e.g., gt-abc, bd-xyz, hq-123).
 func looksLikeIssueID(s string) bool {
-	// Common beads prefixes
-	prefixes := []string{"gt-", "bd-", "hq-"}
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(s, prefix) {
-			return true
-		}
+	// Check registry prefixes and legacy fallbacks via centralized helper
+	if session.HasKnownPrefix(s) {
+		return true
 	}
-	// Also check for pattern: 2-3 lowercase letters followed by hyphen
-	// This catches custom prefixes defined in routes.jsonl
-	if len(s) >= 4 && s[2] == '-' || (len(s) >= 5 && s[3] == '-') {
-		hyphenIdx := strings.Index(s, "-")
-		if hyphenIdx >= 2 && hyphenIdx <= 3 {
-			prefix := s[:hyphenIdx]
-			// Check if prefix is all lowercase letters
-			allLower := true
-			for _, c := range prefix {
-				if c < 'a' || c > 'z' {
-					allLower = false
-					break
-				}
+	// Pattern check: 2-3 lowercase letters followed by hyphen.
+	// Covers unregistered short rig prefixes (e.g., nx, rpk).
+	// Longer prefixes (4+ chars like nrpk) are caught by HasKnownPrefix
+	// via the registry — no need to heuristic-match them here.
+	hyphenIdx := strings.Index(s, "-")
+	if hyphenIdx >= 2 && hyphenIdx <= 3 && len(s) > hyphenIdx+1 {
+		prefix := s[:hyphenIdx]
+		for _, c := range prefix {
+			if c < 'a' || c > 'z' {
+				return false
 			}
-			return allLower
 		}
+		return true
 	}
 	return false
 }
@@ -84,8 +82,10 @@ var (
 )
 
 const (
-	convoyStatusOpen   = "open"
-	convoyStatusClosed = "closed"
+	convoyStatusOpen           = "open"
+	convoyStatusClosed         = "closed"
+	convoyStatusStagedReady    = "staged_ready"
+	convoyStatusStagedWarnings = "staged_warnings"
 )
 
 func normalizeConvoyStatus(status string) string {
@@ -94,16 +94,23 @@ func normalizeConvoyStatus(status string) string {
 
 func ensureKnownConvoyStatus(status string) error {
 	switch normalizeConvoyStatus(status) {
-	case convoyStatusOpen, convoyStatusClosed:
+	case convoyStatusOpen, convoyStatusClosed, convoyStatusStagedReady, convoyStatusStagedWarnings:
 		return nil
 	default:
 		return fmt.Errorf(
-			"unsupported convoy status %q (expected %q or %q)",
+			"unsupported convoy status %q (expected %q, %q, %q, or %q)",
 			status,
 			convoyStatusOpen,
 			convoyStatusClosed,
+			convoyStatusStagedReady,
+			convoyStatusStagedWarnings,
 		)
 	}
+}
+
+// isStagedStatus reports whether the given normalized status is a staged status.
+func isStagedStatus(status string) bool {
+	return strings.HasPrefix(status, "staged_")
 }
 
 func validateConvoyStatusTransition(currentStatus, targetStatus string) error {
@@ -119,13 +126,26 @@ func validateConvoyStatusTransition(currentStatus, targetStatus string) error {
 	if current == target {
 		return nil
 	}
+
+	// Original open ↔ closed transitions.
 	if (current == convoyStatusOpen && target == convoyStatusClosed) ||
 		(current == convoyStatusClosed && target == convoyStatusOpen) {
 		return nil
 	}
-	// With only two valid statuses, identity and both cross-transitions are
-	// covered above. This is unreachable unless new statuses are added to
-	// ensureKnownConvoyStatus without updating this function.
+
+	// Staged → open (launch) and staged → closed (cancel) are allowed.
+	if isStagedStatus(current) && (target == convoyStatusOpen || target == convoyStatusClosed) {
+		return nil
+	}
+
+	// Staged ↔ staged transitions (re-stage with different result).
+	if isStagedStatus(current) && isStagedStatus(target) {
+		return nil
+	}
+
+	// REJECT: open → staged_* and closed → staged_* are not allowed.
+	// (Falls through to the error below.)
+
 	return fmt.Errorf("illegal convoy status transition %q -> %q", currentStatus, targetStatus)
 }
 
@@ -332,7 +352,6 @@ func init() {
 	convoyCreateCmd.Flags().BoolVar(&convoyOwned, "owned", false, "Mark convoy as caller-managed lifecycle (no automatic witness/refinery registration)")
 	convoyCreateCmd.Flags().StringVar(&convoyMerge, "merge", "", "Merge strategy: direct (push to main), mr (merge queue, default), local (keep on branch)")
 
-
 	// Status flags
 	convoyStatusCmd.Flags().BoolVar(&convoyStatusJSON, "json", false, "Output as JSON")
 
@@ -370,6 +389,8 @@ func init() {
 	convoyCmd.AddCommand(convoyStrandedCmd)
 	convoyCmd.AddCommand(convoyCloseCmd)
 	convoyCmd.AddCommand(convoyLandCmd)
+	convoyCmd.AddCommand(convoyStageCmd)
+	convoyCmd.AddCommand(convoyLaunchCmd)
 
 	rootCmd.AddCommand(convoyCmd)
 }
@@ -446,6 +467,11 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 		description += fmt.Sprintf("\nMolecule: %s", convoyMolecule)
 	}
 
+	// Guard against flag-like convoy names (gt-e0kx5)
+	if beads.IsFlagLikeTitle(name) {
+		return fmt.Errorf("refusing to create convoy: name %q looks like a CLI flag", name)
+	}
+
 	// Generate convoy ID with cv- prefix
 	convoyID := fmt.Sprintf("hq-cv-%s", generateShortID())
 
@@ -464,14 +490,12 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 		createArgs = append(createArgs, "--force")
 	}
 
-	createCmd := exec.Command("bd", createArgs...)
-	createCmd.Dir = townBeads
-	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	createCmd.Stdout = &stdout
-	createCmd.Stderr = &stderr
-
-	if err := createCmd.Run(); err != nil {
+	if err := BdCmd(createArgs...).
+		WithAutoCommit().
+		Dir(townBeads).
+		Stderr(&stderr).
+		Run(); err != nil {
 		return fmt.Errorf("creating convoy: %w (%s)", err, strings.TrimSpace(stderr.String()))
 	}
 
@@ -481,13 +505,12 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 	trackedCount := 0
 	for _, issueID := range trackedIssues {
 		// Use --type=tracks for non-blocking tracking relation
-		depArgs := []string{"dep", "add", convoyID, issueID, "--type=tracks"}
-		depCmd := exec.Command("bd", depArgs...)
-		depCmd.Dir = townBeads
 		var depStderr bytes.Buffer
-		depCmd.Stderr = &depStderr
-
-		if err := depCmd.Run(); err != nil {
+		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
+			WithAutoCommit().
+			Dir(townBeads).
+			Stderr(&depStderr).
+			Run(); err != nil {
 			errMsg := strings.TrimSpace(depStderr.String())
 			if errMsg == "" {
 				errMsg = err.Error()
@@ -540,13 +563,11 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Validate convoy exists and get its status
-	showArgs := []string{"show", convoyID, "--json"}
-	showCmd := exec.Command("bd", showArgs...)
-	showCmd.Dir = townBeads
-	var stdout bytes.Buffer
-	showCmd.Stdout = &stdout
-
-	if err := showCmd.Run(); err != nil {
+	showOut, err := BdCmd("show", convoyID, "--json").
+		Dir(townBeads).
+		Stderr(io.Discard).
+		Output()
+	if err != nil {
 		return fmt.Errorf("convoy '%s' not found", convoyID)
 	}
 
@@ -556,7 +577,7 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
 		Status string `json:"status"`
 		Type   string `json:"issue_type"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
+	if err := json.Unmarshal(showOut, &convoys); err != nil {
 		return fmt.Errorf("parsing convoy data: %w", err)
 	}
 
@@ -579,10 +600,10 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
 	if normalizeConvoyStatus(convoy.Status) == convoyStatusClosed {
 		// closed→open is always valid; ensureKnownConvoyStatus above guarantees
 		// the current status is known, so no additional transition check needed.
-		reopenArgs := []string{"update", convoyID, "--status=open"}
-		reopenCmd := exec.Command("bd", reopenArgs...)
-		reopenCmd.Dir = townBeads
-		if err := reopenCmd.Run(); err != nil {
+		if err := BdCmd("update", convoyID, "--status=open").
+			Dir(townBeads).
+			WithAutoCommit().
+			Run(); err != nil {
 			return fmt.Errorf("couldn't reopen convoy: %w", err)
 		}
 		reopened = true
@@ -592,13 +613,12 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
 	// Add 'tracks' relations for each issue
 	addedCount := 0
 	for _, issueID := range issuesToAdd {
-		depArgs := []string{"dep", "add", convoyID, issueID, "--type=tracks"}
-		depCmd := exec.Command("bd", depArgs...)
-		depCmd.Dir = townBeads
 		var depStderr bytes.Buffer
-		depCmd.Stderr = &depStderr
-
-		if err := depCmd.Run(); err != nil {
+		if err := BdCmd("dep", "add", convoyID, issueID, "--type=tracks").
+			Dir(townBeads).
+			WithAutoCommit().
+			Stderr(&depStderr).
+			Run(); err != nil {
 			errMsg := strings.TrimSpace(depStderr.String())
 			if errMsg == "" {
 				errMsg = err.Error()
@@ -1260,10 +1280,28 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			continue
 		}
 
-		// Find ready issues (open, not blocked, no live assignee)
+		// Find ready issues (open, not blocked, no live assignee, slingable).
+		// Town-level beads (hq- prefix with path=".") are excluded because
+		// they can't be dispatched via gt sling -- they're handled by the deacon.
+		// Non-slingable types (epics, convoys, etc.) are also excluded.
+		townRoot := filepath.Dir(townBeads)
+
+		// Batch-check scheduling status for all tracked issues (single DB query).
+		var trackedIDs []string
+		for _, t := range tracked {
+			trackedIDs = append(trackedIDs, t.ID)
+		}
+		scheduledSet := areScheduled(trackedIDs)
+
 		var readyIssues []string
 		for _, t := range tracked {
-			if isReadyIssue(t) {
+			if isReadyIssue(t, scheduledSet) {
+				if !isSlingableBead(townRoot, t.ID) {
+					continue
+				}
+				if !convoyops.IsSlingableType(t.IssueType) {
+					continue
+				}
 				readyIssues = append(readyIssues, t.ID)
 			}
 		}
@@ -1286,7 +1324,8 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 // - status = "open" AND (no assignee OR assignee session is dead)
 // - OR status = "in_progress"/"hooked" AND assignee session is dead (orphaned molecule)
 // - AND not blocked (cross-rig-aware from issue details)
-func isReadyIssue(t trackedIssueInfo) bool {
+// scheduledSet is a pre-computed set of bead IDs with open sling contexts (from areScheduled).
+func isReadyIssue(t trackedIssueInfo, scheduledSet map[string]bool) bool {
 	// Closed issues are never ready
 	if t.Status == "closed" || t.Status == "tombstone" {
 		return false
@@ -1294,6 +1333,11 @@ func isReadyIssue(t trackedIssueInfo) bool {
 
 	// Must not be blocked
 	if t.Blocked {
+		return false
+	}
+
+	// Scheduled beads are not stranded — they're waiting for dispatch capacity.
+	if scheduledSet[t.ID] {
 		return false
 	}
 
@@ -1318,7 +1362,7 @@ func isReadyIssue(t trackedIssueInfo) bool {
 	}
 
 	// Check if tmux session exists
-	checkCmd := exec.Command("tmux", "has-session", "-t", sessionName)
+	checkCmd := tmux.BuildCommand("has-session", "-t", sessionName)
 	if err := checkCmd.Run(); err != nil {
 		// Session doesn't exist = orphaned molecule or dead worker
 		// This is the key fix: issues with in_progress/hooked status but
@@ -1327,6 +1371,17 @@ func isReadyIssue(t trackedIssueInfo) bool {
 	}
 
 	return false // Session exists = worker is active
+}
+
+// isSlingableBead reports whether a bead can be dispatched via gt sling.
+// Town-level beads (hq- prefix with path=".") and beads with unknown
+// prefixes are not slingable — they're handled by the deacon/mayor.
+func isSlingableBead(townRoot, beadID string) bool {
+	prefix := beads.ExtractPrefix(beadID)
+	if prefix == "" {
+		return true // No prefix info, assume slingable
+	}
+	return beads.GetRigNameForPrefix(townRoot, prefix) != ""
 }
 
 // checkAndCloseCompletedConvoys finds open convoys where all tracked issues are closed
@@ -1901,10 +1956,11 @@ type trackedIssueInfo struct {
 	Status    string `json:"status"`
 	Type      string `json:"dependency_type"`
 	IssueType string `json:"issue_type"`
-	Blocked   bool   `json:"blocked,omitempty"`    // True if issue currently has blockers
-	Assignee  string `json:"assignee,omitempty"`   // Assigned agent (e.g., gastown/polecats/goose)
-	Worker    string `json:"worker,omitempty"`     // Worker currently assigned (e.g., gastown/nux)
-	WorkerAge string `json:"worker_age,omitempty"` // How long worker has been on this issue
+	Blocked   bool     `json:"blocked,omitempty"`    // True if issue currently has blockers
+	Assignee  string   `json:"assignee,omitempty"`   // Assigned agent (e.g., gastown/polecats/goose)
+	Labels    []string `json:"labels,omitempty"`     // Bead labels (propagated from trackedDependency)
+	Worker    string   `json:"worker,omitempty"`     // Worker currently assigned (e.g., gastown/nux)
+	WorkerAge string   `json:"worker_age,omitempty"` // How long worker has been on this issue
 }
 
 // trackedDependency is dep-list data enriched with fresh issue details.
@@ -1919,19 +1975,6 @@ type trackedDependency struct {
 	Blocked        bool     `json:"-"`
 }
 
-// extractIssueID strips the external:prefix:id wrapper from bead IDs.
-// bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
-// but consumers need the raw bead ID for bd show lookups.
-func extractIssueID(id string) string {
-	if strings.HasPrefix(id, "external:") {
-		parts := strings.SplitN(id, ":", 3)
-		if len(parts) == 3 {
-			return parts[2]
-		}
-	}
-	return id
-}
-
 func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 	dep.Status = details.Status
 	dep.Blocked = details.IsBlocked()
@@ -1944,6 +1987,13 @@ func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 	if dep.IssueType == "" {
 		dep.IssueType = details.IssueType
 	}
+	// Always refresh labels unconditionally — bd dep list may return stale
+	// labels from dependency records, but bd show returns current bead labels.
+	// This ensures isReadyIssue sees accurate queue labels (gt:queued,
+	// gt:queue-dispatched) for cross-rig beads. Assigning even when fresh
+	// labels are empty clears stale queue labels that would otherwise
+	// suppress stranded issue detection.
+	dep.Labels = details.Labels
 }
 
 // getTrackedIssues uses bd dep list to get issues tracked by a convoy.
@@ -1969,7 +2019,7 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 
 	// Unwrap external:prefix:id format from dep IDs before use
 	for i := range deps {
-		deps[i].ID = extractIssueID(deps[i].ID)
+		deps[i].ID = beads.ExtractIssueID(deps[i].ID)
 	}
 
 	// Refresh status via cross-rig lookup. bd dep list returns status from
@@ -2006,6 +2056,7 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 			IssueType: dep.IssueType,
 			Blocked:   dep.Blocked,
 			Assignee:  dep.Assignee,
+			Labels:    dep.Labels,
 		}
 
 		// Add worker info if available
@@ -2031,6 +2082,7 @@ type issueDetailsJSON struct {
 	Status         string            `json:"status"`
 	IssueType      string            `json:"issue_type"`
 	Assignee       string            `json:"assignee"`
+	Labels         []string          `json:"labels"`
 	BlockedBy      []string          `json:"blocked_by"`
 	BlockedByCount int               `json:"blocked_by_count"`
 	Dependencies   []issueDependency `json:"dependencies"`
@@ -2043,6 +2095,7 @@ func (issue issueDetailsJSON) toIssueDetails() *issueDetails {
 		Status:         issue.Status,
 		IssueType:      issue.IssueType,
 		Assignee:       issue.Assignee,
+		Labels:         issue.Labels,
 		BlockedBy:      issue.BlockedBy,
 		BlockedByCount: issue.BlockedByCount,
 		Dependencies:   issue.Dependencies,
@@ -2064,7 +2117,7 @@ func getExternalIssueDetails(townBeads, rigName, issueID string) *issueDetails {
 	}
 
 	// Query the rig database by running bd show from the rig directory
-	// Use --allow-stale to handle cases where JSONL and DB are out of sync
+	// Use --allow-stale to handle cases where the database may be temporarily stale
 	showCmd := exec.Command("bd", "show", issueID, "--json", "--allow-stale")
 	showCmd.Dir = rigDir // Set working directory to rig directory
 	var stdout bytes.Buffer
@@ -2095,6 +2148,7 @@ type issueDetails struct {
 	Status         string
 	IssueType      string
 	Assignee       string
+	Labels         []string
 	BlockedBy      []string
 	BlockedByCount int
 	Dependencies   []issueDependency

@@ -3,7 +3,6 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -239,6 +239,10 @@ func runSwarmCreate(cmd *cobra.Command, args []string) error {
 	checkCmd := exec.Command("bd", "show", swarmEpic, "--json")
 	checkCmd.Dir = beadsPath
 	if err := checkCmd.Run(); err != nil {
+		// Guard against flag-like epic names (gt-e0kx5)
+		if beads.IsFlagLikeTitle(swarmEpic) {
+			return fmt.Errorf("refusing to create swarm: epic name %q looks like a CLI flag", swarmEpic)
+		}
 		// Epic doesn't exist, create it as a swarm molecule
 		createArgs := []string{
 			"create",
@@ -526,7 +530,7 @@ func spawnSwarmWorkersFromBeads(r *rig.Rig, townRoot string, swarmID string, wor
 			fmt.Printf("  %s already running, injecting task...\n", worker)
 		} else {
 			fmt.Printf("  Starting %s...\n", worker)
-			if err := polecatSessMgr.Start(worker, polecat.SessionStartOptions{}); err != nil && !errors.Is(err, polecat.ErrSessionReused) {
+			if err := polecatSessMgr.Start(worker, polecat.SessionStartOptions{}); err != nil {
 				style.PrintWarning("  couldn't start %s: %v", worker, err)
 				continue
 			}

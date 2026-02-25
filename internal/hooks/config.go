@@ -20,7 +20,7 @@ type HookEntry struct {
 
 // Hook represents an individual hook command.
 type Hook struct {
-	Type    string `json:"type"`    // "command"
+	Type    string `json:"type"` // "command"
 	Command string `json:"command"`
 }
 
@@ -32,6 +32,8 @@ type HooksConfig struct {
 	Stop             []HookEntry `json:"Stop,omitempty"`
 	PreCompact       []HookEntry `json:"PreCompact,omitempty"`
 	UserPromptSubmit []HookEntry `json:"UserPromptSubmit,omitempty"`
+	WorktreeCreate   []HookEntry `json:"WorktreeCreate,omitempty"`
+	WorktreeRemove   []HookEntry `json:"WorktreeRemove,omitempty"`
 }
 
 // SettingsJSON represents the full Claude Code settings.json structure.
@@ -165,17 +167,149 @@ func Merge(base, override *HooksConfig) *HooksConfig {
 }
 
 // DefaultOverrides returns built-in role-specific hook overrides.
-// Currently empty — the merge mechanism is retained for future use.
-// On-disk overrides (in ~/.gt/hooks-overrides/) layer on top of DefaultBase().
+// On-disk overrides (in ~/.gt/hooks-overrides/) layer on top of these.
+//
+// Crew workers get auto-session-cycling on PreCompact: instead of compacting
+// context (which degrades quality), the session is replaced with a fresh one.
+// The successor picks up hooked work via SessionStart hook (gt prime --hook).
 func DefaultOverrides() map[string]*HooksConfig {
-	return map[string]*HooksConfig{}
+	pathSetup := `export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"`
+
+	return map[string]*HooksConfig{
+		// Crew workers: auto-cycle session on context compaction (gt-op78).
+		// Instead of compacting (lossy), replace with fresh session that
+		// inherits hooked work. The --cycle flag does: collect state →
+		// send handoff mail → respawn pane with fresh Claude instance.
+		"crew": {
+			PreCompact: []HookEntry{
+				{
+					Matcher: "",
+					Hooks: []Hook{
+						{
+							Type:    "command",
+							Command: fmt.Sprintf("%s && gt handoff --cycle --reason compaction", pathSetup),
+						},
+					},
+				},
+			},
+		},
+		// Witness roles: patrol-formula-guard (gt-e47hxn).
+		// Blocks patrol formulas from using persistent molecules — must use wisps.
+		// Without this, witnesses could accidentally create permanent patrol molecules
+		// that survive session restarts and accumulate unbounded.
+		"witness": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*bd mol pour*patrol*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-witness*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-deacon*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-refinery*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+			},
+		},
+		// Deacon roles: patrol-formula-guard (same as witness).
+		// Deacons also run patrols and must use wisps, not persistent molecules.
+		"deacon": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*bd mol pour*patrol*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-witness*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-deacon*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-refinery*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+			},
+		},
+		// Refinery roles: patrol-formula-guard (same as witness).
+		// Refineries also run patrols and must use wisps, not persistent molecules.
+		"refinery": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*bd mol pour*patrol*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-witness*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-deacon*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*bd mol pour *mol-refinery*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Patrol formulas must use wisps, not persistent molecules.' && echo 'Use: bd mol wisp mol-*-patrol' && echo 'Not:  bd mol pour mol-*-patrol' && exit 2",
+					}},
+				},
+			},
+		},
+	}
 }
 
 // ComputeExpected computes the expected HooksConfig for a target by loading
 // the base config and applying all applicable overrides in order of specificity.
 // If no base config exists, uses DefaultBase().
 //
-// For each override key, built-in defaults (from DefaultOverrides, currently empty)
+// When an on-disk base exists, DefaultBase() is merged underneath it so that
+// new hook types (e.g., SessionStart added after the base was created) are
+// automatically backfilled. User customizations in the on-disk base take
+// precedence. Hook types absent from the on-disk base inherit from DefaultBase.
+//
+// For each override key, built-in defaults (from DefaultOverrides)
 // are merged first, then on-disk overrides layer on top. On-disk overrides can
 // replace or extend base hooks by providing matching PreToolUse entries.
 func ComputeExpected(target string) (*HooksConfig, error) {
@@ -186,6 +320,11 @@ func ComputeExpected(target string) (*HooksConfig, error) {
 		} else {
 			return nil, fmt.Errorf("loading base config: %w", err)
 		}
+	} else {
+		// Backfill: merge DefaultBase as floor, then on-disk base on top.
+		// This ensures new hook types added to DefaultBase are always present,
+		// while preserving user customizations from the on-disk base.
+		base = Merge(DefaultBase(), base)
 	}
 
 	defaults := DefaultOverrides()
@@ -284,11 +423,11 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 			})
 		}
 
-		// Refinery — settings in the refinery parent directory
-		refineryDir := filepath.Join(rigPath, "refinery")
-		if info, err := os.Stat(refineryDir); err == nil && info.IsDir() {
+		// Refinery — settings in the refinery working directory (refinery/rig/)
+		refineryRigDir := filepath.Join(rigPath, "refinery", "rig")
+		if info, err := os.Stat(refineryRigDir); err == nil && info.IsDir() {
 			targets = append(targets, Target{
-				Path: filepath.Join(refineryDir, ".claude", "settings.json"),
+				Path: filepath.Join(refineryRigDir, ".claude", "settings.json"),
 				Key:  rigName + "/refinery",
 				Rig:  rigName,
 				Role: "refinery",
@@ -311,7 +450,7 @@ func isRig(path string) bool {
 }
 
 // EventTypes returns the known hook event type names in display order.
-var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit"}
+var EventTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop", "PreCompact", "UserPromptSubmit", "WorktreeCreate", "WorktreeRemove"}
 
 // GetEntries returns the hook entries for a given event type.
 func (c *HooksConfig) GetEntries(eventType string) []HookEntry {
@@ -328,6 +467,10 @@ func (c *HooksConfig) GetEntries(eventType string) []HookEntry {
 		return c.PreCompact
 	case "UserPromptSubmit":
 		return c.UserPromptSubmit
+	case "WorktreeCreate":
+		return c.WorktreeCreate
+	case "WorktreeRemove":
+		return c.WorktreeRemove
 	default:
 		return nil
 	}
@@ -348,6 +491,10 @@ func (c *HooksConfig) SetEntries(eventType string, entries []HookEntry) {
 		c.PreCompact = entries
 	case "UserPromptSubmit":
 		c.UserPromptSubmit = entries
+	case "WorktreeCreate":
+		c.WorktreeCreate = entries
+	case "WorktreeRemove":
+		c.WorktreeRemove = entries
 	}
 }
 
@@ -579,8 +726,24 @@ func loadConfig(path string) (*HooksConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
+	if err := validateUniqueMatchers(&cfg); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
 
 	return &cfg, nil
+}
+
+func validateUniqueMatchers(cfg *HooksConfig) error {
+	for _, eventType := range EventTypes {
+		seen := make(map[string]struct{})
+		for _, entry := range cfg.GetEntries(eventType) {
+			if _, exists := seen[entry.Matcher]; exists {
+				return fmt.Errorf("duplicate matcher %q in %s", entry.Matcher, eventType)
+			}
+			seen[entry.Matcher] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // saveConfig writes a HooksConfig to a JSON file, creating directories as needed.

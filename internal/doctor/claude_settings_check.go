@@ -139,20 +139,20 @@ func (c *ClaudeSettingsCheck) Run(ctx *CheckContext) *CheckResult {
 
 	if hasMissingFiles && !hasStaleFiles {
 		message = fmt.Sprintf("Found %d agent(s) missing settings.json", len(c.staleSettings))
-		fixHint = "Run 'gt up --restart' to restart agents and create settings"
+		fixHint = "Run 'gt up --restore' to restart agents and create settings"
 	} else if hasStaleFiles && !hasMissingFiles {
 		message = fmt.Sprintf("Found %d stale Claude config file(s)", len(c.staleSettings))
 		if hasModifiedFiles {
 			fixHint = "Run 'gt doctor --fix' to fix safe issues. Files with local modifications require manual review."
 		} else {
-			fixHint = "Run 'gt doctor --fix' to delete stale files, then 'gt up --restart' to create new settings"
+			fixHint = "Run 'gt doctor --fix' to delete stale files, then 'gt up --restore' to create new settings"
 		}
 	} else {
 		message = fmt.Sprintf("Found %d Claude settings issue(s)", len(c.staleSettings))
 		if hasModifiedFiles {
-			fixHint = "Run 'gt doctor --fix' to fix safe issues, then 'gt up --restart'. Files with local modifications require manual review."
+			fixHint = "Run 'gt doctor --fix' to fix safe issues, then 'gt up --restore'. Files with local modifications require manual review."
 		} else {
-			fixHint = "Run 'gt doctor --fix' to delete stale files, then 'gt up --restart' to create new settings"
+			fixHint = "Run 'gt doctor --fix' to delete stale files, then 'gt up --restore' to create new settings"
 		}
 	}
 
@@ -347,8 +347,8 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 		// Check for refinery settings
 		refineryDir := filepath.Join(rigPath, "refinery")
 		if dirExists(refineryDir) {
-			// CORRECT: refinery/.claude/settings.json (parent directory)
-			refineryCorrectSettings := filepath.Join(refineryDir, ".claude", "settings.json")
+			// CORRECT: refinery/rig/.claude/settings.json (working directory)
+			refineryCorrectSettings := filepath.Join(refineryDir, "rig", ".claude", "settings.json")
 			if fileExists(refineryCorrectSettings) {
 				files = append(files, staleSettingsInfo{
 					path:        refineryCorrectSettings,
@@ -365,33 +365,18 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 					missingFile: true,
 				})
 			}
-			// STALE: old settings.local.json in parent directory (not a customer repo)
-			refineryParentStaleLocal := filepath.Join(refineryDir, ".claude", "settings.local.json")
-			if fileExists(refineryParentStaleLocal) {
-				files = append(files, staleSettingsInfo{
-					path:          refineryParentStaleLocal,
-					agentType:     "refinery",
-					rigName:       rigName,
-					sessionName:   session.RefinerySessionName(session.PrefixFor(rigName)),
-					wrongLocation: true,
-					missing:       []string{"stale settings.local.json (settings now in refinery/.claude/settings.json)"},
-				})
-			}
-			// STALE: old settings in workdir (rig/) — skip if tracked in customer repo
+			// STALE: old settings in parent directory (refinery/.claude/)
 			for _, staleFile := range []string{"settings.json", "settings.local.json"} {
-				stalePath := filepath.Join(refineryDir, "rig", ".claude", staleFile)
+				stalePath := filepath.Join(refineryDir, ".claude", staleFile)
 				if fileExists(stalePath) {
-					gs := c.getGitFileStatus(stalePath)
-					if gs != gitStatusTrackedClean && gs != gitStatusTrackedModified {
-						files = append(files, staleSettingsInfo{
-							path:          stalePath,
-							agentType:     "refinery",
-							rigName:       rigName,
-							sessionName:   session.RefinerySessionName(session.PrefixFor(rigName)),
-							wrongLocation: true,
-							missing:       []string{"stale settings in workdir (settings now in refinery/.claude/settings.json)"},
-						})
-					}
+					files = append(files, staleSettingsInfo{
+						path:          stalePath,
+						agentType:     "refinery",
+						rigName:       rigName,
+						sessionName:   session.RefinerySessionName(session.PrefixFor(rigName)),
+						wrongLocation: true,
+						missing:       []string{fmt.Sprintf("stale %s in parent dir (settings now in refinery/rig/.claude/)", staleFile)},
+					})
 				}
 			}
 		}
@@ -686,9 +671,15 @@ func (c *ClaudeSettingsCheck) Fix(ctx *CheckContext) error {
 		fmt.Printf("  Deleted stale: %s\n", sf.path)
 		needsRestart = true
 
-		// Also delete parent .claude directory if empty
 		claudeDir := filepath.Dir(sf.path)
-		_ = os.Remove(claudeDir) // Best-effort, will fail if not empty
+
+		// Only remove the parent .claude directory for wrong-location files.
+		// For correct-location stale files, the directory is the RIGHT place —
+		// removing it creates a race window where the daemon could recreate
+		// settings before the fix does (gt-99u).
+		if sf.wrongLocation {
+			_ = os.Remove(claudeDir) // Best-effort, will fail if not empty
+		}
 
 		// Handle town-root files: redirect to mayor/ instead of recreating at root.
 		// Town-root settings pollute ALL agents via directory traversal.
@@ -708,7 +699,7 @@ func (c *ClaudeSettingsCheck) Fix(ctx *CheckContext) error {
 			// Warn user to restart agents - don't auto-kill sessions as that's too disruptive,
 			// especially since deacon runs gt doctor automatically which would create a loop.
 			fmt.Printf("\n  %s Town-root settings were moved. Restart agents to pick up new config:\n", style.Warning.Render("⚠"))
-			fmt.Printf("      gt up --restart\n\n")
+			fmt.Printf("      gt up --restore\n\n")
 			continue
 		}
 
@@ -761,7 +752,7 @@ func (c *ClaudeSettingsCheck) Fix(ctx *CheckContext) error {
 	// Tell user to restart agents so they create correct settings
 	if needsRestart && !ctx.RestartSessions {
 		fmt.Printf("\n  %s Restart agents to create new settings:\n", style.Warning.Render("⚠"))
-		fmt.Printf("      gt up --restart\n")
+		fmt.Printf("      gt up --restore\n")
 		fmt.Printf("\n  If you had custom Claude settings edits, re-apply them via 'gt hooks override <role>'.\n\n")
 	}
 

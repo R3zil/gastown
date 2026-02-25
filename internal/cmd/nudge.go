@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -190,7 +192,14 @@ var validNudgePriorities = map[string]bool{
 	nudge.PriorityUrgent: true,
 }
 
-func runNudge(cmd *cobra.Command, args []string) error {
+func runNudge(cmd *cobra.Command, args []string) (retErr error) {
+	defer func() {
+		target := ""
+		if len(args) > 0 {
+			target = args[0]
+		}
+		telemetry.RecordNudge(context.Background(), target, retErr)
+	}()
 	// Validate --mode and --priority before doing anything else.
 	if !validNudgeModes[nudgeModeFlag] {
 		return fmt.Errorf("invalid --mode %q: must be one of immediate, queue, wait-idle", nudgeModeFlag)
@@ -345,6 +354,15 @@ func runNudge(cmd *cobra.Command, args []string) error {
 			// Extract crew name and use crew session naming
 			crewName := strings.TrimPrefix(polecatName, "crew/")
 			sessionName = crewSessionName(rigName, crewName)
+		} else if strings.HasPrefix(polecatName, "polecats/") {
+			// Explicit polecat address (e.g., "vastal/polecats/furiosa").
+			// Bypasses crew-first resolution for short addresses.
+			pcName := strings.TrimPrefix(polecatName, "polecats/")
+			mgr, _, err := getSessionManager(rigName)
+			if err != nil {
+				return err
+			}
+			sessionName = mgr.SessionName(pcName)
 		} else {
 			// Short address (e.g., "gastown/holden") - could be crew or polecat.
 			// Try crew first (matches mail system's addressToSessionIDs pattern),
@@ -696,6 +714,10 @@ func addressToAgentBeadID(address string) string {
 		if strings.HasPrefix(role, "crew/") {
 			crewName := strings.TrimPrefix(role, "crew/")
 			return session.CrewSessionName(session.PrefixFor(rig), crewName)
+		}
+		if strings.HasPrefix(role, "polecats/") {
+			pcName := strings.TrimPrefix(role, "polecats/")
+			return session.PolecatSessionName(session.PrefixFor(rig), pcName)
 		}
 		return session.PolecatSessionName(session.PrefixFor(rig), role)
 	}

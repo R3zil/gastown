@@ -97,8 +97,8 @@ This command is intended to be run by Deacon patrol (daily) or manually.
 It reads entries from ~/.gt/costs.jsonl for a target date, creates a single
 aggregate "Cost Report YYYY-MM-DD" bead, then removes the source entries.
 
-The resulting digest bead is permanent (exported to JSONL, synced via git)
-and provides an audit trail without log-in-database pollution.
+The resulting digest bead is permanent (synced via git) and provides
+an audit trail without log-in-database pollution.
 
 Examples:
   gt costs digest --yesterday   # Digest yesterday's costs (default for patrol)
@@ -841,7 +841,7 @@ func extractCostFromWorkDir(workDir string) (float64, error) {
 
 // getTmuxSessionWorkDir gets the current working directory of a tmux session.
 func getTmuxSessionWorkDir(session string) (string, error) {
-	cmd := exec.Command("tmux", "display-message", "-t", session, "-p", "#{pane_current_path}")
+	cmd := tmux.BuildCommand("display-message", "-t", session, "-p", "#{pane_current_path}")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -971,7 +971,12 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 		session = detectCurrentTmuxSession()
 	}
 	if session == "" {
-		return fmt.Errorf("--session flag required (or set GT_SESSION env var, or GT_RIG/GT_ROLE)")
+		// Not a Gas Town session (e.g., Claude Code launched outside gt agent system).
+		// Exit silently — no costs to record.
+		if costsVerbose {
+			fmt.Fprintf(os.Stderr, "[costs] no session context found, skipping costs record\n")
+		}
+		return nil
 	}
 
 	// Get working directory from environment or tmux session
@@ -1056,41 +1061,49 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 }
 
 // deriveSessionName derives the tmux session name from GT_* environment variables.
-// Uses session.* helpers for canonical naming.
+// Uses session.* helpers for canonical naming. Parses GT_ROLE via parseRoleString
+// so compound forms (e.g. "gastown/witness") resolve to their canonical session names.
 func deriveSessionName() string {
 	role := os.Getenv("GT_ROLE")
 	rig := os.Getenv("GT_RIG")
 	polecat := os.Getenv("GT_POLECAT")
 	crew := os.Getenv("GT_CREW")
 
+	// Parse GT_ROLE once to handle both bare and compound forms.
+	parsedRole, _, parsedName := parseRoleString(role)
+
 	// Polecat: {prefix}-{polecat}
+	// Gate on GT_ROLE: coordinators may have stale GT_POLECAT from spawning polecats.
 	if polecat != "" && rig != "" {
-		return session.PolecatSessionName(session.PrefixFor(rig), polecat)
+		if role == "" || parsedRole == RolePolecat {
+			return session.PolecatSessionName(session.PrefixFor(rig), polecat)
+		}
 	}
 
-	// Crew: {prefix}-crew-{crew}
+	// Crew: {prefix}-crew-{crew} (from GT_CREW or parsed compound role)
+	if parsedRole == RoleCrew && parsedName != "" && rig != "" {
+		return session.CrewSessionName(session.PrefixFor(rig), parsedName)
+	}
 	if crew != "" && rig != "" {
 		return session.CrewSessionName(session.PrefixFor(rig), crew)
 	}
 
 	// Town-level roles (mayor, deacon)
-	if role == "mayor" || role == "deacon" {
-		if role == "mayor" {
-			return session.MayorSessionName()
-		}
+	if parsedRole == RoleMayor {
+		return session.MayorSessionName()
+	}
+	if parsedRole == RoleDeacon {
 		return session.DeaconSessionName()
 	}
 
 	// Rig-based roles (witness, refinery): {prefix}-{role}
-	if role != "" && rig != "" {
+	if rig != "" {
 		prefix := session.PrefixFor(rig)
-		switch role {
-		case "witness":
+		switch parsedRole {
+		case RoleWitness:
 			return session.WitnessSessionName(prefix)
-		case "refinery":
+		case RoleRefinery:
 			return session.RefinerySessionName(prefix)
-		default:
-			return session.PolecatSessionName(prefix, role)
 		}
 	}
 
@@ -1102,7 +1115,7 @@ func deriveSessionName() string {
 // Note: We don't check TMUX env var because it may not be inherited when Claude Code
 // runs bash commands, even though we are inside a tmux session.
 func detectCurrentTmuxSession() string {
-	cmd := exec.Command("tmux", "display-message", "-p", "#S")
+	cmd := tmux.BuildCommand("display-message", "-p", "#S")
 	output, err := cmd.Output()
 	if err != nil {
 		return ""

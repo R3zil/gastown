@@ -17,7 +17,7 @@ import (
 // 2. If a rig has its own routes.jsonl, bd uses it and never finds town routes, breaking cross-rig routing
 // 3. These files often exist due to a bug where bd's auto-export wrote issue data to routes.jsonl
 //
-// Fix: Delete routes.jsonl unconditionally. The SQLite database (beads.db) is the source
+// Fix: Delete routes.jsonl unconditionally. The Dolt database is the source
 // of truth, and bd will auto-export to issues.jsonl on next run.
 type RigRoutesJSONLCheck struct {
 	FixableCheck
@@ -100,7 +100,7 @@ func (c *RigRoutesJSONLCheck) Run(ctx *CheckContext) *CheckResult {
 }
 
 // Fix deletes routes.jsonl files in rig .beads directories.
-// The SQLite database (beads.db) is the source of truth - bd will auto-export
+// The Dolt database is the source of truth - bd will auto-export
 // to issues.jsonl on next run.
 func (c *RigRoutesJSONLCheck) Fix(ctx *CheckContext) error {
 	// Re-run check to populate affectedRigs if needed
@@ -139,6 +139,7 @@ func (c *RigRoutesJSONLCheck) findRigDirectories(townRoot string) []string {
 
 	// Source 2: routes.jsonl (for rigs that may not be in registry)
 	townBeadsDir := filepath.Join(townRoot, ".beads")
+	townBeadsInfo, townBeadsErr := os.Stat(townBeadsDir)
 	if routes, err := beads.LoadRoutes(townBeadsDir); err == nil {
 		for _, route := range routes {
 			if route.Path == "." || route.Path == "" {
@@ -169,7 +170,16 @@ func (c *RigRoutesJSONLCheck) findRigDirectories(townRoot string) []string {
 			}
 			rigPath := filepath.Join(townRoot, entry.Name())
 			beadsDir := filepath.Join(rigPath, ".beads")
-			if _, err := os.Stat(beadsDir); err == nil && !seen[rigPath] {
+			beadsDirInfo, err := os.Stat(beadsDir)
+			if err != nil {
+				continue // .beads doesn't exist
+			}
+			// Skip if this dir's .beads resolves to the town root .beads
+			// (e.g. deacon uses a symlinked .beads dir pointing to town beads)
+			if townBeadsErr == nil && os.SameFile(townBeadsInfo, beadsDirInfo) {
+				continue
+			}
+			if !seen[rigPath] {
 				rigDirs = append(rigDirs, rigPath)
 				seen[rigPath] = true
 			}

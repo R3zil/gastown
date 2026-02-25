@@ -192,14 +192,11 @@ func detectTownRoot(startDir string) string {
 	return townRoot
 }
 
-// resolveBeadsDir returns the correct .beads directory for the given address.
+// resolveBeadsDir returns the correct .beads directory for mail delivery.
 //
-// Two-level beads architecture:
-// - ALL mail uses town beads ({townRoot}/.beads) regardless of address
-// - Rig-level beads ({rig}/.beads) are for project issues only, not mail
-//
-// This ensures messages are visible to all agents in the town.
-func (r *Router) resolveBeadsDir(_ string) string { // address unused: all mail uses town-level beads
+// All mail uses town beads ({townRoot}/.beads). Rig-level beads ({rig}/.beads)
+// are for project issues only, not mail.
+func (r *Router) resolveBeadsDir() string {
 	// If no town root, fall back to workDir's .beads
 	if r.townRoot == "" {
 		return filepath.Join(r.workDir, ".beads")
@@ -304,11 +301,13 @@ func parseGroupAddress(address string) *ParsedGroup {
 
 // agentBead represents an agent bead as returned by bd list --label=gt:agent.
 type agentBead struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
-	CreatedBy   string `json:"created_by"`
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Status      string   `json:"status"`
+	CreatedBy   string   `json:"created_by"`
+	Type        string   `json:"issue_type"`
+	Labels      []string `json:"labels"`
 }
 
 // agentBeadToAddress converts an agent bead to a mail address.
@@ -660,7 +659,7 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 	var allAgents []*agentBead
 
 	// Query town-level beads
-	townBeadsDir := r.resolveBeadsDir("")
+	townBeadsDir := r.resolveBeadsDir()
 	townAgents, err := r.queryAgentsInDir(townBeadsDir, descContains)
 	if err != nil {
 		// Don't fail yet - rig beads might still have results
@@ -702,6 +701,7 @@ func (r *Router) queryAgents(descContains string) []*agentBead {
 }
 
 // queryAgentsInDir queries agent beads in a specific beads directory with optional description filtering.
+// Queries both the issues and wisps tables, merging results.
 func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, error) {
 	args := []string{"list", "--label=gt:agent", "--json", "--limit=0"}
 
@@ -711,25 +711,68 @@ func (r *Router) queryAgentsInDir(beadsDir, descContains string) ([]*agentBead, 
 
 	ctx, cancel := bdReadCtx()
 	defer cancel()
-	stdout, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
-	if err != nil {
-		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, err)
-	}
 
+	// Query issues table (backward compat during migration)
+	stdout, issuesErr := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+
+	// Also query wisps table for migrated agent beads (best-effort)
+	wispCtx, wispCancel := bdReadCtx()
+	defer wispCancel()
+	wispOut, _ := runBdCommand(wispCtx, []string{"mol", "wisp", "list", "--json"}, filepath.Dir(beadsDir), beadsDir)
+
+	// Merge results: collect agent beads from both sources
+	seenIDs := make(map[string]bool)
 	var agents []*agentBead
-	if err := json.Unmarshal(stdout, &agents); err != nil {
-		return nil, fmt.Errorf("parsing agent query result: %w", err)
+
+	// Parse wisps first (primary source after migration)
+	if len(wispOut) > 0 {
+		var wispAgents []*agentBead
+		if json.Unmarshal(wispOut, &wispAgents) == nil {
+			for _, agent := range wispAgents {
+				if isAgentBeadEntry(agent) {
+					seenIDs[agent.ID] = true
+					agents = append(agents, agent)
+				}
+			}
+		}
 	}
 
-	// Filter for open agents only (closed agents are inactive)
+	// Then issues (backward compat, skip duplicates)
+	if len(stdout) > 0 {
+		var issueAgents []*agentBead
+		if json.Unmarshal(stdout, &issueAgents) == nil {
+			for _, agent := range issueAgents {
+				if !seenIDs[agent.ID] {
+					agents = append(agents, agent)
+				}
+			}
+		}
+	} else if issuesErr != nil && len(agents) == 0 {
+		return nil, fmt.Errorf("querying agents in %s: %w", beadsDir, issuesErr)
+	}
+
+	// Filter for active agents (closed/deleted agents are inactive)
 	var active []*agentBead
 	for _, agent := range agents {
-		if agent.Status == "open" || agent.Status == "in_progress" {
+		if agent.Status == "open" || agent.Status == "in_progress" || agent.Status == "hooked" || agent.Status == "pinned" {
 			active = append(active, agent)
 		}
 	}
 
 	return active, nil
+}
+
+// isAgentBeadEntry checks if an agentBead entry is an actual agent bead.
+func isAgentBeadEntry(a *agentBead) bool {
+	if a.Type == "agent" {
+		return true
+	}
+	for _, l := range a.Labels {
+		if l == "gt:agent" {
+			return true
+		}
+	}
+	return false
 }
 
 // queryAgentsFromDir queries agent beads from a specific beads directory.
@@ -858,6 +901,7 @@ func (r *Router) validateRecipient(identity string) error {
 		townBeadsDir := filepath.Join(r.townRoot, ".beads")
 		routes, err := beads.LoadRoutes(townBeadsDir)
 		if err == nil {
+			var queryErrors []string
 			for _, route := range routes {
 				// Skip hq- routes (town-level, already queried)
 				if strings.HasPrefix(route.Prefix, "hq-") {
@@ -866,13 +910,17 @@ func (r *Router) validateRecipient(identity string) error {
 				rigBeadsDir := filepath.Join(r.townRoot, route.Path, ".beads")
 				rigAgents, err := r.queryAgentsFromDir(rigBeadsDir)
 				if err != nil {
-					continue // Skip rigs with errors
+					queryErrors = append(queryErrors, fmt.Sprintf("%s: %v", route.Path, err))
+					continue
 				}
 				for _, agent := range rigAgents {
 					if agentBeadToAddress(agent) == identity {
 						return nil // Found matching agent
 					}
 				}
+			}
+			if len(queryErrors) > 0 {
+				return fmt.Errorf("no agent found (query errors: %s)", strings.Join(queryErrors, "; "))
 			}
 		}
 	}
@@ -937,7 +985,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Add actor for attribution (sender identity)
 	args = append(args, "--actor", msg.From)
 
-	// Add --ephemeral flag for ephemeral messages (stored in single DB, filtered from JSONL export)
+	// Add --ephemeral flag for ephemeral messages (wisps, not synced to git)
 	if r.shouldBeWisp(msg) {
 		args = append(args, "--ephemeral")
 	}
@@ -946,7 +994,7 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// This prevents subjects like "--help" or "--json" from being parsed as flags.
 	args = append(args, "--", msg.Subject)
 
-	beadsDir := r.resolveBeadsDir(msg.To)
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1073,7 +1121,7 @@ func (r *Router) sendToQueue(msg *Message) error {
 	args = append(args, "--", msg.Subject)
 
 	// Queue messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1157,7 +1205,7 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 	args = append(args, "--", msg.Subject)
 
 	// Announce messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1243,7 +1291,7 @@ func (r *Router) sendToChannel(msg *Message) error {
 	args = append(args, "--", msg.Subject)
 
 	// Channel messages go to town-level beads (shared location)
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1291,7 +1339,7 @@ func (r *Router) pruneAnnounce(announceName string, retainCount int) error {
 		return nil // No retention limit
 	}
 
-	beadsDir := r.resolveBeadsDir("")
+	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
 		return err
 	}
@@ -1350,7 +1398,7 @@ func isSelfMail(from, to string) bool {
 // GetMailbox returns a Mailbox for the given address.
 // Routes to the correct beads database based on the address.
 func (r *Router) GetMailbox(address string) (*Mailbox, error) {
-	beadsDir := r.resolveBeadsDir(address)
+	beadsDir := r.resolveBeadsDir()
 	workDir := filepath.Dir(beadsDir) // Parent of .beads
 	return NewMailboxFromAddress(address, workDir), nil
 }
@@ -1494,6 +1542,9 @@ func addressToAgentBeadID(address string) string {
 	case strings.HasPrefix(target, "crew/"):
 		crewName := strings.TrimPrefix(target, "crew/")
 		return session.CrewSessionName(rigPrefix, crewName)
+	case strings.HasPrefix(target, "polecats/"):
+		pcName := strings.TrimPrefix(target, "polecats/")
+		return session.PolecatSessionName(rigPrefix, pcName)
 	default:
 		return session.PolecatSessionName(rigPrefix, target)
 	}
@@ -1561,13 +1612,3 @@ func AddressToSessionIDs(address string) []string {
 	}
 }
 
-// addressToSessionID converts a mail address to a tmux session ID.
-// Returns empty string if address format is not recognized.
-// Deprecated: Use AddressToSessionIDs for proper crew/polecat handling.
-func addressToSessionID(address string) string {
-	ids := AddressToSessionIDs(address)
-	if len(ids) == 0 {
-		return ""
-	}
-	return ids[0]
-}

@@ -106,7 +106,7 @@ func TestConvoyHandler_RendersTemplate(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -156,7 +156,7 @@ func TestConvoyHandler_LastActivityColors(t *testing.T) {
 				},
 			}
 
-			handler, err := NewConvoyHandler(mock, 8*time.Second)
+			handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 			if err != nil {
 				t.Fatalf("NewConvoyHandler() error = %v", err)
 			}
@@ -179,7 +179,7 @@ func TestConvoyHandler_EmptyConvoys(t *testing.T) {
 		Convoys: []ConvoyRow{},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -204,7 +204,7 @@ func TestConvoyHandler_ContentType(t *testing.T) {
 		Convoys: []ConvoyRow{},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -229,7 +229,7 @@ func TestConvoyHandler_MultipleConvoys(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -258,7 +258,7 @@ func TestConvoyHandler_FetchConvoysError(t *testing.T) {
 		Error: errFetchFailed,
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -307,7 +307,7 @@ func TestConvoyHandler_MergeQueueRendering(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -356,7 +356,7 @@ func TestConvoyHandler_EmptyMergeQueue(t *testing.T) {
 		MergeQueue: []MergeQueueRow{},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -397,7 +397,7 @@ func TestConvoyHandler_PolecatWorkersRendering(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -414,8 +414,8 @@ func TestConvoyHandler_PolecatWorkersRendering(t *testing.T) {
 	body := w.Body.String()
 
 	// Check polecat section header
-	if !strings.Contains(body, "Workers") {
-		t.Error("Response should contain workers section header")
+	if !strings.Contains(body, "Polecats") {
+		t.Error("Response should contain polecats section header")
 	}
 
 	// Check polecat names
@@ -472,7 +472,7 @@ func TestConvoyHandler_WorkStatusRendering(t *testing.T) {
 				},
 			}
 
-			handler, err := NewConvoyHandler(mock, 8*time.Second)
+			handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 			if err != nil {
 				t.Fatalf("NewConvoyHandler() error = %v", err)
 			}
@@ -515,7 +515,7 @@ func TestConvoyHandler_ProgressBarRendering(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -553,7 +553,7 @@ func TestConvoyHandler_HTMXAutoRefresh(t *testing.T) {
 		Convoys: []ConvoyRow{},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -617,7 +617,7 @@ func TestConvoyHandler_FullDashboard(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -646,8 +646,8 @@ func TestConvoyHandler_FullDashboard(t *testing.T) {
 	if !strings.Contains(body, "#789") {
 		t.Error("Response should contain PR data")
 	}
-	if !strings.Contains(body, "Workers") {
-		t.Error("Response should contain workers section")
+	if !strings.Contains(body, "Polecats") {
+		t.Error("Response should contain polecats section")
 	}
 	if !strings.Contains(body, "worker1") {
 		t.Error("Response should contain polecat data")
@@ -695,7 +695,7 @@ func TestE2E_Server_FullDashboard(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -740,7 +740,7 @@ func TestE2E_Server_FullDashboard(t *testing.T) {
 		{"Merge queue section", "Merge Queue"},
 		{"PR number", "#101"},
 		{"PR repo", "roxas"},
-		{"Workers section", "Workers"},
+		{"Polecats section", "Polecats"},
 		{"Polecat name", "furiosa"},
 		{"HTMX SSE trigger", `hx-trigger="sse:dashboard-update`},
 	}
@@ -778,7 +778,7 @@ func TestE2E_Server_ActivityColors(t *testing.T) {
 				},
 			}
 
-			handler, err := NewConvoyHandler(mock, 8*time.Second)
+			handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 			if err != nil {
 				t.Fatalf("NewConvoyHandler() error = %v", err)
 			}
@@ -810,7 +810,7 @@ func TestE2E_Server_MergeQueueEmpty(t *testing.T) {
 		Workers:   []WorkerRow{},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -870,7 +870,7 @@ func TestE2E_Server_MergeQueueStatuses(t *testing.T) {
 				},
 			}
 
-			handler, err := NewConvoyHandler(mock, 8*time.Second)
+			handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 			if err != nil {
 				t.Fatalf("NewConvoyHandler() error = %v", err)
 			}
@@ -904,7 +904,7 @@ func TestE2E_Server_MergeQueueStatuses(t *testing.T) {
 func TestE2E_Server_HTMLStructure(t *testing.T) {
 	mock := &MockConvoyFetcher{Convoys: []ConvoyRow{}}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -966,7 +966,7 @@ func TestE2E_Server_RefineryInPolecats(t *testing.T) {
 		},
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}
@@ -1114,7 +1114,7 @@ func TestConvoyHandler_NonFatalErrors(t *testing.T) {
 		WorkersError:    errFetchFailed,
 	}
 
-	handler, err := NewConvoyHandler(mock, 8*time.Second)
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler() error = %v", err)
 	}

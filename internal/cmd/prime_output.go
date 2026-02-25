@@ -19,12 +19,14 @@ import (
 )
 
 // outputPrimeContext outputs the role-specific context using templates or fallback.
-func outputPrimeContext(ctx RoleContext) error {
+// Returns the rendered template content (empty string when using fallback path).
+func outputPrimeContext(ctx RoleContext) (string, error) {
 	// Try to use templates first
 	tmpl, err := templates.New()
 	if err != nil {
 		// Fall back to hardcoded output if templates fail
-		return outputPrimeContextFallback(ctx)
+		outputPrimeContextFallback(ctx)
+		return "", nil
 	}
 
 	// Map role to template name
@@ -46,7 +48,8 @@ func outputPrimeContext(ctx RoleContext) error {
 		roleName = "boot"
 	default:
 		// Unknown role - use fallback
-		return outputPrimeContextFallback(ctx)
+		outputPrimeContextFallback(ctx)
+		return "", nil
 	}
 
 	// Build template data
@@ -77,14 +80,14 @@ func outputPrimeContext(ctx RoleContext) error {
 	// Render and output
 	output, err := tmpl.RenderRole(roleName, data)
 	if err != nil {
-		return fmt.Errorf("rendering template: %w", err)
+		return "", fmt.Errorf("rendering template: %w", err)
 	}
 
 	fmt.Print(output)
-	return nil
+	return output, nil
 }
 
-func outputPrimeContextFallback(ctx RoleContext) error {
+func outputPrimeContextFallback(ctx RoleContext) {
 	switch ctx.Role {
 	case RoleMayor:
 		outputMayorContext(ctx)
@@ -101,7 +104,6 @@ func outputPrimeContextFallback(ctx RoleContext) error {
 	default:
 		outputUnknownContext(ctx)
 	}
-	return nil
 }
 
 func outputMayorContext(ctx RoleContext) {
@@ -521,6 +523,23 @@ func outputAttachmentStatus(ctx RoleContext) {
 
 	// Show current step from molecule
 	showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
+}
+
+// outputContinuationDirective displays a brief continuation prompt for post-compact/resume.
+// Unlike outputAutonomousDirective, this does NOT ask the agent to re-announce or
+// re-run startup protocol — it just reminds the agent what's on the hook. (GH#1965)
+func outputContinuationDirective(hookedBead *beads.Issue, hasMolecule bool) {
+	fmt.Println()
+	fmt.Printf("%s\n\n", style.Bold.Render("## ▶ CONTINUE HOOKED WORK"))
+	fmt.Println("Your context was compacted/resumed. **Continue working on your hooked bead.**")
+	fmt.Println("Do NOT re-announce, re-initialize, or re-read the bead from scratch.")
+	fmt.Println("Pick up where you left off.")
+	fmt.Println()
+	fmt.Printf("  Hooked: %s — %s\n", style.Bold.Render(hookedBead.ID), hookedBead.Title)
+	if hasMolecule {
+		fmt.Println("  (Has attached molecule — check `bd mol current` for next step)")
+	}
+	fmt.Println()
 }
 
 // outputHandoffWarning outputs the post-handoff warning message.

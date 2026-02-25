@@ -19,6 +19,35 @@ import (
 // WLCommonsDB is the database name for the wl-commons shared wanted board.
 const WLCommonsDB = "wl_commons"
 
+// WLCommonsStore abstracts wl-commons database operations.
+type WLCommonsStore interface {
+	EnsureDB() error
+	DatabaseExists(dbName string) bool
+	InsertWanted(item *WantedItem) error
+	ClaimWanted(wantedID, rigHandle string) error
+	SubmitCompletion(completionID, wantedID, rigHandle, evidence string) error
+	QueryWanted(wantedID string) (*WantedItem, error)
+}
+
+// WLCommons implements WLCommonsStore using the real Dolt server.
+type WLCommons struct{ townRoot string }
+
+// NewWLCommons creates a WLCommonsStore backed by the real Dolt server.
+func NewWLCommons(townRoot string) *WLCommons { return &WLCommons{townRoot: townRoot} }
+
+func (w *WLCommons) EnsureDB() error           { return EnsureWLCommons(w.townRoot) }
+func (w *WLCommons) DatabaseExists(db string) bool { return DatabaseExists(w.townRoot, db) }
+func (w *WLCommons) InsertWanted(item *WantedItem) error { return InsertWanted(w.townRoot, item) }
+func (w *WLCommons) ClaimWanted(wantedID, rigHandle string) error {
+	return ClaimWanted(w.townRoot, wantedID, rigHandle)
+}
+func (w *WLCommons) SubmitCompletion(completionID, wantedID, rigHandle, evidence string) error {
+	return SubmitCompletion(w.townRoot, completionID, wantedID, rigHandle, evidence)
+}
+func (w *WLCommons) QueryWanted(wantedID string) (*WantedItem, error) {
+	return QueryWanted(w.townRoot, wantedID)
+}
+
 // WantedItem represents a row in the wanted table.
 type WantedItem struct {
 	ID              string
@@ -33,6 +62,21 @@ type WantedItem struct {
 	Status          string
 	EffortLevel     string
 	SandboxRequired bool
+}
+
+// isNothingToCommit returns true if the error indicates DOLT_COMMIT found no
+// changes to commit. This happens when a conditional UPDATE matched 0 rows,
+// leaving the working set unchanged.
+func isNothingToCommit(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "nothing to commit")
+}
+
+// EscapeSQL escapes backslashes and single quotes for SQL string literals.
+// Dolt (MySQL-compatible) treats \ as an escape character, so a trailing
+// backslash in user input would escape the closing quote and break the query.
+func EscapeSQL(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, "'", "''")
 }
 
 // GenerateWantedID generates a unique wanted item ID in the format w-<10-char-hash>.
@@ -83,15 +127,18 @@ CREATE TABLE IF NOT EXISTS _meta (
 INSERT IGNORE INTO _meta (%s, value) VALUES ('schema_version', '1.0');
 INSERT IGNORE INTO _meta (%s, value) VALUES ('wasteland_name', 'Gas Town Wasteland');
 
-CREATE TABLE IF NOT EXISTS towns (
+CREATE TABLE IF NOT EXISTS rigs (
     handle VARCHAR(255) PRIMARY KEY,
     display_name VARCHAR(255),
     dolthub_org VARCHAR(255),
+    hop_uri VARCHAR(512),
     owner_email VARCHAR(255),
     gt_version VARCHAR(32),
-    trust_level INT DEFAULT 1,
+    trust_level INT DEFAULT 0,
     registered_at TIMESTAMP,
-    last_seen TIMESTAMP
+    last_seen TIMESTAMP,
+    rig_type VARCHAR(16) DEFAULT 'human',
+    parent_rig VARCHAR(255)
 );
 
 CREATE TABLE IF NOT EXISTS wanted (
@@ -107,7 +154,7 @@ CREATE TABLE IF NOT EXISTS wanted (
     status VARCHAR(32) DEFAULT 'open',
     effort_level VARCHAR(16) DEFAULT 'medium',
     evidence_url TEXT,
-    sandbox_required BOOLEAN DEFAULT FALSE,
+    sandbox_required TINYINT(1) DEFAULT 0,
     sandbox_scope JSON,
     sandbox_min_tier VARCHAR(32),
     created_at TIMESTAMP,
@@ -119,23 +166,48 @@ CREATE TABLE IF NOT EXISTS completions (
     wanted_id VARCHAR(64),
     completed_by VARCHAR(255),
     evidence TEXT,
-    completed_at TIMESTAMP
+    validated_by VARCHAR(255),
+    stamp_id VARCHAR(64),
+    parent_completion_id VARCHAR(64),
+    block_hash VARCHAR(64),
+    hop_uri VARCHAR(512),
+    completed_at TIMESTAMP,
+    validated_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS stamps (
     id VARCHAR(64) PRIMARY KEY,
-    completion_id VARCHAR(64),
-    stamper VARCHAR(255),
-    value_dimension VARCHAR(32),
-    confidence DECIMAL(3,2),
-    stamped_at TIMESTAMP
+    author VARCHAR(255) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    valence JSON NOT NULL,
+    confidence FLOAT DEFAULT 1,
+    severity VARCHAR(16) DEFAULT 'leaf',
+    context_id VARCHAR(64),
+    context_type VARCHAR(32),
+    skill_tags JSON,
+    message TEXT,
+    prev_stamp_hash VARCHAR(64),
+    block_hash VARCHAR(64),
+    hop_uri VARCHAR(512),
+    created_at TIMESTAMP,
+    CHECK (NOT(author = subject))
 );
 
 CREATE TABLE IF NOT EXISTS badges (
     id VARCHAR(64) PRIMARY KEY,
-    holder VARCHAR(255),
+    rig_handle VARCHAR(255),
     badge_type VARCHAR(64),
-    awarded_at TIMESTAMP
+    awarded_at TIMESTAMP,
+    evidence TEXT
+);
+
+CREATE TABLE IF NOT EXISTS chain_meta (
+    chain_id VARCHAR(64) PRIMARY KEY,
+    chain_type VARCHAR(32),
+    parent_chain_id VARCHAR(64),
+    hop_uri VARCHAR(512),
+    dolt_database VARCHAR(255),
+    created_at TIMESTAMP
 );
 
 CALL DOLT_ADD('-A');
@@ -173,33 +245,29 @@ func InsertWanted(townRoot string, item *WantedItem) error {
 		tagsJSON = fmt.Sprintf("'[\"%s\"]'", strings.Join(escaped, `","`))
 	}
 
-	esc := func(s string) string {
-		return strings.ReplaceAll(s, "'", "''")
-	}
-
 	descField := "NULL"
 	if item.Description != "" {
-		descField = fmt.Sprintf("'%s'", esc(item.Description))
+		descField = fmt.Sprintf("'%s'", EscapeSQL(item.Description))
 	}
 	projectField := "NULL"
 	if item.Project != "" {
-		projectField = fmt.Sprintf("'%s'", esc(item.Project))
+		projectField = fmt.Sprintf("'%s'", EscapeSQL(item.Project))
 	}
 	typeField := "NULL"
 	if item.Type != "" {
-		typeField = fmt.Sprintf("'%s'", esc(item.Type))
+		typeField = fmt.Sprintf("'%s'", EscapeSQL(item.Type))
 	}
 	postedByField := "NULL"
 	if item.PostedBy != "" {
-		postedByField = fmt.Sprintf("'%s'", esc(item.PostedBy))
+		postedByField = fmt.Sprintf("'%s'", EscapeSQL(item.PostedBy))
 	}
 	effortField := "'medium'"
 	if item.EffortLevel != "" {
-		effortField = fmt.Sprintf("'%s'", esc(item.EffortLevel))
+		effortField = fmt.Sprintf("'%s'", EscapeSQL(item.EffortLevel))
 	}
 	status := "'open'"
 	if item.Status != "" {
-		status = fmt.Sprintf("'%s'", esc(item.Status))
+		status = fmt.Sprintf("'%s'", EscapeSQL(item.Status))
 	}
 
 	script := fmt.Sprintf(`USE %s;
@@ -211,81 +279,80 @@ CALL DOLT_ADD('-A');
 CALL DOLT_COMMIT('-m', 'wl post: %s');
 `,
 		WLCommonsDB,
-		esc(item.ID), esc(item.Title), descField, projectField, typeField,
+		EscapeSQL(item.ID), EscapeSQL(item.Title), descField, projectField, typeField,
 		item.Priority, tagsJSON, postedByField, status, effortField,
 		now, now,
-		esc(item.Title))
+		EscapeSQL(item.Title))
 
 	return doltSQLScriptWithRetry(townRoot, script)
-}
-
-// GetTownHandle returns the town's handle for the posted_by field.
-func GetTownHandle(townRoot string) string {
-	if org := DoltHubOrg(); org != "" {
-		return org
-	}
-	return filepath.Base(townRoot)
 }
 
 // ClaimWanted updates a wanted item's status to claimed.
-func ClaimWanted(townRoot, wantedID, townHandle string) error {
-	esc := func(s string) string {
-		return strings.ReplaceAll(s, "'", "''")
-	}
-
+// Returns an error if the item does not exist or is not open.
+//
+// Uses a single-script approach: UPDATE + DOLT_ADD + DOLT_COMMIT in one
+// invocation. If the UPDATE matches 0 rows (item not open), the working set
+// is unchanged and DOLT_COMMIT fails with "nothing to commit" — which we
+// map to a precondition error. This avoids splitting into separate sessions
+// and eliminates the need for DOLT_RESET on failure.
+func ClaimWanted(townRoot, wantedID, rigHandle string) error {
 	script := fmt.Sprintf(`USE %s;
-
 UPDATE wanted SET claimed_by='%s', status='claimed', updated_at=NOW()
-WHERE id='%s' AND status='open';
-
+  WHERE id='%s' AND status='open';
 CALL DOLT_ADD('-A');
 CALL DOLT_COMMIT('-m', 'wl claim: %s');
-`,
-		WLCommonsDB,
-		esc(townHandle),
-		esc(wantedID),
-		esc(wantedID))
+`, WLCommonsDB, EscapeSQL(rigHandle), EscapeSQL(wantedID), EscapeSQL(wantedID))
 
-	return doltSQLScriptWithRetry(townRoot, script)
+	err := doltSQLScriptWithRetry(townRoot, script)
+	if err == nil {
+		return nil
+	}
+	if isNothingToCommit(err) {
+		return fmt.Errorf("wanted item %q is not open or does not exist", wantedID)
+	}
+	return fmt.Errorf("claim failed: %w", err)
 }
 
 // SubmitCompletion inserts a completion record and updates the wanted status.
-func SubmitCompletion(townRoot, completionID, wantedID, townHandle, evidence string) error {
-	esc := func(s string) string {
-		return strings.ReplaceAll(s, "'", "''")
-	}
-
+// The item must have status='claimed' AND claimed_by=rigHandle to prevent
+// completing an item claimed by another rig.
+//
+// Uses a single-script approach like ClaimWanted. The INSERT uses INSERT IGNORE
+// with a SELECT conditional on status='in_review' AND claimed_by AND NOT EXISTS
+// (prior completion). INSERT IGNORE makes the script idempotent on retry since
+// completions.id is a PRIMARY KEY. NOT EXISTS prevents multiple completions per
+// wanted item, ensuring the lifecycle is strictly post→claim→done.
+func SubmitCompletion(townRoot, completionID, wantedID, rigHandle, evidence string) error {
 	script := fmt.Sprintf(`USE %s;
-
-INSERT INTO completions (id, wanted_id, completed_by, evidence, completed_at)
-VALUES ('%s', '%s', '%s', '%s', NOW());
-
 UPDATE wanted SET status='in_review', evidence_url='%s', updated_at=NOW()
-WHERE id='%s';
-
+  WHERE id='%s' AND status='claimed' AND claimed_by='%s';
+INSERT IGNORE INTO completions (id, wanted_id, completed_by, evidence, completed_at)
+  SELECT '%s', '%s', '%s', '%s', NOW()
+  FROM wanted WHERE id='%s' AND status='in_review' AND claimed_by='%s'
+  AND NOT EXISTS (SELECT 1 FROM completions WHERE wanted_id='%s');
 CALL DOLT_ADD('-A');
 CALL DOLT_COMMIT('-m', 'wl done: %s');
 `,
 		WLCommonsDB,
-		esc(completionID),
-		esc(wantedID),
-		esc(townHandle),
-		esc(evidence),
-		esc(evidence),
-		esc(wantedID),
-		esc(wantedID))
+		EscapeSQL(evidence), EscapeSQL(wantedID), EscapeSQL(rigHandle),
+		EscapeSQL(completionID), EscapeSQL(wantedID), EscapeSQL(rigHandle), EscapeSQL(evidence),
+		EscapeSQL(wantedID), EscapeSQL(rigHandle), EscapeSQL(wantedID),
+		EscapeSQL(wantedID))
 
-	return doltSQLScriptWithRetry(townRoot, script)
+	err := doltSQLScriptWithRetry(townRoot, script)
+	if err == nil {
+		return nil
+	}
+	if isNothingToCommit(err) {
+		return fmt.Errorf("wanted item %q is not claimed by %q or does not exist", wantedID, rigHandle)
+	}
+	return fmt.Errorf("completion failed: %w", err)
 }
 
 // QueryWanted fetches a wanted item by ID. Returns nil if not found.
 func QueryWanted(townRoot, wantedID string) (*WantedItem, error) {
-	esc := func(s string) string {
-		return strings.ReplaceAll(s, "'", "''")
-	}
-
 	query := fmt.Sprintf(`USE %s; SELECT id, title, status, COALESCE(claimed_by, '') as claimed_by FROM wanted WHERE id='%s';`,
-		WLCommonsDB, esc(wantedID))
+		WLCommonsDB, EscapeSQL(wantedID))
 
 	output, err := doltSQLQuery(townRoot, query)
 	if err != nil {
@@ -322,20 +389,21 @@ func doltSQLQuery(townRoot, query string) (string, error) {
 }
 
 // parseSimpleCSV parses CSV output from dolt sql into a slice of maps.
+// Handles quoted fields containing commas and escaped quotes.
 func parseSimpleCSV(data string) []map[string]string {
 	lines := strings.Split(strings.TrimSpace(data), "\n")
 	if len(lines) < 2 {
 		return nil
 	}
 
-	headers := strings.Split(lines[0], ",")
+	headers := parseCSVLine(lines[0])
 	var result []map[string]string
 
 	for _, line := range lines[1:] {
 		if line == "" {
 			continue
 		}
-		fields := strings.Split(line, ",")
+		fields := parseCSVLine(line)
 		row := make(map[string]string)
 		for i, h := range headers {
 			if i < len(fields) {
@@ -345,4 +413,33 @@ func parseSimpleCSV(data string) []map[string]string {
 		result = append(result, row)
 	}
 	return result
+}
+
+// parseCSVLine parses a single CSV line, handling quoted fields.
+func parseCSVLine(line string) []string {
+	var fields []string
+	var field strings.Builder
+	inQuote := false
+
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		switch {
+		case ch == '"' && !inQuote:
+			inQuote = true
+		case ch == '"' && inQuote:
+			if i+1 < len(line) && line[i+1] == '"' {
+				field.WriteByte('"')
+				i++
+			} else {
+				inQuote = false
+			}
+		case ch == ',' && !inQuote:
+			fields = append(fields, field.String())
+			field.Reset()
+		default:
+			field.WriteByte(ch)
+		}
+	}
+	fields = append(fields, field.String())
+	return fields
 }

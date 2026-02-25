@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/wasteland"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -14,7 +15,7 @@ var wlClaimCmd = &cobra.Command{
 	Short: "Claim a wanted item",
 	Long: `Claim a wanted item on the shared wanted board.
 
-Updates the wanted row: claimed_by=<your town handle>, status='claimed'.
+Updates the wanted row: claimed_by=<your rig handle>, status='claimed'.
 The item must exist and have status='open'.
 
 In wild-west mode (Phase 1), this writes directly to the local wl-commons
@@ -38,31 +39,45 @@ func runWlClaim(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	townName, err := workspace.GetTownName(townRoot)
+	wlCfg, err := wasteland.LoadConfig(townRoot)
 	if err != nil {
-		return fmt.Errorf("getting town handle: %w", err)
+		return fmt.Errorf("loading wasteland config: %w", err)
 	}
+	rigHandle := wlCfg.RigHandle
 
 	if !doltserver.DatabaseExists(townRoot, doltserver.WLCommonsDB) {
 		return fmt.Errorf("database %q not found\nJoin a wasteland first with: gt wl join <org/db>", doltserver.WLCommonsDB)
 	}
 
-	item, err := doltserver.QueryWanted(townRoot, wantedID)
+	store := doltserver.NewWLCommons(townRoot)
+	item, err := claimWanted(store, wantedID, rigHandle)
 	if err != nil {
-		return fmt.Errorf("querying wanted item: %w", err)
-	}
-
-	if item.Status != "open" {
-		return fmt.Errorf("wanted item %s is not open (status: %s)", wantedID, item.Status)
-	}
-
-	if err := doltserver.ClaimWanted(townRoot, wantedID, townName); err != nil {
-		return fmt.Errorf("claiming wanted item: %w", err)
+		return err
 	}
 
 	fmt.Printf("%s Claimed %s\n", style.Bold.Render("✓"), wantedID)
-	fmt.Printf("  Claimed by: %s\n", townName)
+	fmt.Printf("  Claimed by: %s\n", rigHandle)
 	fmt.Printf("  Title: %s\n", item.Title)
 
 	return nil
+}
+
+// claimWanted contains the testable business logic for claiming a wanted item.
+// The returned WantedItem reflects pre-claim state (status "open", empty ClaimedBy);
+// callers needing post-claim state should re-query.
+func claimWanted(store doltserver.WLCommonsStore, wantedID, rigHandle string) (*doltserver.WantedItem, error) {
+	item, err := store.QueryWanted(wantedID)
+	if err != nil {
+		return nil, fmt.Errorf("querying wanted item: %w", err)
+	}
+
+	if item.Status != "open" {
+		return nil, fmt.Errorf("wanted item %s is not open (status: %s)", wantedID, item.Status)
+	}
+
+	if err := store.ClaimWanted(wantedID, rigHandle); err != nil {
+		return nil, fmt.Errorf("claiming wanted item: %w", err)
+	}
+
+	return item, nil
 }

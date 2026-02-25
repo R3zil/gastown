@@ -2,14 +2,20 @@
 package beads
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gofrs/flock"
+
+	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/telemetry"
 )
 
 // lockAgentBead acquires an exclusive file lock for a specific agent bead ID.
@@ -39,6 +45,7 @@ type AgentFields struct {
 	CleanupStatus     string // ZFC: polecat self-reports git state (clean, has_uncommitted, has_stash, has_unpushed)
 	ActiveMR          string // Currently active merge request bead ID (for traceability)
 	NotificationLevel string // DND mode: verbose, normal, muted (default: normal)
+	Mode              string // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
 	// Note: RoleBead field removed - role definitions are now config-based.
 	// See internal/config/roles/*.toml and config-based-roles.md.
 }
@@ -95,6 +102,10 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 		lines = append(lines, "notification_level: null")
 	}
 
+	if fields.Mode != "" {
+		lines = append(lines, fmt.Sprintf("mode: %s", fields.Mode))
+	}
+
 	return strings.Join(lines, "\n")
 }
 
@@ -136,6 +147,8 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.ActiveMR = value
 		case "notification_level":
 			fields.NotificationLevel = value
+		case "mode":
+			fields.Mode = value
 		}
 	}
 
@@ -152,37 +165,63 @@ func ParseAgentFields(description string) *AgentFields {
 // where the bead may be routed to a different database than the one this wrapper
 // is connected to.
 func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, error) {
+	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
+	if IsFlagLikeTitle(title) {
+		return nil, fmt.Errorf("refusing to create agent bead: %w (got %q)", ErrFlagTitle, title)
+	}
+
 	// Resolve where this bead will actually be written (handles multi-repo routing)
 	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
 
-	// Ensure target database has custom types configured
-	// This is cached (sentinel file + in-memory) so repeated calls are fast
-	if err := EnsureCustomTypes(targetDir); err != nil {
-		return nil, fmt.Errorf("prepare target for agent bead %s: %w", id, err)
-	}
+	// Ensure target database has custom types configured.
+	// This is cached (sentinel file + in-memory) so repeated calls are fast.
+	// On fresh rigs, this may fail if the database can't be initialized.
+	// Don't bail out — try the bd create calls anyway (GH#1769).
+	ensureErr := EnsureCustomTypes(targetDir)
 
 	description := FormatAgentDescription(title, fields)
 
-	args := []string{"create", "--json",
-		"--id=" + id,
-		"--title=" + title,
-		"--description=" + description,
-		"--type=agent",
-		"--labels=gt:agent",
-	}
-	if NeedsForceForID(id) {
-		args = append(args, "--force")
+	buildArgs := func() []string {
+		a := []string{"create", "--json",
+			"--id=" + id,
+			"--title=" + title,
+			"--description=" + description,
+			"--type=agent",
+			"--labels=gt:agent",
+		}
+		// Persistent polecats (gt-4ac): agent beads are non-ephemeral (issues table).
+		// They persist across polecat lifecycles and survive Dolt GC.
+		// Previously used --ephemeral (wisps table) but persistent polecats need
+		// durable agent state for idle detection and reuse.
+		if NeedsForceForID(id) {
+			a = append(a, "--force")
+		}
+		// Default actor from BD_ACTOR env var for provenance tracking
+		// Uses getActor() to respect isolated mode (tests)
+		if actor := b.getActor(); actor != "" {
+			a = append(a, "--actor="+actor)
+		}
+		return a
 	}
 
-	// Default actor from BD_ACTOR env var for provenance tracking
-	// Uses getActor() to respect isolated mode (tests)
-	if actor := b.getActor(); actor != "" {
-		args = append(args, "--actor="+actor)
-	}
-
-	out, err := b.run(args...)
+	// Create non-ephemeral agent bead (issues table). Persistent polecats (gt-4ac)
+	// need durable agent beads that survive across work assignments.
+	out, err := b.run(buildArgs()...)
 	if err != nil {
-		return nil, err
+		out, err = b.run(buildArgs()...)
+		if err != nil {
+			// Both bd create attempts failed. If EnsureCustomTypes also failed,
+			// the database may be completely uninitialized. Fall back to writing
+			// the agent bead directly as a JSONL entry (GH#1769 workaround).
+			if ensureErr != nil || isSubprocessCrash(err) {
+				issue, jsonlErr := createAgentBeadViaJSONL(targetDir, id, title, description)
+				if jsonlErr != nil {
+					return nil, fmt.Errorf("creating %s: bd create failed (%w), JSONL fallback also failed (%w)", id, err, jsonlErr)
+				}
+				return issue, nil
+			}
+			return nil, err
+		}
 	}
 
 	var issue Issue
@@ -203,11 +242,57 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 		}
 		if err := target.SetHookBead(id, fields.HookBead); err != nil {
 			// Non-fatal: warn but continue - description text has the backup
-			fmt.Printf("Warning: could not set hook slot: %v\n", err)
+			style.PrintWarning("could not set hook slot: %v", err)
 		}
 	}
 
 	return &issue, nil
+}
+
+// createAgentBeadViaJSONL writes an agent bead directly to the issues.jsonl file
+// as a fallback when all bd create attempts fail (GH#1769). This bypasses the
+// Dolt database entirely and creates a JSONL entry that bd import can pick up.
+// The bead will be properly imported on the next bd init or bd import.
+func createAgentBeadViaJSONL(beadsDir, id, title, description string) (*Issue, error) {
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	issue := &Issue{
+		ID:          id,
+		Title:       title,
+		Description: description,
+		Status:      "open",
+		Type:        "agent",
+		Labels:      []string{"gt:agent"},
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	data, err := json.Marshal(issue)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling agent bead JSON: %w", err)
+	}
+
+	// Append to JSONL file (create if needed). Use O_APPEND for atomicity.
+	f, err := os.OpenFile(jsonlPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) //nolint:gosec // G304: path is constructed internally
+	if err != nil {
+		return nil, fmt.Errorf("opening %s: %w", jsonlPath, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return nil, fmt.Errorf("writing to %s: %w", jsonlPath, err)
+	}
+
+	// Try to import the JSONL file into the database (best effort).
+	// This may fail if the database is truly uninitialized, but the JSONL
+	// file is now on disk for manual or future import.
+	importCmd := exec.Command("bd", "import", "-i", jsonlPath)
+	importCmd.Dir = filepath.Dir(beadsDir)
+	importCmd.Env = append(stripEnvPrefixes(os.Environ(), "BEADS_DIR="), "BEADS_DIR="+beadsDir)
+	_, _ = importCmd.CombinedOutput() // Best effort
+
+	return issue, nil
 }
 
 // CreateOrReopenAgentBead creates an agent bead or reopens an existing one.
@@ -222,8 +307,8 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 // 4. Updates the bead with new fields regardless of prior state
 //
 // This is robust against Dolt backend issues where bd close/reopen may fail:
-// - If nuke used ResetAgentBeadForReuse (preferred), bead is open → update directly
-// - If nuke used CloseAndClearAgentBead (legacy), bead is closed → reopen then update
+// - If nuke used ResetAgentBeadForReuse, bead is open → update directly
+// - If bead is closed (legacy state), reopen then update
 // - If bead is in unknown state, falls back to show+update
 func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (*Issue, error) {
 	// First try to create the bead (no lock needed - create is atomic)
@@ -288,6 +373,14 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	if _, err := target.run("update", id, "--type=agent"); err != nil {
 		return nil, fmt.Errorf("fixing agent bead type: %w", err)
 	}
+	// Persistent polecats (gt-4ac): agent beads are non-ephemeral.
+	// Migrate any existing ephemeral (wisp) beads to the issues table
+	// by removing the ephemeral flag. This ensures agent state persists
+	// across polecat lifecycles for idle detection and reuse.
+	if _, err := target.run("update", id, "--no-ephemeral"); err != nil {
+		// Non-fatal: the bead is functional either way
+		// --no-ephemeral may not be supported in all bd versions
+	}
 
 	// Note: role slot no longer set - role definitions are config-based
 
@@ -299,7 +392,7 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	if fields != nil && fields.HookBead != "" {
 		if err := target.SetHookBead(id, fields.HookBead); err != nil {
 			// Non-fatal: warn but continue - description text has the backup
-			fmt.Printf("Warning: could not set hook slot: %v\n", err)
+			style.PrintWarning("could not set hook slot: %v", err)
 		}
 	}
 
@@ -313,7 +406,7 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 // bd reopen failures). By keeping the bead open with agent_state="nuked",
 // CreateOrReopenAgentBead can simply update it on re-spawn without needing reopen.
 //
-// This replaces CloseAndClearAgentBead for the nuke path (gt-14b8o).
+// This is the standard nuke path (gt-14b8o).
 func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	// Lock the agent bead to prevent concurrent read-modify-write races.
 	// Without this, a concurrent CreateOrReopenAgentBead could overwrite
@@ -368,7 +461,8 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 // This ensures consistency with `bd slot show` and other beads commands.
 // Previously, this function embedded these fields in the description text,
 // which caused inconsistencies with bd slot commands (see GH #gt-9v52).
-func (b *Beads) UpdateAgentState(id string, state string, hookBead *string) error {
+func (b *Beads) UpdateAgentState(id string, state string, hookBead *string) (retErr error) {
+	defer func() { telemetry.RecordAgentStateChange(context.Background(), id, state, hookBead, retErr) }()
 	// Update agent state using bd agent state command
 	// Use runWithRouting so bd can resolve cross-prefix agent beads (e.g., wa-*
 	// agent beads from hq context) via routes.jsonl instead of BEADS_DIR.
@@ -450,6 +544,7 @@ type AgentFieldUpdates struct {
 	CleanupStatus     *string
 	ActiveMR          *string
 	NotificationLevel *string
+	Mode              *string
 }
 
 // UpdateAgentDescriptionFields atomically updates one or more agent description
@@ -489,6 +584,9 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	}
 	if updates.NotificationLevel != nil {
 		fields.NotificationLevel = *updates.NotificationLevel
+	}
+	if updates.Mode != nil {
+		fields.Mode = *updates.Mode
 	}
 
 	description := FormatAgentDescription(issue.Title, fields)
@@ -532,90 +630,6 @@ func (b *Beads) GetAgentNotificationLevel(id string) (string, error) {
 	return fields.NotificationLevel, nil
 }
 
-// DeleteAgentBead permanently deletes an agent bead.
-// Uses --hard --force for immediate permanent deletion (no tombstone).
-//
-// Deprecated: Agent beads represent persistent identity and should never be
-// hard-deleted. Use ResetAgentBeadForReuse instead, which preserves the CV
-// chain across assignments. This function remains only for test cleanup.
-//
-// WARNING: Due to a bd bug, --hard --force still creates tombstones instead of
-// truly deleting. This breaks CreateOrReopenAgentBead because tombstones are
-// invisible to bd show/reopen but still block bd create via UNIQUE constraint.
-func (b *Beads) DeleteAgentBead(id string) error {
-	_, err := b.run("delete", id, "--hard", "--force")
-	return err
-}
-
-// CloseAndClearAgentBead closes an agent bead (soft delete).
-//
-// Deprecated: Use ResetAgentBeadForReuse instead. Agent beads represent persistent
-// identity (not lifecycle artifacts) and should not be closed during nuke cycles.
-// Closing destroys work history continuity. ResetAgentBeadForReuse keeps the bead
-// open with agent_state="nuked", preserving the CV chain across assignments.
-//
-// This function remains for backward compatibility with older cleanup paths.
-// CreateOrReopenAgentBead can reopen closed beads when re-spawning polecats,
-// but the preferred path avoids close/reopen entirely.
-func (b *Beads) CloseAndClearAgentBead(id, reason string) error {
-	// Lock the agent bead to prevent concurrent read-modify-write races.
-	// See gt-joazs.
-	fl, lockErr := b.lockAgentBead(id)
-	if lockErr != nil {
-		return fmt.Errorf("locking agent bead %s: %w", id, lockErr)
-	}
-	defer func() { _ = fl.Unlock() }()
-
-	// Resolve where this bead lives (handles cross-rig routing).
-	// Without this, cross-rig agent beads (e.g., bd-beads-polecat-obsidian
-	// from gastown) would be looked up in the local rig's database and fail.
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-	target := b
-	if targetDir != b.getResolvedBeadsDir() {
-		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-	}
-
-	// Clear mutable fields to emulate delete --force --hard behavior.
-	// This ensures reopened agent beads don't have stale state.
-
-	// First get current issue to preserve immutable fields
-	issue, err := target.Show(id)
-	if err != nil {
-		// If we can't read the issue, still attempt to close
-		args := []string{"close", id}
-		if reason != "" {
-			args = append(args, "--reason="+reason)
-		}
-		_, closeErr := target.run(args...)
-		return closeErr
-	}
-
-	// Parse existing fields and clear mutable ones
-	fields := ParseAgentFields(issue.Description)
-	fields.HookBead = ""     // Clear hook_bead
-	fields.ActiveMR = ""     // Clear active_mr
-	fields.CleanupStatus = "" // Clear cleanup_status
-	fields.AgentState = "closed"
-
-	// Update description with cleared fields
-	description := FormatAgentDescription(issue.Title, fields)
-	if err := target.Update(id, UpdateOptions{Description: &description}); err != nil {
-		// Non-fatal: continue with close even if update fails
-	}
-
-	// Also clear the hook slot in the database
-	if err := target.ClearHookBead(id); err != nil {
-		// Non-fatal
-	}
-
-	args := []string{"close", id}
-	if reason != "" {
-		args = append(args, "--reason="+reason)
-	}
-	_, err = target.run(args...)
-	return err
-}
-
 // GetAgentBead retrieves an agent bead by ID.
 // Returns nil if not found.
 func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
@@ -637,21 +651,112 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 
 // ListAgentBeads returns all agent beads in a single query.
 // Returns a map of agent bead ID to Issue.
+//
+// Queries both the wisps table (primary, for migrated agent beads) and
+// the issues table (backward compat during migration). Wisps take
+// precedence for duplicate IDs.
 func (b *Beads) ListAgentBeads() (map[string]*Issue, error) {
+	result := make(map[string]*Issue)
+
+	// Query wisps table first (primary source after agent bead migration).
+	// Gracefully ignore errors — wisps table may not exist yet.
+	if wispBeads, _ := b.ListAgentBeadsFromWisps(); len(wispBeads) > 0 {
+		for id, issue := range wispBeads {
+			result[id] = issue
+		}
+	}
+
+	// Also query issues table (backward compat during migration).
 	out, err := b.run("list", "--label=gt:agent", "--json")
-	if err != nil {
+	if err != nil && len(result) == 0 {
 		return nil, err
 	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	if err == nil {
+		var issues []*Issue
+		if jsonErr := json.Unmarshal(out, &issues); jsonErr == nil {
+			for _, issue := range issues {
+				if _, exists := result[issue.ID]; !exists {
+					result[issue.ID] = issue
+				}
+			}
+		}
 	}
 
-	result := make(map[string]*Issue, len(issues))
-	for _, issue := range issues {
-		result[issue.ID] = issue
+	return result, nil
+}
+
+// ListAgentBeadsFromWisps queries the wisps table for agent beads.
+// Returns nil, nil if the wisps table doesn't exist yet or has no agent beads.
+func (b *Beads) ListAgentBeadsFromWisps() (map[string]*Issue, error) {
+	out, err := b.run("mol", "wisp", "list", "--json")
+	if err != nil {
+		return nil, nil // Wisps table may not exist yet
 	}
 
+	// bd mol wisp list --json returns {"wisps": [...], "count": N, ...}
+	var wrapper struct {
+		Wisps []*Issue `json:"wisps"`
+	}
+	if err := json.Unmarshal(out, &wrapper); err != nil {
+		return nil, nil
+	}
+
+	result := make(map[string]*Issue)
+	for _, w := range wrapper.Wisps {
+		// Check by type/label first (works when fields are present)
+		if IsAgentBead(w) {
+			result[w.ID] = w
+			continue
+		}
+		// Fallback: wisps JSON may omit issue_type/labels fields.
+		// Detect agent beads by ID pattern (prefix-rig-role format).
+		if isAgentBeadByID(w.ID) {
+			result[w.ID] = w
+		}
+	}
+
+	return result, nil
+}
+
+// isAgentBeadByID detects agent beads by their ID naming convention.
+// Agent bead IDs follow the pattern: prefix-rig-role[-name]
+// where role is one of: witness, refinery, crew, polecat, deacon, mayor.
+func isAgentBeadByID(id string) bool {
+	parts := strings.Split(id, "-")
+	if len(parts) < 3 {
+		return false
+	}
+	// Check if any part matches an agent role keyword
+	for _, part := range parts[2:] {
+		switch part {
+		case "witness", "refinery", "crew", "polecat", "deacon", "mayor":
+			return true
+		}
+	}
+	return false
+}
+
+// ListWispIDs returns a set of all wisp IDs in the wisps table.
+// This is useful for existence checks where wisp metadata (type, labels)
+// may not be available in the list output.
+func (b *Beads) ListWispIDs() (map[string]bool, error) {
+	out, err := b.run("mol", "wisp", "list", "--json")
+	if err != nil {
+		return nil, nil
+	}
+
+	var wrapper struct {
+		Wisps []struct {
+			ID string `json:"id"`
+		} `json:"wisps"`
+	}
+	if err := json.Unmarshal(out, &wrapper); err != nil {
+		return nil, nil
+	}
+
+	result := make(map[string]bool, len(wrapper.Wisps))
+	for _, w := range wrapper.Wisps {
+		result[w.ID] = true
+	}
 	return result, nil
 }

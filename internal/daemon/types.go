@@ -116,6 +116,7 @@ type PatrolsConfig struct {
 	Refinery    *PatrolConfig      `json:"refinery,omitempty"`
 	Witness     *PatrolConfig      `json:"witness,omitempty"`
 	Deacon      *PatrolConfig      `json:"deacon,omitempty"`
+	Handler     *PatrolConfig      `json:"handler,omitempty"`
 	DoltServer  *DoltServerConfig  `json:"dolt_server,omitempty"`
 	DoltRemotes *DoltRemotesConfig `json:"dolt_remotes,omitempty"`
 }
@@ -142,10 +143,14 @@ type DoltRemotesConfig struct {
 
 // DaemonPatrolConfig is the structure of mayor/daemon.json.
 type DaemonPatrolConfig struct {
-	Type      string         `json:"type"`
-	Version   int            `json:"version"`
-	Heartbeat *PatrolConfig  `json:"heartbeat,omitempty"`
-	Patrols   *PatrolsConfig `json:"patrols,omitempty"`
+	Type      string            `json:"type"`
+	Version   int               `json:"version"`
+	Heartbeat *PatrolConfig     `json:"heartbeat,omitempty"`
+	Patrols   *PatrolsConfig    `json:"patrols,omitempty"`
+	// Env holds environment variables to set at startup.
+	// Propagated to all sessions spawned by the daemon and read by gt up/mayor attach.
+	// Example: {"GT_DOLT_PORT": "43211"}
+	Env       map[string]string `json:"env,omitempty"`
 }
 
 // PatrolConfigFile returns the path to the patrol config file.
@@ -199,6 +204,10 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 	case "deacon":
 		if config.Patrols.Deacon != nil {
 			return config.Patrols.Deacon.Enabled
+		}
+	case "handler":
+		if config.Patrols.Handler != nil {
+			return config.Patrols.Handler.Enabled
 		}
 	}
 	return true // Default: enabled

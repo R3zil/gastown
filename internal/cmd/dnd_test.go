@@ -29,6 +29,8 @@ func TestAddressToAgentBeadID(t *testing.T) {
 		{"gastown/refinery", "gt-refinery"},
 		{"gastown/alpha", "gt-alpha"},
 		{"gastown/crew/max", "gt-crew-max"},
+		{"gastown/polecats/alpha", "gt-alpha"},
+		{"beads/polecats/beta", "bd-beta"},
 		{"beads/witness", "bd-witness"},
 		{"beads/beta", "bd-beta"},
 		// Invalid addresses should return empty string

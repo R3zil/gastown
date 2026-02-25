@@ -2,13 +2,15 @@ package cmd
 
 import (
 	"bytes"
-	"github.com/steveyegge/gastown/internal/config"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 func writeBDStub(t *testing.T, binDir string, unixScript string, windowsScript string) string {
@@ -106,9 +108,9 @@ func TestExtractIssueID(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := extractIssueID(tt.id)
+			got := beads.ExtractIssueID(tt.id)
 			if got != tt.want {
-				t.Errorf("extractIssueID(%q) = %q, want %q", tt.id, got, tt.want)
+				t.Errorf("ExtractIssueID(%q) = %q, want %q", tt.id, got, tt.want)
 			}
 		})
 	}
@@ -438,7 +440,7 @@ exit /b 0
 			RigName:     rigName,
 			PolecatName: "Toast",
 			ClonePath:   filepath.Join(townRoot, "fake-polecat"),
-			DoltBranch:  "",
+
 		}, nil
 	}
 
@@ -462,6 +464,93 @@ exit /b 0
 	}
 	if !rollbackCalled {
 		t.Fatalf("expected rollbackSlingArtifacts to be called")
+	}
+}
+
+func TestRollbackSlingArtifactsBurnsAttachedMolecules(t *testing.T) {
+	townRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	bdScript := `#!/bin/sh
+set -e
+cmd="$1"
+shift || true
+case "$cmd" in
+  update)
+    exit 0
+    ;;
+esac
+exit 0
+`
+	bdScriptWindows := `@echo off
+set "cmd=%1"
+if "%cmd%"=="update" exit /b 0
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "mayor")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	prevGetBead := getBeadInfoForRollback
+	prevCollect := collectExistingMoleculesForRollback
+	prevBurn := burnExistingMoleculesForRollback
+	t.Cleanup(func() {
+		getBeadInfoForRollback = prevGetBead
+		collectExistingMoleculesForRollback = prevCollect
+		burnExistingMoleculesForRollback = prevBurn
+	})
+
+	getBeadInfoForRollback = func(beadID string) (*beadInfo, error) {
+		if beadID != "gt-abc123" {
+			t.Fatalf("unexpected bead id: %q", beadID)
+		}
+		return &beadInfo{
+			Description: "attached_molecule: gt-wisp-stale",
+			Dependencies: []beads.IssueDep{
+				{ID: "gt-wisp-stale"},
+			},
+		}, nil
+	}
+	collectExistingMoleculesForRollback = collectExistingMolecules
+
+	burnCalled := false
+	burnExistingMoleculesForRollback = func(molecules []string, beadID, gotTownRoot string) error {
+		burnCalled = true
+		if beadID != "gt-abc123" {
+			t.Fatalf("unexpected burn bead id: %q", beadID)
+		}
+		if gotTownRoot != townRoot {
+			t.Fatalf("unexpected town root: got %q want %q", gotTownRoot, townRoot)
+		}
+		if len(molecules) != 1 || molecules[0] != "gt-wisp-stale" {
+			t.Fatalf("unexpected molecules to burn: %#v", molecules)
+		}
+		return nil
+	}
+
+	rollbackSlingArtifacts(&SpawnedPolecatInfo{
+		RigName:     "gastown",
+		PolecatName: "Toast",
+	}, "gt-abc123", "")
+
+	if !burnCalled {
+		t.Fatalf("expected rollbackSlingArtifacts to burn attached molecules")
 	}
 }
 
@@ -580,7 +669,7 @@ exit /b 0
 			RigName:     rigName,
 			PolecatName: "Toast",
 			ClonePath:   fakeWorkDir,
-			DoltBranch:  "",
+
 		}, nil
 	}
 
@@ -776,8 +865,8 @@ exit /b 0
 }
 
 // TestVerifyBeadExistsAllowStale reproduces the bug in gtl-ncq where beads
-// visible via regular bd show fail due to database sync issues.
-// The fix uses --allow-stale to skip the sync check for existence verification.
+// visible via regular bd show fail due to database staleness.
+// The fix uses --allow-stale to skip the staleness check for existence verification.
 func TestVerifyBeadExistsAllowStale(t *testing.T) {
 	townRoot := t.TempDir()
 
@@ -786,9 +875,9 @@ func TestVerifyBeadExistsAllowStale(t *testing.T) {
 		t.Fatalf("mkdir mayor/rig: %v", err)
 	}
 
-	// Create a stub bd that simulates the sync issue:
-	// - without --allow-stale fails (database out of sync)
-	// - with --allow-stale succeeds (skips sync check)
+	// Create a stub bd that simulates a staleness issue:
+	// - without --allow-stale fails (database stale)
+	// - with --allow-stale succeeds (skips staleness check)
 	binDir := filepath.Join(townRoot, "bin")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir binDir: %v", err)
@@ -808,7 +897,7 @@ if [ "$allow_stale" = "true" ]; then
   exit 0
 else
   # Without --allow-stale, fails with sync error
-  echo '{"error":"Database out of sync with JSONL."}'
+  echo '{"error":"Database is stale."}'
   exit 1
 fi
 `
@@ -822,7 +911,7 @@ if "%allow%"=="true" (
   echo [{"title":"Test bead","status":"open","assignee":""}]
   exit /b 0
 )
-echo {"error":"Database out of sync with JSONL."}
+echo {"error":"Database is stale."}
 exit /b 1
 `
 	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
@@ -1354,16 +1443,16 @@ func TestCheckCrossRigGuard(t *testing.T) {
 			wantErr:     true,
 		},
 		{
-			name:        "town-level: hq bead to any rig (allowed)",
+			name:        "town-level: hq bead to rig (rejected — belongs to town root)",
 			beadID:      "hq-abc123",
 			targetAgent: "gastown/polecats/Toast",
-			wantErr:     false,
+			wantErr:     true,
 		},
 		{
-			name:        "unknown prefix: allowed (no route to check)",
+			name:        "unknown prefix: rejected (no route maps to target rig)",
 			beadID:      "xx-unknown",
 			targetAgent: "gastown/polecats/Toast",
-			wantErr:     false,
+			wantErr:     true,
 		},
 		{
 			name:        "empty bead prefix: allowed",
@@ -1380,11 +1469,15 @@ func TestCheckCrossRigGuard(t *testing.T) {
 				t.Errorf("checkCrossRigGuard(%q, %q) error = %v, wantErr %v", tc.beadID, tc.targetAgent, err, tc.wantErr)
 			}
 			if err != nil && tc.wantErr {
-				if !strings.Contains(err.Error(), "cross-rig mismatch") {
-					t.Errorf("expected cross-rig mismatch error, got: %v", err)
+				errMsg := err.Error()
+				if !strings.Contains(errMsg, "cross-rig mismatch") && !strings.Contains(errMsg, "town root") {
+					t.Errorf("expected cross-rig or town-root error, got: %v", err)
 				}
-				if !strings.Contains(err.Error(), "--force") {
+				if !strings.Contains(errMsg, "--force") {
 					t.Errorf("error should mention --force override, got: %v", err)
+				}
+				if !strings.Contains(errMsg, "bd create") {
+					t.Errorf("error should mention bd create, got: %v", err)
 				}
 			}
 		})
@@ -1688,7 +1781,7 @@ cmd="$1"
 shift || true
 case "$cmd" in
   show)
-    echo '[{"title":"Test issue","status":"hooked","assignee":"gastown/polecats/toast","description":""}]'
+    echo '[{"title":"Test issue","status":"hooked","assignee":"gastown/polecats/test-dead-polecat-xxxx","description":""}]'
     ;;
   update)
     exit 0
@@ -1700,7 +1793,7 @@ exit 0
 echo %*>>"%BD_LOG%"
 set "cmd=%1"
 if "%cmd%"=="show" (
-  echo [{"title":"Test issue","status":"hooked","assignee":"gastown/polecats/toast","description":""}]
+  echo [{"title":"Test issue","status":"hooked","assignee":"gastown/polecats/test-dead-polecat-xxxx","description":""}]
   exit /b 0
 )
 exit /b 0
@@ -1750,9 +1843,9 @@ exit /b 0
 
 	// Sling with matching target but dead agent — should NOT no-op.
 	// The auto-force path proceeds into resolveTarget which will fail
-	// because the rig doesn't exist in the test environment. The key
-	// assertion: we must NOT get an idempotent no-op (nil error).
-	err = runSling(nil, []string{"gt-test456", "gastown/polecats/toast"})
+	// because the polecat doesn't exist in tmux. Use a unique name that
+	// will never collide with a real running polecat session.
+	err = runSling(nil, []string{"gt-test456", "gastown/polecats/test-dead-polecat-xxxx"})
 
 	w.Close()
 	os.Stdout = origStdout
@@ -2030,5 +2123,332 @@ exit /b 0
 	err = runSling(nil, []string{"gt-test-pinned-dot", "."})
 	if err != nil {
 		t.Fatalf("expected no-op nil return for pinned bead with dot target, got error: %v", err)
+	}
+}
+
+// TestSlingPolecatEnvCheck verifies that the polecat guard in runSling uses
+// GT_ROLE as the authoritative check, so coordinators with a stale GT_POLECAT
+// in their environment are not blocked from slinging (GH #664).
+func TestSlingPolecatEnvCheck(t *testing.T) {
+	tests := []struct {
+		name      string
+		role      string
+		polecat   string
+		wantBlock bool
+	}{
+		{
+			name:      "bare polecat role is blocked",
+			role:      "polecat",
+			polecat:   "alpha",
+			wantBlock: true,
+		},
+		{
+			name:      "compound polecat role is blocked",
+			role:      "gastown/polecats/Toast",
+			polecat:   "Toast",
+			wantBlock: true,
+		},
+		{
+			name:      "mayor with stale GT_POLECAT is NOT blocked",
+			role:      "mayor",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "compound witness with stale GT_POLECAT is NOT blocked",
+			role:      "gastown/witness",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "crew with stale GT_POLECAT is NOT blocked",
+			role:      "crew",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "compound crew with stale GT_POLECAT is NOT blocked",
+			role:      "gastown/crew/den",
+			polecat:   "alpha",
+			wantBlock: false,
+		},
+		{
+			name:      "no GT_ROLE with GT_POLECAT set is blocked",
+			role:      "",
+			polecat:   "alpha",
+			wantBlock: true,
+		},
+		{
+			name:      "no GT_ROLE and no GT_POLECAT is not blocked",
+			role:      "",
+			polecat:   "",
+			wantBlock: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GT_ROLE", tt.role)
+			t.Setenv("GT_POLECAT", tt.polecat)
+
+			// We only test the polecat guard, so we call runSling with no args.
+			// It will either fail at the guard or panic/fail later (missing args).
+			// We only care whether the error is the polecat-block message.
+			var blocked bool
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// Panic means we got past the guard — not blocked
+						blocked = false
+					}
+				}()
+				err := runSling(nil, nil)
+				blocked = err != nil && strings.Contains(err.Error(), "polecats cannot sling")
+			}()
+
+			if blocked != tt.wantBlock {
+				if tt.wantBlock {
+					t.Errorf("expected polecat block but was not blocked (GT_ROLE=%q GT_POLECAT=%q)", tt.role, tt.polecat)
+				} else {
+					t.Errorf("unexpected polecat block with GT_ROLE=%q GT_POLECAT=%q", tt.role, tt.polecat)
+				}
+			}
+		})
+	}
+}
+
+// TestSlingNudgeCrewAndMayor verifies that slinging to crew or mayor targets
+// with an active session includes the nudge (inject start prompt) step.
+// This is a regression test for gt-in7b: the generic resolveTarget + nudge
+// flow handles all target types, not just polecats.
+func TestSlingNudgeCrewAndMayor(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		wantAgent  string
+		wantPaneIn string // substring expected in dry-run "Would inject" output
+	}{
+		{
+			name:       "crew target gets nudge pane",
+			target:     "gastown/crew/max",
+			wantAgent:  "gastown/crew/max",
+			wantPaneIn: "%99",
+		},
+		{
+			name:       "mayor target gets nudge pane",
+			target:     "mayor",
+			wantAgent:  "mayor/",
+			wantPaneIn: "%99",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			townRoot := t.TempDir()
+
+			if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+				t.Fatalf("mkdir .beads: %v", err)
+			}
+			rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
+			if err := os.MkdirAll(rigDir, 0755); err != nil {
+				t.Fatalf("mkdir rigDir: %v", err)
+			}
+			routes := `{"prefix":"gt-","path":"gastown/mayor/rig"}` + "\n" +
+				`{"prefix":"hq-","path":"."}` + "\n"
+			if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+				t.Fatalf("write routes: %v", err)
+			}
+
+			binDir := filepath.Join(townRoot, "bin")
+			if err := os.MkdirAll(binDir, 0755); err != nil {
+				t.Fatalf("mkdir binDir: %v", err)
+			}
+			bdScript := `#!/bin/sh
+cmd="$1"
+shift || true
+case "$cmd" in
+  show)
+    echo '[{"title":"Test issue","status":"open","assignee":"","description":""}]'
+    ;;
+  update)
+    exit 0
+    ;;
+esac
+exit 0
+`
+			bdScriptWindows := `@echo off
+set "cmd=%1"
+if "%cmd%"=="show" (
+  echo [{"title":"Test issue","status":"open","assignee":"","description":""}]
+  exit /b 0
+)
+exit /b 0
+`
+			_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv(EnvGTRole, "mayor")
+			t.Setenv("GT_POLECAT", "")
+			t.Setenv("GT_CREW", "")
+			t.Setenv("TMUX_PANE", "")
+			t.Setenv("GT_TEST_NO_NUDGE", "1")
+			t.Setenv("GT_TEST_SKIP_HOOK_VERIFY", "1")
+
+			cwd, err := os.Getwd()
+			if err != nil {
+				t.Fatalf("getwd: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Chdir(cwd) })
+			if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+				t.Fatalf("chdir: %v", err)
+			}
+
+			// Mock resolveTargetAgentFn to return a fake pane (no real tmux needed)
+			prevFn := resolveTargetAgentFn
+			t.Cleanup(func() { resolveTargetAgentFn = prevFn })
+			resolveTargetAgentFn = func(target string) (string, string, string, error) {
+				return tt.wantAgent, "%99", townRoot, nil
+			}
+
+			prevDryRun := slingDryRun
+			prevNoConvoy := slingNoConvoy
+			t.Cleanup(func() {
+				slingDryRun = prevDryRun
+				slingNoConvoy = prevNoConvoy
+			})
+			slingDryRun = true
+			slingNoConvoy = true
+
+			// Capture stdout
+			origStdout := os.Stdout
+			r, w, _ := os.Pipe()
+			os.Stdout = w
+			t.Cleanup(func() { os.Stdout = origStdout })
+
+			err = runSling(nil, []string{"gt-abc123", tt.target})
+
+			w.Close()
+			os.Stdout = origStdout
+			var captured bytes.Buffer
+			_, _ = captured.ReadFrom(r)
+			stdout := captured.String()
+
+			if err != nil {
+				t.Fatalf("runSling: %v", err)
+			}
+
+			// Verify the dry-run output includes the nudge pane
+			if !strings.Contains(stdout, "Would inject start prompt to pane: "+tt.wantPaneIn) {
+				t.Errorf("expected nudge pane %q in output, got:\n%s", tt.wantPaneIn, stdout)
+			}
+
+			// Verify correct agent was resolved
+			if !strings.Contains(stdout, tt.wantAgent) {
+				t.Errorf("expected agent %q in output, got:\n%s", tt.wantAgent, stdout)
+			}
+		})
+	}
+}
+// TestSlingRejectsDeferredBead verifies that gt sling refuses to sling beads
+// with deferred status or deferral keywords in their description (gt-1326mw).
+// This prevents wasting polecat slots on low-priority deferred work.
+func TestSlingRejectsDeferredBead(t *testing.T) {
+	tests := []struct {
+		name      string
+		bdOutput  string // JSON response from bd show --json
+		force     bool
+		wantError string // expected error substring, empty = no error expected
+	}{
+		{
+			name:      "deferred status is rejected",
+			bdOutput:  `[{"title":"Epic cleanup","status":"deferred","assignee":"","description":"some task"}]`,
+			wantError: "refusing to sling deferred bead",
+		},
+		{
+			name:      "deferred to post-launch in description is rejected",
+			bdOutput:  `[{"title":"Nice to have feature","status":"open","assignee":"","description":"deferred to post-launch"}]`,
+			wantError: "refusing to sling deferred bead",
+		},
+		{
+			name:      "status: deferred in description is rejected",
+			bdOutput:  `[{"title":"Low-pri work","status":"open","assignee":"","description":"status: deferred, will revisit later"}]`,
+			wantError: "refusing to sling deferred bead",
+		},
+		{
+			name:     "deferred status with --force is allowed",
+			bdOutput: `[{"title":"Re-activated work","status":"deferred","assignee":"","description":"re-activated from deferred"}]`,
+			force:    true,
+		},
+		{
+			name:     "open bead is allowed",
+			bdOutput: `[{"title":"Normal work","status":"open","assignee":"","description":"just a regular task"}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			townRoot := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+
+			binDir := filepath.Join(townRoot, "bin")
+			if err := os.MkdirAll(binDir, 0755); err != nil {
+				t.Fatalf("mkdir bin: %v", err)
+			}
+
+			// Create bd stub that returns the test bead info
+			bdScript := "#!/bin/sh\necho '" + tt.bdOutput + "'\n"
+			bdScriptWindows := "@echo off\r\necho " + tt.bdOutput + "\r\n"
+			writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv(EnvGTRole, "crew")
+			t.Setenv("GT_CREW", "jv")
+			t.Setenv("GT_POLECAT", "")
+			t.Setenv("TMUX_PANE", "")
+			t.Setenv("GT_TEST_NO_NUDGE", "1")
+
+			cwd, err := os.Getwd()
+			if err != nil {
+				t.Fatalf("getwd: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Chdir(cwd) })
+			if err := os.Chdir(townRoot); err != nil {
+				t.Fatalf("chdir: %v", err)
+			}
+
+			prevDryRun := slingDryRun
+			prevNoConvoy := slingNoConvoy
+			prevForce := slingForce
+			t.Cleanup(func() {
+				slingDryRun = prevDryRun
+				slingNoConvoy = prevNoConvoy
+				slingForce = prevForce
+			})
+			slingDryRun = true
+			slingNoConvoy = true
+			slingForce = tt.force
+
+			err = runSling(nil, []string{"gt-test123"})
+
+			if tt.wantError != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q but got nil", tt.wantError)
+				}
+				if !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantError, err)
+				}
+			} else if err != nil {
+				// Some errors are OK in dry-run (e.g., "finding town root" when workspace not fully set up).
+				// We only fail if the error is about deferred rejection, which shouldn't happen.
+				if strings.Contains(err.Error(), "refusing to sling deferred") {
+					t.Fatalf("unexpected deferred rejection: %v", err)
+				}
+			}
+		})
 	}
 }

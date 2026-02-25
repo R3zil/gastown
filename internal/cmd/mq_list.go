@@ -53,16 +53,19 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	var issues []*beads.Issue
 
 	if mqListReady {
-		// Use ready query which filters by no blockers
-		allReady, err := b.Ready()
+		// Query all open MRs and filter out blocked ones manually.
+		// Cannot use b.Ready() because it excludes ephemeral beads,
+		// and MRs are ephemeral by design (see gt-t5t6y).
+		opts.Status = "open"
+		allOpen, err := b.List(opts)
 		if err != nil {
 			return fmt.Errorf("querying ready MRs: %w", err)
 		}
-		// Filter to only merge-request label (issue_type field is deprecated)
-		for _, issue := range allReady {
-			if beads.HasLabel(issue, "gt:merge-request") {
-				issues = append(issues, issue)
+		for _, issue := range allOpen {
+			if len(issue.BlockedBy) > 0 || issue.BlockedByCount > 0 {
+				continue // Skip blocked issues
 			}
+			issues = append(issues, issue)
 		}
 	} else {
 		issues, err = b.List(opts)
@@ -74,10 +77,10 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	// Apply additional filters and calculate scores
 	now := time.Now()
 	type scoredIssue struct {
-		issue          *beads.Issue
-		fields         *beads.MRFields
-		score          float64
-		branchMissing  bool // true if branch doesn't exist in git (when --verify is set)
+		issue           *beads.Issue
+		fields          *beads.MRFields
+		score           float64
+		branchMissing   bool // true if branch doesn't exist in git (when --verify is set)
 		branchVerifyErr bool // true if git check errored (corrupt repo, permission, etc.)
 	}
 	var scored []scoredIssue
@@ -150,8 +153,8 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			// Extend JSON with verification results
 			type verifiedIssue struct {
 				*beads.Issue
-				BranchExists *bool  `json:"branch_exists,omitempty"`
-				VerifyError  bool   `json:"verify_error,omitempty"`
+				BranchExists *bool `json:"branch_exists,omitempty"`
+				VerifyError  bool  `json:"verify_error,omitempty"`
 			}
 			var verified []verifiedIssue
 			for _, s := range scored {
@@ -180,20 +183,7 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create styled table - add GIT column when --verify is set
-	columns := []style.Column{
-		{Name: "ID", Width: 12},
-		{Name: "SCORE", Width: 7, Align: style.AlignRight},
-		{Name: "PRI", Width: 4},
-		{Name: "CONVOY", Width: 12},
-		{Name: "BRANCH", Width: 24},
-		{Name: "STATUS", Width: 10},
-	}
-	if mqListVerify {
-		columns = append(columns, style.Column{Name: "GIT", Width: 8})
-	}
-	columns = append(columns, style.Column{Name: "AGE", Width: 6, Align: style.AlignRight})
-
-	table := style.NewTable(columns...)
+	table := style.NewTable(buildMQListColumns(mqListVerify)...)
 
 	// Add rows using scored items (already sorted by score)
 	for _, item := range scored {
@@ -225,10 +215,15 @@ func runMQList(cmd *cobra.Command, args []string) error {
 
 		// Get MR fields
 		branch := ""
+		target := ""
 		convoyID := ""
 		if fields != nil {
 			branch = fields.Branch
+			target = fields.Target
 			convoyID = fields.ConvoyID
+		}
+		if target == "" {
+			target = style.Dim.Render("(unset)")
 		}
 
 		// Format convoy column
@@ -275,9 +270,9 @@ func runMQList(cmd *cobra.Command, args []string) error {
 
 		// Build row with conditional GIT column
 		if mqListVerify {
-			table.AddRow(displayID, scoreStr, priority, convoyDisplay, branch, styledStatus, gitStatus, style.Dim.Render(age))
+			table.AddRow(displayID, scoreStr, priority, convoyDisplay, branch, target, styledStatus, gitStatus, style.Dim.Render(age))
 		} else {
-			table.AddRow(displayID, scoreStr, priority, convoyDisplay, branch, styledStatus, style.Dim.Render(age))
+			table.AddRow(displayID, scoreStr, priority, convoyDisplay, branch, target, styledStatus, style.Dim.Render(age))
 		}
 	}
 
@@ -348,6 +343,22 @@ func outputJSON(data interface{}) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(data)
+}
+
+func buildMQListColumns(verify bool) []style.Column {
+	columns := []style.Column{
+		{Name: "ID", Width: 12},
+		{Name: "SCORE", Width: 7, Align: style.AlignRight},
+		{Name: "PRI", Width: 4},
+		{Name: "CONVOY", Width: 12},
+		{Name: "BRANCH", Width: 24},
+		{Name: "TARGET", Width: 24},
+		{Name: "STATUS", Width: 10},
+	}
+	if verify {
+		columns = append(columns, style.Column{Name: "GIT", Width: 8})
+	}
+	return append(columns, style.Column{Name: "AGE", Width: 6, Align: style.AlignRight})
 }
 
 // calculateMRScore computes the priority score for an MR using the refinery scoring function.

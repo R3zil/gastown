@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 func TestValidateCommand(t *testing.T) {
@@ -245,7 +247,7 @@ func TestParseCommandArgs(t *testing.T) {
 }
 
 func TestAPIHandler_Commands(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/commands", nil)
 	w := httptest.NewRecorder()
@@ -291,11 +293,12 @@ func TestAPIHandler_Commands(t *testing.T) {
 }
 
 func TestAPIHandler_Run_BlockedCommand(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{"command": "delete everything"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -318,11 +321,12 @@ func TestAPIHandler_Run_BlockedCommand(t *testing.T) {
 }
 
 func TestAPIHandler_Run_InvalidJSON(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{invalid json}`
 	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -333,11 +337,12 @@ func TestAPIHandler_Run_InvalidJSON(t *testing.T) {
 }
 
 func TestAPIHandler_Run_EmptyCommand(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{"command": ""}`
 	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -347,8 +352,76 @@ func TestAPIHandler_Run_EmptyCommand(t *testing.T) {
 	}
 }
 
+func TestAPIHandler_Run_MissingCSRFToken(t *testing.T) {
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
+
+	body := `{"command": "status"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	// Deliberately omit X-Dashboard-Token header
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /api/run without CSRF token status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	var resp CommandResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp.Success {
+		t.Error("Expected success=false without CSRF token")
+	}
+	if !strings.Contains(resp.Error, "dashboard token") {
+		t.Errorf("Expected error about dashboard token, got: %q", resp.Error)
+	}
+}
+
+func TestAPIHandler_Run_WrongCSRFToken(t *testing.T) {
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
+
+	body := `{"command": "status"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "wrong-token")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /api/run with wrong CSRF token status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+}
+
+func TestAPIHandler_Run_ConfirmRequired(t *testing.T) {
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
+
+	// "mail send" requires Confirm: true in AllowedCommands
+	body := `{"command": "mail send alice -s test -m hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/run", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /api/run confirm command without confirmed=true status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+
+	var resp CommandResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if !strings.Contains(resp.Error, "confirmation") {
+		t.Errorf("Expected error about confirmation, got: %q", resp.Error)
+	}
+}
+
 func TestAPIHandler_NotFound(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/unknown", nil)
 	w := httptest.NewRecorder()
@@ -382,7 +455,7 @@ func TestGetCommandList(t *testing.T) {
 }
 
 func TestAPIHandler_Crew(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/crew", nil)
 	w := httptest.NewRecorder()
@@ -408,7 +481,7 @@ func TestAPIHandler_Crew(t *testing.T) {
 }
 
 func TestAPIHandler_Ready(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/ready", nil)
 	w := httptest.NewRecorder()
@@ -434,11 +507,12 @@ func TestAPIHandler_Ready(t *testing.T) {
 }
 
 func TestAPIHandler_IssueCreate_MissingTitle(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{"title": ""}`
 	req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -449,7 +523,7 @@ func TestAPIHandler_IssueCreate_MissingTitle(t *testing.T) {
 }
 
 func TestAPIHandler_IssueCreate_InvalidTitle(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	tests := []struct {
 		name  string
@@ -468,6 +542,7 @@ func TestAPIHandler_IssueCreate_InvalidTitle(t *testing.T) {
 			body, _ := json.Marshal(payload)
 			req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBuffer(body))
 			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Dashboard-Token", "test-token")
 			w := httptest.NewRecorder()
 
 			handler.ServeHTTP(w, req)
@@ -480,7 +555,7 @@ func TestAPIHandler_IssueCreate_InvalidTitle(t *testing.T) {
 }
 
 func TestAPIHandler_IssueCreate_InvalidDescription(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	payload := map[string]interface{}{
 		"title":       "Valid title",
@@ -489,6 +564,7 @@ func TestAPIHandler_IssueCreate_InvalidDescription(t *testing.T) {
 	body, _ := json.Marshal(payload)
 	req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -499,11 +575,12 @@ func TestAPIHandler_IssueCreate_InvalidDescription(t *testing.T) {
 }
 
 func TestAPIHandler_IssueCreate_InvalidJSON(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	body := `{not valid json}`
 	req := httptest.NewRequest(http.MethodPost, "/api/issues/create", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Dashboard-Token", "test-token")
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)
@@ -602,6 +679,93 @@ func TestParseMailInboxText_UnreadMarker(t *testing.T) {
 	}
 }
 
+// --- groupIntoThreads tests ---
+
+func TestGroupIntoThreads_SingleMessages(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Hello", Timestamp: "2026-01-01T10:00:00Z"},
+		{ID: "msg-2", From: "bob", Subject: "World", Timestamp: "2026-01-01T11:00:00Z"},
+	}
+	threads := groupIntoThreads(msgs)
+	if len(threads) != 2 {
+		t.Fatalf("got %d threads, want 2", len(threads))
+	}
+	if threads[0].Count != 1 {
+		t.Errorf("thread 0 count = %d, want 1", threads[0].Count)
+	}
+	if threads[1].Subject != "World" {
+		t.Errorf("thread 1 subject = %q, want %q", threads[1].Subject, "World")
+	}
+}
+
+func TestGroupIntoThreads_ByThreadID(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Status update", ThreadID: "t-001", Timestamp: "2026-01-01T10:00:00Z"},
+		{ID: "msg-2", From: "bob", Subject: "Re: Status update", ThreadID: "t-001", Timestamp: "2026-01-01T11:00:00Z"},
+		{ID: "msg-3", From: "carol", Subject: "Other topic", Timestamp: "2026-01-01T12:00:00Z"},
+	}
+	threads := groupIntoThreads(msgs)
+	if len(threads) != 2 {
+		t.Fatalf("got %d threads, want 2", len(threads))
+	}
+	// First thread should have 2 messages grouped by ThreadID
+	if threads[0].Count != 2 {
+		t.Errorf("thread 0 count = %d, want 2", threads[0].Count)
+	}
+	if threads[0].Subject != "Status update" {
+		t.Errorf("thread 0 subject = %q, want %q", threads[0].Subject, "Status update")
+	}
+	if threads[0].LastMessage.ID != "msg-2" {
+		t.Errorf("thread 0 last message ID = %q, want %q", threads[0].LastMessage.ID, "msg-2")
+	}
+	// Second thread is standalone
+	if threads[1].Count != 1 {
+		t.Errorf("thread 1 count = %d, want 1", threads[1].Count)
+	}
+}
+
+func TestGroupIntoThreads_ByReplyTo(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Question", Timestamp: "2026-01-01T10:00:00Z"},
+		{ID: "msg-2", From: "bob", Subject: "Re: Question", ReplyTo: "msg-1", Timestamp: "2026-01-01T11:00:00Z"},
+	}
+	threads := groupIntoThreads(msgs)
+	if len(threads) != 1 {
+		t.Fatalf("got %d threads, want 1", len(threads))
+	}
+	if threads[0].Count != 2 {
+		t.Errorf("thread count = %d, want 2", threads[0].Count)
+	}
+	if threads[0].Subject != "Question" {
+		t.Errorf("thread subject = %q, want %q", threads[0].Subject, "Question")
+	}
+}
+
+func TestGroupIntoThreads_UnreadCount(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Update", ThreadID: "t-001", Read: true},
+		{ID: "msg-2", From: "bob", Subject: "Re: Update", ThreadID: "t-001", Read: false},
+		{ID: "msg-3", From: "carol", Subject: "Re: Update", ThreadID: "t-001", Read: false},
+	}
+	threads := groupIntoThreads(msgs)
+	if len(threads) != 1 {
+		t.Fatalf("got %d threads, want 1", len(threads))
+	}
+	if threads[0].UnreadCount != 2 {
+		t.Errorf("unread count = %d, want 2", threads[0].UnreadCount)
+	}
+}
+
+func TestGroupIntoThreads_ReSubjectStrip(t *testing.T) {
+	msgs := []MailMessage{
+		{ID: "msg-1", From: "alice", Subject: "Re: Original topic", ThreadID: "t-001"},
+	}
+	threads := groupIntoThreads(msgs)
+	if threads[0].Subject != "Original topic" {
+		t.Errorf("subject = %q, want %q", threads[0].Subject, "Original topic")
+	}
+}
+
 // --- parseIssueShowJSON tests (issue #1228: prefer structured JSON over text parsing) ---
 
 func TestParseIssueShowJSON_ValidOutput(t *testing.T) {
@@ -678,7 +842,7 @@ func TestParseIssueShowJSON_InvalidInputs(t *testing.T) {
 }
 
 func TestAPIHandler_SSE_ContentType(t *testing.T) {
-	handler := NewAPIHandler(30*time.Second, 60*time.Second)
+	handler := NewAPIHandler(30*time.Second, 60*time.Second, "test-token")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
 	// Cancel context quickly so the SSE handler returns instead of blocking
@@ -753,6 +917,61 @@ func TestOptionsCacheConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestParseConvoyListJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want []string
+	}{
+		{
+			name: "valid JSON with convoys",
+			json: `[{"id":"hq-cv-abc","title":"Deploy widgets"},{"id":"hq-cv-def","title":"Fix bugs"}]`,
+			want: []string{"hq-cv-abc", "hq-cv-def"},
+		},
+		{
+			name: "empty array",
+			json: `[]`,
+			want: []string{},
+		},
+		{
+			name: "invalid JSON",
+			json: `{not valid`,
+			want: nil,
+		},
+		{
+			name: "empty string",
+			json: ``,
+			want: nil,
+		},
+		{
+			name: "skips empty IDs",
+			json: `[{"id":"hq-cv-abc"},{"id":""},{"id":"hq-cv-def"}]`,
+			want: []string{"hq-cv-abc", "hq-cv-def"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseConvoyListJSON(tt.json)
+			if tt.want == nil {
+				if got != nil {
+					t.Errorf("parseConvoyListJSON(%q) = %v, want nil", tt.json, got)
+				}
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Errorf("parseConvoyListJSON(%q) = %v, want %v", tt.json, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("parseConvoyListJSON(%q)[%d] = %q, want %q", tt.json, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
 }
 
 // TestRunGtCommandSemaphore verifies that runGtCommand limits concurrent
@@ -859,5 +1078,69 @@ func TestRunGtCommandSemaphoreTimeoutBudget(t *testing.T) {
 	// The call should have returned within the timeout budget (200ms + margin).
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("elapsed = %v, want < 500ms (timeout should bound semaphore wait)", elapsed)
+	}
+}
+
+// TestHandleSessionPreviewPrefixValidation verifies that handleSessionPreview
+// accepts session names with known rig prefixes and rejects invalid prefixes.
+func TestHandleSessionPreviewPrefixValidation(t *testing.T) {
+	originalRegistry := session.DefaultRegistry()
+	t.Cleanup(func() { session.SetDefaultRegistry(originalRegistry) })
+
+	testRegistry := session.NewPrefixRegistry()
+	testRegistry.Register("nx", "nexus")
+	testRegistry.Register("myrig", "myrig-project")
+	session.SetDefaultRegistry(testRegistry)
+
+	h := &APIHandler{
+		gtPath:            "true",
+		workDir:           t.TempDir(),
+		defaultRunTimeout: 1 * time.Second,
+		maxRunTimeout:     2 * time.Second,
+		cmdSem:            make(chan struct{}, 5),
+	}
+
+	tests := []struct {
+		name          string
+		sessionName   string
+		wantRejected  bool
+		wantErrSubstr string
+	}{
+		{"registered prefix nx", "nx-polecat-alpha", false, ""},
+		{"registered prefix myrig", "myrig-crew-bob", false, ""},
+		{"legacy gt- prefix", "gt-polecat-test", false, ""},
+		{"legacy bd- prefix", "bd-some-bead", false, ""},
+		{"hq- prefix", "hq-nonexistent-session", false, ""},
+		{"gthq- prefix", "gthq-deacon", false, ""},
+		{"unknown prefix rejected", "unknown-session-name", true, "must start with a known rig prefix"},
+		{"no prefix rejected", "justsomename", true, "must start with a known rig prefix"},
+		{"invalid characters rejected", "gt-bad_chars!", true, "invalid characters"},
+		{"missing session parameter", "", true, "Missing session parameter"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			url := "/api/session-preview"
+			if tc.sessionName != "" {
+				url += "?session=" + tc.sessionName
+			}
+			req := httptest.NewRequest(http.MethodGet, url, nil)
+			rec := httptest.NewRecorder()
+
+			h.handleSessionPreview(rec, req)
+
+			if tc.wantRejected {
+				if rec.Code != http.StatusBadRequest {
+					t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+				}
+				if !strings.Contains(rec.Body.String(), tc.wantErrSubstr) {
+					t.Errorf("body = %q, want substring %q", rec.Body.String(), tc.wantErrSubstr)
+				}
+			} else {
+				if rec.Code == http.StatusBadRequest && strings.Contains(rec.Body.String(), "prefix") {
+					t.Errorf("valid prefix %q was rejected: %s", tc.sessionName, rec.Body.String())
+				}
+			}
+		})
 	}
 }

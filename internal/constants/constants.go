@@ -43,6 +43,24 @@ const (
 	// NudgeRetryInterval is the base interval between send-keys retry attempts
 	// when a transient tmux error is encountered during nudge delivery.
 	NudgeRetryInterval = 500 * time.Millisecond
+
+	// BdCommandTimeout is the default timeout for bd (beads CLI) command
+	// execution. Used across polecat session management and plugin recording.
+	BdCommandTimeout = 30 * time.Second
+
+	// BdSubprocessTimeout is the timeout for bd subprocess calls in TUI panels.
+	// Prevents the TUI from freezing if these commands hang.
+	BdSubprocessTimeout = 5 * time.Second
+
+	// StartupNudgeVerifyDelay is how long to wait after sending a startup nudge
+	// before checking if the agent started working. Must be long enough for the
+	// agent to begin processing the nudge (receive text, parse, start first tool).
+	StartupNudgeVerifyDelay = 5 * time.Second
+
+	// StartupNudgeMaxRetries is the maximum number of times to retry a startup
+	// nudge if the agent appears idle after delivery. Each retry re-sends the
+	// nudge content and waits StartupNudgeVerifyDelay before checking again.
+	StartupNudgeMaxRetries = 3
 )
 
 // Directory names within a Gas Town workspace.
@@ -93,6 +111,9 @@ const (
 	// Written by gt handoff before respawn, cleared by gt prime after detection.
 	// This prevents the handoff loop bug where agents re-run /handoff from context.
 	FileHandoffMarker = "handoff_to_successor"
+
+	// FileQuotaJSON is the quota state file in mayor/.
+	FileQuotaJSON = "quota.json"
 )
 
 // Beads configuration constants.
@@ -270,4 +291,19 @@ func RigSettingsPath(rigPath string) string {
 // MayorAccountsPath returns the path to mayor/accounts.json within a town root.
 func MayorAccountsPath(townRoot string) string {
 	return townRoot + "/" + DirMayor + "/" + FileAccountsJSON
+}
+
+// MayorQuotaPath returns the path to mayor/quota.json within a town root.
+func MayorQuotaPath(townRoot string) string {
+	return townRoot + "/" + DirMayor + "/" + FileQuotaJSON
+}
+
+// DefaultRateLimitPatterns are the default patterns that indicate a session
+// is rate-limited. These are matched against tmux pane content.
+// Note: patterns are compiled with (?i) for case-insensitive matching.
+var DefaultRateLimitPatterns = []string{
+	`You've hit your limit`,
+	`resets \d+[:\d]*(am|pm)\b`,               // "resets 7pm", "resets 3:00 AM" — anchored to digit
+	`Stop and wait for limit to reset`,        // /rate-limit-options TUI prompt option 1
+	`Add funds to continue with extra usage`,  // /rate-limit-options TUI prompt option 2
 }

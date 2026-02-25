@@ -96,9 +96,15 @@ func runMoleculeStepDone(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 2: Extract molecule ID from step ID (gt-xxx.1 -> gt-xxx)
+	// Also handle wisp format (go-wisp-xxx) by using the step's Parent field
 	moleculeID := extractMoleculeIDFromStep(stepID)
 	if moleculeID == "" {
-		return fmt.Errorf("cannot extract molecule ID from step %s (expected format: gt-xxx.N)", stepID)
+		// Fallback: use the step's Parent field (for wisps)
+		if step.Parent != "" {
+			moleculeID = step.Parent
+		} else {
+			return fmt.Errorf("cannot extract molecule ID from step %s (expected format: prefix.N or wisp with parent)", stepID)
+		}
 	}
 
 	result := StepDoneResult{
@@ -476,7 +482,7 @@ func handleMoleculeComplete(cwd, townRoot, moleculeID string, dryRun bool) error
 	if roleCtx.Role == RolePolecat {
 		fmt.Printf("%s Signaling completion to witness...\n", style.Bold.Render("📤"))
 
-		doneCmd := exec.Command("gt", "done", "--exit", "DEFERRED")
+		doneCmd := exec.Command("gt", "done", "--status", "DEFERRED")
 		doneCmd.Stdout = os.Stdout
 		doneCmd.Stderr = os.Stderr
 		return doneCmd.Run()

@@ -212,9 +212,9 @@ func TestClaudeSettingsCheck_ValidRefinerySettings(t *testing.T) {
 	tmpDir := t.TempDir()
 	rigName := "testrig"
 
-	// Create valid refinery settings in correct location (refinery/.claude/settings.json)
-	// Settings are now in the parent directory, passed via --settings flag.
-	refinerySettings := filepath.Join(tmpDir, rigName, "refinery", ".claude", "settings.json")
+	// Create valid refinery settings in correct location (refinery/rig/.claude/settings.json)
+	// Settings are in the working directory, passed via --settings flag.
+	refinerySettings := filepath.Join(tmpDir, rigName, "refinery", "rig", ".claude", "settings.json")
 	createValidSettings(t, refinerySettings)
 
 	check := NewClaudeSettingsCheck()
@@ -389,8 +389,8 @@ func TestClaudeSettingsCheck_WrongLocationRefinery(t *testing.T) {
 	tmpDir := t.TempDir()
 	rigName := "testrig"
 
-	// Create stale settings.local.json at refinery parent dir (old filename, wrong)
-	// The correct file is refinery/.claude/settings.json
+	// Create stale settings.local.json at refinery parent dir (old location, wrong)
+	// The correct location is refinery/rig/.claude/settings.json
 	wrongSettings := filepath.Join(tmpDir, rigName, "refinery", ".claude", "settings.local.json")
 	createValidSettings(t, wrongSettings)
 
@@ -553,7 +553,7 @@ func TestClaudeSettingsCheck_MixedValidAndStale(t *testing.T) {
 	createStaleSettings(t, witnessSettings, "PATH")
 
 	// Create valid refinery settings (settings.json in correct location)
-	refinerySettings := filepath.Join(tmpDir, rigName, "refinery", ".claude", "settings.json")
+	refinerySettings := filepath.Join(tmpDir, rigName, "refinery", "rig", ".claude", "settings.json")
 	createValidSettings(t, refinerySettings)
 
 	check := NewClaudeSettingsCheck()
@@ -880,7 +880,7 @@ func TestClaudeSettingsCheck_FixPreservesTrackedCleanFiles(t *testing.T) {
 // TestClaudeSettingsCheck_FixMovesCLAUDEmdToMayor were removed because
 // CLAUDE.md at town root is now intentionally created by gt install.
 // It serves as an identity anchor for Mayor/Deacon who run from the town root.
-// See install.go createTownRootCLAUDEmd() for details.
+// See install.go createTownRootAgentMDs() for details.
 
 func TestClaudeSettingsCheck_GitIgnoredFilesNotFlagged(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -1042,7 +1042,7 @@ func TestClaudeSettingsCheck_MissingRefinerySettings(t *testing.T) {
 	tmpDir := t.TempDir()
 	rigName := "testrig"
 
-	// Create refinery directory but NOT the settings.json at refinery/.claude/
+	// Create refinery directory but NOT the settings.json at refinery/rig/.claude/
 	refineryDir := filepath.Join(tmpDir, rigName, "refinery")
 	if err := os.MkdirAll(refineryDir, 0755); err != nil {
 		t.Fatal(err)
@@ -1257,8 +1257,8 @@ func TestClaudeSettingsCheck_MissingFileOnlyMessage(t *testing.T) {
 	}
 
 	// Fix hint should mention restart for missing files
-	if !strings.Contains(result.FixHint, "gt up --restart") {
-		t.Errorf("expected fix hint to mention 'gt up --restart', got %q", result.FixHint)
+	if !strings.Contains(result.FixHint, "gt up --restore") {
+		t.Errorf("expected fix hint to mention 'gt up --restore', got %q", result.FixHint)
 	}
 }
 

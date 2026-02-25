@@ -87,7 +87,8 @@ Git-backed issue tracking system that stores work state as structured data.
 
 - **Go 1.23+** - [go.dev/dl](https://go.dev/dl/)
 - **Git 2.25+** - for worktree support
-- **beads (bd) 0.52.0+** - [github.com/steveyegge/beads](https://github.com/steveyegge/beads)
+- **Dolt 1.82.4+** - [github.com/dolthub/dolt](https://github.com/dolthub/dolt)
+- **beads (bd) 0.55.4+** - [github.com/steveyegge/beads](https://github.com/steveyegge/beads)
 - **sqlite3** - for convoy database queries (usually pre-installed on macOS/Linux)
 - **tmux 3.0+** - recommended for full experience
 - **Claude Code CLI** (default runtime) - [claude.ai/code](https://claude.ai/code)
@@ -216,9 +217,9 @@ gt convoy list                         # Check progress
 
 **Best for:** Predefined, repeatable processes
 
-Formulas are TOML-defined workflows stored in `.beads/formulas/`.
+Formulas are TOML-defined workflows embedded in the `gt` binary (source in `internal/formula/formulas/`).
 
-**Example Formula** (`.beads/formulas/release.formula.toml`):
+**Example Formula** (`internal/formula/formulas/release.formula.toml`):
 
 ```toml
 description = "Standard release process"
@@ -334,6 +335,8 @@ gt sling <bead-id> <rig> --agent cursor   # Override runtime for this sling/spaw
 gt mayor attach             # Start Mayor session
 gt mayor start --agent auggie           # Run Mayor with a specific agent alias
 gt prime                    # Context recovery (run inside existing session)
+gt feed                     # Real-time activity feed (TUI)
+gt feed --problems          # Start in problems view (stuck agent detection)
 ```
 
 **Built-in agent presets**: `claude`, `gemini`, `codex`, `cursor`, `auggie`, `amp`
@@ -372,26 +375,62 @@ bd mol list                 # List active instances
 
 ## Cooking Formulas
 
-Gas Town includes built-in formulas for common workflows. See `.beads/formulas/` for available recipes.
+Gas Town includes built-in formulas for common workflows. See `internal/formula/formulas/` for available recipes.
+
+## Activity Feed
+
+`gt feed` launches an interactive terminal dashboard for monitoring all agent activity in real-time. It combines beads activity, agent events, and merge queue updates into a three-panel TUI:
+
+- **Agent Tree** - Hierarchical view of all agents grouped by rig and role
+- **Convoy Panel** - In-progress and recently-landed convoys
+- **Event Stream** - Chronological feed of creates, completions, slings, nudges, and more
+
+```bash
+gt feed                      # Launch TUI dashboard
+gt feed --problems           # Start in problems view
+gt feed --plain              # Plain text output (no TUI)
+gt feed --window             # Open in dedicated tmux window
+gt feed --since 1h           # Events from last hour
+```
+
+**Navigation:** `j`/`k` to scroll, `Tab` to switch panels, `1`/`2`/`3` to jump to a panel, `?` for help, `q` to quit.
+
+### Problems View
+
+At scale (20-50+ agents), spotting stuck agents in the activity stream becomes difficult. The problems view surfaces agents needing human intervention by analyzing structured beads data.
+
+Press `p` in `gt feed` (or start with `gt feed --problems`) to toggle the problems view, which groups agents by health state:
+
+| State | Condition |
+|-------|-----------|
+| **GUPP Violation** | Hooked work with no progress for an extended period |
+| **Stalled** | Hooked work with reduced progress |
+| **Zombie** | Dead tmux session |
+| **Working** | Active, progressing normally |
+| **Idle** | No hooked work |
+
+**Intervention keys** (in problems view): `n` to nudge the selected agent, `h` to handoff (refresh context).
 
 ## Dashboard
 
-Gas Town includes a web dashboard for monitoring:
+Gas Town includes a web dashboard for monitoring your workspace. The dashboard
+must be run from inside a Gas Town workspace (HQ) directory.
 
 ```bash
-# Start dashboard
-gt dashboard --port 8080
+# Start dashboard (default port 8080)
+gt dashboard
 
-# Open in browser
-open http://localhost:8080
+# Start on a custom port
+gt dashboard --port 3000
+
+# Start and automatically open in browser
+gt dashboard --open
 ```
 
-Features:
-
-- Real-time agent status
-- Convoy progress tracking
-- Hook state visualization
-- Configuration management
+The dashboard gives you a single-page overview of everything happening in your
+workspace: agents, convoys, hooks, queues, issues, and escalations. It
+auto-refreshes via htmx and includes a command palette for running gt commands
+directly from the browser.
 
 ## Advanced Concepts
 
@@ -458,7 +497,8 @@ gt completion fish > ~/.config/fish/completions/gt.fish
 - **Use convoys for coordination** - They provide visibility across agents
 - **Leverage hooks for persistence** - Your work won't disappear
 - **Create formulas for repeated tasks** - Save time with Beads recipes
-- **Monitor the dashboard** - Get real-time visibility
+- **Use `gt feed` for live monitoring** - Watch agent activity and catch stuck agents early
+- **Monitor the dashboard** - Get real-time visibility in the browser
 - **Let the Mayor orchestrate** - It knows how to manage agents
 
 ## Troubleshooting

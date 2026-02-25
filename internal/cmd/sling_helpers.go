@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -15,9 +17,11 @@ import (
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
-	"github.com/steveyegge/gastown/internal/nudge"
+	"github.com/steveyegge/gastown/internal/daemon"
+	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -71,11 +75,29 @@ func resolveBeadDirFromRigsJSON(townRoot, prefix string) string {
 
 // beadInfo holds status and assignee for a bead.
 type beadInfo struct {
-	Title        string          `json:"title"`
-	Status       string          `json:"status"`
-	Assignee     string          `json:"assignee"`
-	Description  string          `json:"description"`
+	Title        string           `json:"title"`
+	Status       string           `json:"status"`
+	Assignee     string           `json:"assignee"`
+	Description  string           `json:"description"`
+	Labels       []string         `json:"labels,omitempty"`
 	Dependencies []beads.IssueDep `json:"dependencies,omitempty"`
+	IssueType    string           `json:"issue_type,omitempty"`
+}
+
+// isDeferredBead checks whether a bead should be rejected from slinging because
+// it has been deferred. Returns true if the bead has status "deferred" or if its
+// description contains deferral keywords like "deferred to post-launch".
+func isDeferredBead(info *beadInfo) bool {
+	if info.Status == "deferred" {
+		return true
+	}
+	desc := strings.ToLower(info.Description)
+	if strings.Contains(desc, "deferred to post-launch") ||
+		strings.Contains(desc, "deferred to post launch") ||
+		strings.Contains(desc, "status: deferred") {
+		return true
+	}
+	return false
 }
 
 // collectExistingMolecules returns all molecule wisp IDs attached to a bead.
@@ -107,9 +129,9 @@ func collectExistingMolecules(info *beadInfo) []string {
 	return molecules
 }
 
-// burnExistingMolecules detaches and burns all molecule wisps attached to a bead.
-// First detaches the molecule from the base bead (clears attached_molecule in description),
-// then force-closes the orphaned wisp beads. Returns an error if detach fails, since
+// burnExistingMolecules burns all molecule wisps attached to a bead.
+// Order: force-close descendants → detach from bead → force-close roots.
+// Matches nukeCleanupMolecules pattern. Returns an error if detach fails, since
 // proceeding with a stale attached_molecule reference creates harder-to-debug orphans.
 func burnExistingMolecules(molecules []string, beadID, townRoot string) error {
 	if len(molecules) == 0 {
@@ -117,11 +139,24 @@ func burnExistingMolecules(molecules []string, beadID, townRoot string) error {
 	}
 	burnDir := beads.ResolveHookDir(townRoot, beadID, "")
 
-	// Step 1: Detach molecule from the base bead using the Go API (with audit logging
+	// Follows the same order as nukeCleanupMolecules:
+	//   1. Force-close descendants (children before parents)
+	//   2. Detach molecule from bead (clears attached_molecule in description)
+	//   3. Force-close molecule roots
+	// Closing descendants first ensures that if detach succeeds but a later step
+	// crashes, we don't leave a detached root with live children.
+	bd := beads.New(burnDir)
+
+	// Step 1: Force-close descendant steps before detaching. Uses force variant
+	// since burn is a destructive recovery path where prior state may be inconsistent.
+	for _, molID := range molecules {
+		forceCloseDescendants(bd, molID)
+	}
+
+	// Step 2: Detach molecule from the base bead using the Go API (with audit logging
 	// and advisory locking). This clears attached_molecule/attached_at from the description.
 	// Without this, storeFieldsInBead preserves the stale reference because it only
 	// overwrites when updates.AttachedMolecule is non-empty.
-	bd := beads.New(burnDir)
 	if _, err := bd.DetachMoleculeWithAudit(beadID, beads.DetachOptions{
 		Operation: "burn",
 		Reason:    "force re-sling: burning stale molecules",
@@ -129,8 +164,7 @@ func burnExistingMolecules(molecules []string, beadID, townRoot string) error {
 		return fmt.Errorf("detaching molecule from %s: %w", beadID, err)
 	}
 
-	// Step 2: Force-close the orphaned wisp beads so they don't linger.
-	// Uses --force to handle wisps with open child steps (matching gt done pattern).
+	// Step 3: Force-close the orphaned wisp roots so they don't linger.
 	if err := bd.ForceCloseWithReason("burned: force re-sling", molecules...); err != nil {
 		fmt.Printf("  %s Could not close molecule wisp(s): %v\n",
 			style.Dim.Render("Warning:"), err)
@@ -148,9 +182,10 @@ func burnExistingMolecules(molecules []string, beadID, townRoot string) error {
 // Checks bead existence using bd show.
 // Resolves the rig directory from the bead's prefix for correct dolt access.
 func verifyBeadExists(beadID string) error {
-	cmd := exec.Command("bd", "show", beadID, "--json", "--allow-stale")
-	cmd.Dir = resolveBeadDir(beadID)
-	out, err := cmd.Output()
+	out, err := BdCmd("show", beadID, "--json", "--allow-stale").
+		Dir(resolveBeadDir(beadID)).
+		Stderr(io.Discard).
+		Output()
 	if err != nil {
 		return fmt.Errorf("bead '%s' not found (bd show failed)", beadID)
 	}
@@ -163,9 +198,10 @@ func verifyBeadExists(beadID string) error {
 // getBeadInfo returns status and assignee for a bead.
 // Resolves the rig directory from the bead's prefix for correct dolt access.
 func getBeadInfo(beadID string) (*beadInfo, error) {
-	cmd := exec.Command("bd", "show", beadID, "--json", "--allow-stale")
-	cmd.Dir = resolveBeadDir(beadID)
-	out, err := cmd.Output()
+	out, err := BdCmd("show", beadID, "--json", "--allow-stale").
+		Dir(resolveBeadDir(beadID)).
+		Stderr(io.Discard).
+		Output()
 	if err != nil {
 		return nil, fmt.Errorf("bead '%s' not found", beadID)
 	}
@@ -191,6 +227,10 @@ type beadFieldUpdates struct {
 	Args             string // Natural language instructions
 	AttachedMolecule string // Wisp root ID
 	NoMerge          bool   // Skip merge queue on completion
+	Mode             string // Execution mode: "" (normal) or "ralph"
+	ConvoyID         string // Convoy bead ID (e.g., "hq-cv-abc")
+	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local"
+	ConvoyOwned      bool   // Convoy has gt:owned label (caller-managed lifecycle)
 }
 
 // storeFieldsInBead performs a single read-modify-write to update all attachment fields
@@ -203,9 +243,10 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	issue := &beads.Issue{}
 	if logPath == "" {
 		// Read the bead once
-		showCmd := exec.Command("bd", "show", beadID, "--json", "--allow-stale")
-		showCmd.Dir = resolveBeadDir(beadID)
-		out, err := showCmd.Output()
+		out, err := BdCmd("show", beadID, "--json", "--allow-stale").
+			Dir(resolveBeadDir(beadID)).
+				Stderr(io.Discard).
+			Output()
 		if err != nil {
 			return fmt.Errorf("fetching bead: %w", err)
 		}
@@ -245,6 +286,18 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	if updates.NoMerge {
 		fields.NoMerge = true
 	}
+	if updates.Mode != "" {
+		fields.Mode = updates.Mode
+	}
+	if updates.ConvoyID != "" {
+		fields.ConvoyID = updates.ConvoyID
+	}
+	if updates.MergeStrategy != "" {
+		fields.MergeStrategy = updates.MergeStrategy
+	}
+	if updates.ConvoyOwned {
+		fields.ConvoyOwned = true
+	}
 
 	// Write back once
 	newDesc := beads.SetAttachmentFields(issue, fields)
@@ -253,10 +306,9 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 		return nil
 	}
 
-	updateCmd := exec.Command("bd", "update", beadID, "--description="+newDesc)
-	updateCmd.Dir = resolveBeadDir(beadID)
-	updateCmd.Stderr = os.Stderr
-	if err := updateCmd.Run(); err != nil {
+	if err := BdCmd("update", beadID, "--description="+newDesc).
+		Dir(resolveBeadDir(beadID)).
+		Run(); err != nil {
 		return fmt.Errorf("updating bead description: %w", err)
 	}
 
@@ -302,7 +354,7 @@ func injectStartPrompt(pane, beadID, subject, args string) error {
 func getSessionFromPane(pane string) string {
 	if strings.HasPrefix(pane, "%") {
 		// Pane ID format - query tmux for the session
-		cmd := exec.Command("tmux", "display-message", "-t", pane, "-p", "#{session_name}")
+		cmd := tmux.BuildCommand("display-message", "-t", pane, "-p", "#{session_name}")
 		out, err := cmd.Output()
 		if err != nil {
 			return ""
@@ -336,7 +388,8 @@ func ensureAgentReady(sessionName string) error {
 		}
 	}
 
-	// Accept bypass permissions warning if the agent emits one on startup
+	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
+	_ = t.AcceptWorkspaceTrustDialog(sessionName)
 	agentName, _ := t.GetEnvironment(sessionName, "GT_AGENT")
 	if shouldAcceptPermissionWarning(agentName) {
 		_ = t.AcceptBypassPermissionsWarning(sessionName)
@@ -379,7 +432,7 @@ func ensureAgentReady(sessionName string) error {
 
 // isSessionYoung returns true if the tmux session was created less than maxAge ago.
 func isSessionYoung(sessionName string, maxAge time.Duration) bool {
-	out, err := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{session_created}").Output()
+	out, err := tmux.BuildCommand("display-message", "-t", sessionName, "-p", "#{session_created}").Output()
 	if err != nil {
 		return false
 	}
@@ -520,27 +573,32 @@ func wakeRigAgents(rigName string) {
 	bootCmd := exec.Command("gt", "rig", "boot", rigName)
 	_ = bootCmd.Run() // Ignore errors - rig might already be running
 
-	// Queue nudge to witness for cooperative delivery.
-	// This avoids interrupting in-flight tool calls.
-	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
+	// Verify daemon is running — polecat triggering depends on daemon
+	// processing deacon mail. Warn if not running (gt-9wv0).
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		if err := nudge.Enqueue(townRoot, witnessSession, nudge.QueuedNudge{
-			Sender:  "sling",
-			Message: "Polecat dispatched - check for work",
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to queue nudge for %s: %v\n", witnessSession, err)
+		if running, _, _ := daemon.IsRunning(townRoot); !running {
+			fmt.Fprintf(os.Stderr, "Warning: daemon is not running. Polecat may not auto-start.\n")
+			fmt.Fprintf(os.Stderr, "  Start with: gt daemon start\n")
 		}
-	} else {
-		// Fallback to direct nudge if town root unavailable
-		t := tmux.NewTmux()
-		_ = t.NudgeSession(witnessSession, "Polecat dispatched - check for work")
+	}
+
+	// Immediate delivery to witness: send directly to tmux pane.
+	// No cooperative queue — idle agents never call Drain(), so queued
+	// nudges would be stuck forever. Direct delivery is safe: if the
+	// agent is busy, text buffers in tmux and is processed at next prompt.
+	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
+	t := tmux.NewTmux()
+	if err := t.NudgeSession(witnessSession, "Polecat dispatched - check for work"); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to nudge witness %s: %v\n", witnessSession, err)
 	}
 }
 
-// nudgeRefinery queues a nudge for the refinery after an MR is created.
-// Uses the nudge queue for cooperative delivery so we don't interrupt
-// in-flight tool calls. The refinery picks this up at its next turn boundary.
+// nudgeRefinery wakes the refinery after an MR is created.
+// Uses immediate delivery: sends directly to the tmux pane.
+// No cooperative queue — idle agents never call Drain(), so queued
+// nudges would be stuck forever. Direct delivery is safe: if the
+// agent is busy, text buffers in tmux and is processed at next prompt.
 func nudgeRefinery(rigName, message string) {
 	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 
@@ -555,19 +613,19 @@ func nudgeRefinery(rigName, message string) {
 		return // Don't actually nudge tmux in tests
 	}
 
-	// Queue for cooperative delivery at refinery's next turn boundary
+	// Emit a file event so the refinery's await-event unblocks instantly.
+	// This is the programmatic bridge between mq submit and the event system.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		if err := nudge.Enqueue(townRoot, refinerySession, nudge.QueuedNudge{
-			Sender:  "sling",
-			Message: message,
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to queue nudge for %s: %v\n", refinerySession, err)
-		}
-	} else {
-		// Fallback to direct nudge if town root unavailable
-		t := tmux.NewTmux()
-		_ = t.NudgeSession(refinerySession, message)
+		_, _ = EmitEventToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
+			"source=sling",
+			"message=" + message,
+		})
+	}
+
+	t := tmux.NewTmux()
+	if err := t.NudgeSession(refinerySession, message); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to nudge refinery %s: %v\n", refinerySession, err)
 	}
 }
 
@@ -599,34 +657,60 @@ type FormulaOnBeadResult struct {
 //   - extraVars: additional --var values supplied by the user
 //
 // Returns the wisp root ID which should be hooked.
-func InstantiateFormulaOnBead(formulaName, beadID, title, hookWorkDir, townRoot string, skipCook bool, extraVars []string) (*FormulaOnBeadResult, error) {
+func InstantiateFormulaOnBead(formulaName, beadID, title, hookWorkDir, townRoot string, skipCook bool, extraVars []string) (_ *FormulaOnBeadResult, retErr error) {
+	defer func() { telemetry.RecordFormulaInstantiate(context.Background(), formulaName, beadID, retErr) }()
 	// Route bd mutations (wisp/bond) to the correct beads context for the target bead.
 	formulaWorkDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
 
 	// Step 1: Cook the formula (ensures proto exists)
+	// If cook fails, retry with the embedded formula extracted to a temp file.
+	// This handles non-gastown rigs that don't have formulas provisioned on disk.
+	// See gt-oir.
+	resolvedFormula := formulaName
+	var formulaCleanup func()
 	if !skipCook {
-		cookCmd := exec.Command("bd", "cook", formulaName)
-		cookCmd.Dir = formulaWorkDir
-		cookCmd.Env = append(os.Environ(), "GT_ROOT="+townRoot)
-		cookCmd.Stderr = os.Stderr
-		if err := cookCmd.Run(); err != nil {
-			return nil, fmt.Errorf("cooking formula %s: %w", formulaName, err)
+		if err := BdCmd("cook", formulaName).
+			Dir(formulaWorkDir).
+			WithGTRoot(townRoot).
+				Run(); err != nil {
+			// Retry with embedded formula
+			resolvedFormula, formulaCleanup = resolveFormulaToTempFile(formulaName)
+			if formulaCleanup != nil {
+				defer formulaCleanup()
+			}
+			if resolvedFormula != formulaName {
+				if retryErr := BdCmd("cook", resolvedFormula).
+					Dir(formulaWorkDir).
+					WithGTRoot(townRoot).
+					Run(); retryErr != nil {
+					return nil, fmt.Errorf("cooking formula %s: %w (embedded retry: %v)", formulaName, err, retryErr)
+				}
+			} else {
+				return nil, fmt.Errorf("cooking formula %s: %w", formulaName, err)
+			}
 		}
 	}
 
-	// Step 2: Create wisp with feature and issue variables from bead
+	// Build variable list once so both legacy and fallback paths use
+	// identical formula inputs.
 	featureVar := fmt.Sprintf("feature=%s", title)
 	issueVar := fmt.Sprintf("issue=%s", beadID)
-	wispArgs := []string{"mol", "wisp", formulaName, "--var", featureVar, "--var", issueVar}
+	formulaVars := []string{featureVar, issueVar}
+	formulaVars = append(formulaVars, extraVars...)
+	formulaVars = ensureFormulaRequiredVars(formulaName, formulaVars)
+
+	// Step 2: Create wisp with feature and issue variables from bead.
+	// Use resolvedFormula which may be a temp file path if the embedded fallback was used.
+	wispArgs := []string{"mol", "wisp", resolvedFormula, "--var", featureVar, "--var", issueVar}
 	for _, variable := range extraVars {
 		wispArgs = append(wispArgs, "--var", variable)
 	}
 	wispArgs = append(wispArgs, "--json")
-	wispCmd := exec.Command("bd", wispArgs...)
-	wispCmd.Dir = formulaWorkDir
-	wispCmd.Env = append(os.Environ(), "GT_ROOT="+townRoot)
-	wispCmd.Stderr = os.Stderr
-	wispOut, err := wispCmd.Output()
+	wispOut, err := BdCmd(wispArgs...).
+		Dir(formulaWorkDir).
+		WithAutoCommit().
+		WithGTRoot(townRoot).
+		Output()
 	if err != nil {
 		return nil, fmt.Errorf("creating wisp for formula %s: %w", formulaName, err)
 	}
@@ -637,22 +721,45 @@ func InstantiateFormulaOnBead(formulaName, beadID, title, hookWorkDir, townRoot 
 		return nil, fmt.Errorf("parsing wisp output: %w", err)
 	}
 
-	// Step 3: Bond wisp to original bead (creates compound)
+	// Step 3: Bond wisp to original bead (creates compound).
+	//
+	// Compatibility fallback:
+	// Some bd versions return a wisp ID from `mol wisp` that is not bond-resolvable
+	// ("<id> not found"), while direct formula->bead bond still works. If legacy
+	// wisp->bead bond fails, retry with direct formula bond in ephemeral mode.
 	bondArgs := []string{"mol", "bond", wispRootID, beadID, "--json"}
-	bondCmd := exec.Command("bd", bondArgs...)
-	bondCmd.Dir = formulaWorkDir
-	bondCmd.Stderr = os.Stderr
-	bondOut, err := bondCmd.Output()
+	bondOut, err := BdCmd(bondArgs...).
+		Dir(formulaWorkDir).
+		WithAutoCommit().
+		WithGTRoot(townRoot).
+		Output()
 	if err != nil {
-		return nil, fmt.Errorf("bonding formula to bead: %w", err)
+		fallbackRootID, fallbackErr := bondFormulaDirect(resolvedFormula, beadID, formulaWorkDir, townRoot, formulaVars)
+		if fallbackErr != nil {
+			return nil, fmt.Errorf("bonding formula to bead: %w (direct formula bond fallback failed: %v)", err, fallbackErr)
+		}
+		return &FormulaOnBeadResult{
+			WispRootID: fallbackRootID,
+			BeadToHook: beadID, // Hook the BASE bead (lifecycle fix: wisp is attached_molecule)
+		}, nil
 	}
 
-	// Parse bond output - the wisp root becomes the compound root
-	var bondResult struct {
-		RootID string `json:"root_id"`
+	// Parse bond output - the wisp root becomes the compound root.
+	// Some environments may return success with non-JSON/empty stdout while
+	// still writing an error to stderr. If parsing fails, retry direct bond.
+	parsedRootID, parsed := parseBondSpawnRootIDWithStatus(bondOut, formulaName, beadID, wispRootID)
+	if !parsed {
+		fallbackRootID, fallbackErr := bondFormulaDirect(resolvedFormula, beadID, formulaWorkDir, townRoot, formulaVars)
+		if fallbackErr != nil {
+			return nil, fmt.Errorf("bond output not parseable and direct formula bond fallback failed: %v", fallbackErr)
+		}
+		return &FormulaOnBeadResult{
+			WispRootID: fallbackRootID,
+			BeadToHook: beadID, // Hook the BASE bead (lifecycle fix: wisp is attached_molecule)
+		}, nil
 	}
-	if err := json.Unmarshal(bondOut, &bondResult); err == nil && bondResult.RootID != "" {
-		wispRootID = bondResult.RootID
+	if parsedRootID != "" {
+		wispRootID = parsedRootID
 	}
 
 	return &FormulaOnBeadResult{
@@ -661,15 +768,148 @@ func InstantiateFormulaOnBead(formulaName, beadID, title, hookWorkDir, townRoot 
 	}, nil
 }
 
+// bondFormulaDirect retries formula attachment using direct formula->bead bond.
+// Newer bd versions support this polymorphic path even when legacy wisp->bead
+// bonding fails with "not found" for the generated wisp ID.
+func bondFormulaDirect(formulaName, beadID, formulaWorkDir, townRoot string, vars []string) (string, error) {
+	bondArgs := []string{"mol", "bond", formulaName, beadID, "--json", "--ephemeral"}
+	for _, variable := range vars {
+		bondArgs = append(bondArgs, "--var", variable)
+	}
+	bondOut, err := BdCmd(bondArgs...).
+		Dir(formulaWorkDir).
+		WithAutoCommit().
+		WithGTRoot(townRoot).
+		Output()
+	if err != nil {
+		return "", fmt.Errorf("%w (args: %s)", err, strings.Join(bondArgs, " "))
+	}
+
+	rootID := parseBondSpawnRootID(bondOut, formulaName, beadID, "")
+	if rootID == "" {
+		return "", fmt.Errorf("direct bond output missing spawned root id (output: %s)", trimJSONForError(bondOut))
+	}
+	return rootID, nil
+}
+
+// parseBondSpawnRootID extracts the spawned molecule root from bd mol bond JSON.
+// Handles both legacy output (root_id) and polymorphic output (result_id + id_mapping).
+func parseBondSpawnRootID(bondOut []byte, formulaName, beadID, fallbackID string) string {
+	rootID, _ := parseBondSpawnRootIDWithStatus(bondOut, formulaName, beadID, fallbackID)
+	return rootID
+}
+
+func parseBondSpawnRootIDWithStatus(bondOut []byte, formulaName, beadID, fallbackID string) (string, bool) {
+	var bondResult struct {
+		RootID    string            `json:"root_id"`
+		ResultID  string            `json:"result_id"`
+		NewEpicID string            `json:"new_epic_id"`
+		IDMapping map[string]string `json:"id_mapping"`
+	}
+	if err := json.Unmarshal(bondOut, &bondResult); err != nil {
+		return fallbackID, false
+	}
+
+	if len(bondResult.IDMapping) > 0 {
+		if mappedID := bondResult.IDMapping[formulaName]; mappedID != "" {
+			return mappedID, true
+		}
+		if !strings.HasPrefix(formulaName, "mol-") {
+			if mappedID := bondResult.IDMapping["mol-"+formulaName]; mappedID != "" {
+				return mappedID, true
+			}
+		}
+	}
+
+	for _, candidate := range []string{bondResult.RootID, bondResult.ResultID, bondResult.NewEpicID} {
+		if candidate != "" && candidate != beadID {
+			return candidate, true
+		}
+	}
+	return fallbackID, true
+}
+
+// ensureFormulaRequiredVars appends missing required vars for formulas that enforce
+// strict var presence on direct bond paths.
+func ensureFormulaRequiredVars(formulaName string, vars []string) []string {
+	// Currently only mol-polecat-work has strict required vars on bond.
+	if formulaName != "mol-polecat-work" && formulaName != "polecat-work" {
+		return vars
+	}
+
+	seen := make(map[string]bool, len(vars))
+	for _, variable := range vars {
+		if eq := strings.Index(variable, "="); eq > 0 {
+			seen[variable[:eq]] = true
+		}
+	}
+
+	requiredDefaults := []struct {
+		Key   string
+		Value string
+	}{
+		{"base_branch", "main"},
+		{"setup_command", ""},
+		{"typecheck_command", ""},
+		{"lint_command", ""},
+		{"test_command", "go test ./..."},
+		{"build_command", ""},
+	}
+	for _, item := range requiredDefaults {
+		if !seen[item.Key] {
+			vars = append(vars, item.Key+"="+item.Value)
+		}
+	}
+	return vars
+}
+
 // CookFormula cooks a formula to ensure its proto exists.
 // This is useful for batch mode where we cook once before processing multiple beads.
 // townRoot is required for GT_ROOT so bd can find town-level formulas.
+// Falls back to embedded formula extraction if bd can't find the formula on disk.
 func CookFormula(formulaName, workDir, townRoot string) error {
-	cookCmd := exec.Command("bd", "cook", formulaName)
-	cookCmd.Dir = workDir
-	cookCmd.Env = append(os.Environ(), "GT_ROOT="+townRoot)
-	cookCmd.Stderr = os.Stderr
-	return cookCmd.Run()
+	err := BdCmd("cook", formulaName).
+		Dir(workDir).
+		WithGTRoot(townRoot).
+		Run()
+	if err == nil {
+		return nil
+	}
+	// Retry with embedded formula extracted to temp file
+	resolved, cleanup := resolveFormulaToTempFile(formulaName)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if resolved == formulaName {
+		return err // No embedded fallback available
+	}
+	return BdCmd("cook", resolved).
+		Dir(workDir).
+		WithGTRoot(townRoot).
+		Run()
+}
+
+// resolveFormulaToTempFile extracts an embedded formula to a temp file.
+// Returns the temp file path and a cleanup function, or the original name
+// if extraction fails. Used as a fallback when bd can't find the formula on disk.
+func resolveFormulaToTempFile(formulaName string) (resolved string, cleanup func()) {
+	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+	if err != nil {
+		return formulaName, nil
+	}
+
+	tmpFile, err := os.CreateTemp("", "gt-formula-*.formula.toml")
+	if err != nil {
+		return formulaName, nil
+	}
+	if _, err := tmpFile.Write(content); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return formulaName, nil
+	}
+	tmpFile.Close()
+
+	return tmpFile.Name(), func() { os.Remove(tmpFile.Name()) }
 }
 
 // isHookedAgentDeadFn is a seam for tests. Production uses isHookedAgentDead.
@@ -704,10 +944,10 @@ func hookBeadWithRetry(beadID, targetAgent, hookDir string) error {
 
 	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		hookCmd := exec.Command("bd", "update", beadID, "--status=hooked", "--assignee="+targetAgent)
-		hookCmd.Dir = hookDir
-		hookCmd.Stderr = os.Stderr
-		if err := hookCmd.Run(); err != nil {
+		err := BdCmd("update", beadID, "--status=hooked", "--assignee="+targetAgent).
+			Dir(hookDir).
+			Run()
+		if err != nil {
 			lastErr = err
 			// Fail fast on config/init errors — retrying won't help (gt-2ra)
 			if isSlingConfigError(err) {
@@ -836,4 +1076,30 @@ func shouldAcceptPermissionWarning(agentName string) bool {
 		return false
 	}
 	return preset.EmitsPermissionWarning
+}
+
+// updateAgentMode updates the mode field on the agent bead.
+// This is needed so the stuck detector can read the mode from agent fields
+// and apply appropriate thresholds (ralphcats get longer leash).
+func updateAgentMode(agentID, mode, workDir, townBeadsDir string) {
+	_ = townBeadsDir // Not used - BEADS_DIR breaks redirect mechanism
+
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		return
+	}
+	if workDir == "" {
+		workDir = townRoot
+	}
+
+	agentBeadID := agentIDToBeadID(agentID, townRoot)
+	if agentBeadID == "" {
+		return
+	}
+
+	agentWorkDir := beads.ResolveHookDir(townRoot, agentBeadID, workDir)
+	bd := beads.New(agentWorkDir)
+	if err := bd.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{Mode: &mode}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: couldn't set agent %s mode: %v\n", agentBeadID, err)
+	}
 }

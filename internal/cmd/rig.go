@@ -2,12 +2,12 @@
 package cmd
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -294,6 +294,7 @@ var (
 	rigAddPrefix       string
 	rigAddLocalRepo    string
 	rigAddBranch       string
+	rigAddPushURL      string
 	rigAddAdopt        bool
 	rigAddAdoptURL     string
 	rigAddAdoptForce   bool
@@ -352,6 +353,7 @@ func init() {
 	rigAddCmd.Flags().StringVar(&rigAddPrefix, "prefix", "", "Beads issue prefix (default: derived from name)")
 	rigAddCmd.Flags().StringVar(&rigAddLocalRepo, "local-repo", "", "Local repo path to share git objects (optional)")
 	rigAddCmd.Flags().StringVar(&rigAddBranch, "branch", "", "Default branch name (default: auto-detected from remote)")
+	rigAddCmd.Flags().StringVar(&rigAddPushURL, "push-url", "", "Push URL for read-only upstreams (push to fork)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdopt, "adopt", false, "Adopt an existing directory instead of creating new")
 	rigAddCmd.Flags().StringVar(&rigAddAdoptURL, "url", "", "Git remote URL for --adopt (default: auto-detected from origin)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdoptForce, "force", false, "With --adopt, register even if git remote cannot be detected")
@@ -512,12 +514,19 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Local repo: %s\n", rigAddLocalRepo)
 	}
 
+	// Validate push URL if provided
+	rigAddPushURL = strings.TrimSpace(rigAddPushURL)
+	if rigAddPushURL != "" && !isGitRemoteURL(rigAddPushURL) {
+		return fmt.Errorf("invalid push URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddPushURL)
+	}
+
 	startTime := time.Now()
 
 	// Add the rig
 	newRig, err := mgr.AddRig(rig.AddRigOptions{
 		Name:          name,
 		GitURL:        gitURL,
+		PushURL:       rigAddPushURL,
 		BeadsPrefix:   rigAddPrefix,
 		LocalRepo:     rigAddLocalRepo,
 		DefaultBranch: rigAddBranch,
@@ -599,6 +608,49 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// GetRigLED returns the LED indicator for a rig based on session and operational state.
+// Used by both rig list and statusline for consistent indicators:
+//   - 🟢 = both witness and refinery running (fully active)
+//   - 🟡 = one session running (partially active)
+//   - ⚫ = nothing running (stopped)
+//   - 🅿️ = parked (intentionally paused)
+//   - 🛑 = docked (global shutdown)
+func GetRigLED(hasWitness, hasRefinery bool, opState string) string {
+	if hasWitness && hasRefinery {
+		return "🟢"
+	}
+	if hasWitness || hasRefinery {
+		return "🟡"
+	}
+	switch opState {
+	case "PARKED":
+		return "🅿️"
+	case "DOCKED":
+		return "🛑"
+	default:
+		return "⚫"
+	}
+}
+
+// rigStatePriority returns a sort priority for a rig's state.
+// Lower values sort first: active > partial > stopped > parked > docked.
+func rigStatePriority(hasWitness, hasRefinery bool, opState string) int {
+	if hasWitness && hasRefinery {
+		return 0
+	}
+	if hasWitness || hasRefinery {
+		return 1
+	}
+	switch opState {
+	case "PARKED":
+		return 3
+	case "DOCKED":
+		return 4
+	default:
+		return 2
+	}
+}
+
 func runRigList(cmd *cobra.Command, args []string) error {
 	// Find workspace
 	townRoot, err := workspace.FindFromCwdOrError()
@@ -632,6 +684,8 @@ func runRigList(cmd *cobra.Command, args []string) error {
 		Refinery string `json:"refinery"`
 		Polecats int    `json:"polecats"`
 		Crew     int    `json:"crew"`
+		// sorting fields (not exported to JSON)
+		sortPrio int
 	}
 
 	var rigs []rigInfo
@@ -639,11 +693,7 @@ func runRigList(cmd *cobra.Command, args []string) error {
 	for name := range rigsConfig.Rigs {
 		r, err := mgr.GetRig(name)
 		if err != nil {
-			if rigListJSON {
-				rigs = append(rigs, rigInfo{Name: name, Status: "error"})
-			} else {
-				fmt.Printf("  %s %s\n", style.Warning.Render("!"), name)
-			}
+			rigs = append(rigs, rigInfo{Name: name, Status: "error", sortPrio: 99})
 			continue
 		}
 
@@ -671,8 +721,17 @@ func runRigList(cmd *cobra.Command, args []string) error {
 			Refinery: refineryStatus,
 			Polecats: summary.PolecatCount,
 			Crew:     summary.CrewCount,
+			sortPrio: rigStatePriority(witnessRunning, refineryRunning, opState),
 		})
 	}
+
+	// Sort by state priority (active first), then alphabetically
+	sort.Slice(rigs, func(i, j int) bool {
+		if rigs[i].sortPrio != rigs[j].sortPrio {
+			return rigs[i].sortPrio < rigs[j].sortPrio
+		}
+		return rigs[i].Name < rigs[j].Name
+	})
 
 	if rigListJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -687,14 +746,14 @@ func runRigList(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		stateLabel := style.Success.Render(strings.ToUpper(ri.Status))
-		if ri.Status == "parked" {
-			stateLabel = style.Warning.Render("PARKED")
-		} else if ri.Status == "docked" {
-			stateLabel = style.Dim.Render("DOCKED")
+		led := GetRigLED(ri.Witness == "running", ri.Refinery == "running", strings.ToUpper(ri.Status))
+		// 🅿️ needs extra space for alignment
+		space := " "
+		if led == "🅿️" {
+			space = "  "
 		}
 
-		fmt.Printf("  %s  %s\n", style.Bold.Render(ri.Name), stateLabel)
+		fmt.Printf("%s%s%s\n", led, space, style.Bold.Render(ri.Name))
 
 		witnessIcon := style.Dim.Render("○")
 		if ri.Witness == "running" {
@@ -705,9 +764,9 @@ func runRigList(cmd *cobra.Command, args []string) error {
 			refineryIcon = style.Success.Render("●")
 		}
 
-		fmt.Printf("    Witness: %s %s  Refinery: %s %s\n",
+		fmt.Printf("   Witness: %s %s  Refinery: %s %s\n",
 			witnessIcon, ri.Witness, refineryIcon, ri.Refinery)
-		fmt.Printf("    Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
+		fmt.Printf("   Polecats: %d  Crew: %d\n", ri.Polecats, ri.Crew)
 		fmt.Println()
 	}
 
@@ -789,6 +848,12 @@ func runRigRemove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving rigs config: %w", err)
 	}
 
+	// Remove rig from daemon.json patrol config (witness + refinery rigs arrays)
+	if err := config.RemoveRigFromDaemonPatrols(townRoot, name); err != nil {
+		// Non-fatal: daemon will stop spawning for this rig anyway since it's unregistered
+		fmt.Printf("  %s Could not update daemon.json patrols: %v\n", style.Warning.Render("!"), err)
+	}
+
 	// Remove route from routes.jsonl (issue #899)
 	if beadsPrefix != "" {
 		if err := beads.RemoveRoute(townRoot, beadsPrefix+"-"); err != nil {
@@ -834,10 +899,17 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid git URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddAdoptURL)
 	}
 
+	// Validate --push-url if provided
+	rigAddPushURL = strings.TrimSpace(rigAddPushURL)
+	if rigAddPushURL != "" && !isGitRemoteURL(rigAddPushURL) {
+		return fmt.Errorf("invalid push URL %q: expected a remote URL (https://, git@, ssh://, git://)", rigAddPushURL)
+	}
+
 	// Register the existing rig
 	result, err := mgr.RegisterRig(rig.RegisterRigOptions{
 		Name:        name,
 		GitURL:      rigAddAdoptURL,
+		PushURL:     rigAddPushURL,
 		BeadsPrefix: rigAddPrefix,
 		Force:       rigAddAdoptForce,
 	})
@@ -884,9 +956,9 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		}
 		foundBeadsCandidate = true
 
-		// Detect prefix: try dolt backend first, fall back to metadata.json, then issues.jsonl.
-		// With dolt, metadata.json survives clone (dolt/ is gitignored since bd v0.50+).
-		// Try "bd config get issue_prefix", then extract from metadata.json dolt_database name.
+		// Detect prefix from Dolt metadata: try "bd config get issue_prefix" first,
+		// then extract from metadata.json dolt_database name as fallback.
+		// metadata.json survives clone (dolt/ is gitignored since bd v0.50+).
 		prefixDetected := false
 		metadataPath := filepath.Join(beadsDir, "metadata.json")
 		if metaBytes, readErr := os.ReadFile(metadataPath); readErr == nil {
@@ -932,35 +1004,6 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			}
 		}
 
-		// Fall back to issues.jsonl for non-dolt backends or if dolt detection failed
-		if !prefixDetected {
-			jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-			if f, readErr := os.Open(jsonlPath); readErr == nil {
-				scanner := bufio.NewScanner(f)
-				if scanner.Scan() {
-					var issue struct {
-						ID string `json:"id"`
-					}
-					if json.Unmarshal(scanner.Bytes(), &issue) == nil && issue.ID != "" {
-						// Extract prefix: everything before the last "-" segment
-						if lastDash := strings.LastIndex(issue.ID, "-"); lastDash > 0 {
-							detected := issue.ID[:lastDash]
-							if detected != "" && rigAddPrefix != "" {
-								if strings.TrimSuffix(rigAddPrefix, "-") != detected {
-									f.Close()
-									return fmt.Errorf("prefix mismatch: source repo uses '%s' but --prefix '%s' was provided", detected, rigAddPrefix)
-								}
-							}
-							if detected != "" && result.BeadsPrefix == "" {
-								result.BeadsPrefix = detected
-							}
-						}
-					}
-				}
-				f.Close()
-			}
-		}
-
 		// Re-init database if metadata.json is missing or dolt/ directory is missing.
 		// Since bd v0.50+, dolt/ is gitignored and won't exist after clone.
 		// Use mgr.InitBeads() for consistency with the non-adopt path — it handles
@@ -986,7 +1029,7 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 			if prefix == "" {
 				break
 			}
-			if err := mgr.InitBeads(rigPath, prefix); err != nil {
+			if err := mgr.InitBeads(rigPath, prefix, name); err != nil {
 				fmt.Printf("  %s Could not init bd database: %v\n", style.Warning.Render("!"), err)
 			} else {
 				fmt.Printf("  %s Initialized beads database (Dolt)\n", style.Success.Render("✓"))
@@ -998,7 +1041,7 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 	// If no existing .beads/ candidate was found, initialize a fresh database
 	// to match the behavior of the normal (non-adopt) gt rig add path.
 	if !foundBeadsCandidate && result.BeadsPrefix != "" {
-		if err := mgr.InitBeads(rigPath, result.BeadsPrefix); err != nil {
+		if err := mgr.InitBeads(rigPath, result.BeadsPrefix, name); err != nil {
 			fmt.Printf("  %s Could not init beads database: %v\n", style.Warning.Render("!"), err)
 		} else {
 			fmt.Printf("  %s Initialized beads database\n", style.Success.Render("✓"))
@@ -1598,7 +1641,7 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 			displayState := p.State
 			if hasSession && displayState == polecat.StateDone {
 				displayState = polecat.StateWorking
-			} else if !hasSession && displayState.IsActive() {
+			} else if !hasSession && displayState == polecat.StateWorking {
 				displayState = polecat.StateDone
 			}
 

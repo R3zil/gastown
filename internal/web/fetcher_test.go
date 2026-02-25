@@ -1,6 +1,10 @@
 package web
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -431,7 +435,7 @@ func TestNewConvoyHandler_StoresTimeout(t *testing.T) {
 	mock := &MockConvoyFetcher{}
 	timeout := 15 * time.Second
 
-	handler, err := NewConvoyHandler(mock, timeout)
+	handler, err := NewConvoyHandler(mock, timeout, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler: %v", err)
 	}
@@ -443,7 +447,7 @@ func TestNewConvoyHandler_StoresTimeout(t *testing.T) {
 
 func TestNewConvoyHandler_ZeroTimeout(t *testing.T) {
 	mock := &MockConvoyFetcher{}
-	handler, err := NewConvoyHandler(mock, 0)
+	handler, err := NewConvoyHandler(mock, 0, "test-token")
 	if err != nil {
 		t.Fatalf("NewConvoyHandler: %v", err)
 	}
@@ -459,7 +463,7 @@ func TestNewAPIHandler_StoresTimeouts(t *testing.T) {
 	defTimeout := 45 * time.Second
 	maxTimeout := 90 * time.Second
 
-	handler := NewAPIHandler(defTimeout, maxTimeout)
+	handler := NewAPIHandler(defTimeout, maxTimeout, "test-token")
 	if handler.defaultRunTimeout != defTimeout {
 		t.Errorf("defaultRunTimeout = %v, want %v", handler.defaultRunTimeout, defTimeout)
 	}
@@ -478,5 +482,78 @@ func TestNewDashboardMux_NilConfig(t *testing.T) {
 	}
 	if mux == nil {
 		t.Fatal("NewDashboardMux returned nil handler")
+	}
+}
+
+func TestRunCmd_SuccessAndTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	out, err := runCmd(500*time.Millisecond, "sh", "-c", "printf 'ok'")
+	if err != nil {
+		t.Fatalf("runCmd success case failed: %v", err)
+	}
+	if got := strings.TrimSpace(out.String()); got != "ok" {
+		t.Fatalf("runCmd output = %q, want %q", got, "ok")
+	}
+
+	_, err = runCmd(30*time.Millisecond, "sh", "-c", "sleep 1")
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout error, got: %v", err)
+	}
+}
+
+func TestRunBdCmd_ReturnsStdoutOnNonZeroAndTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+case "$1" in
+  warn)
+    echo "partial output"
+    exit 1
+    ;;
+  sleep)
+    sleep 1
+    exit 0
+    ;;
+  *)
+    echo "ok"
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	f := &LiveConvoyFetcher{cmdTimeout: 2 * time.Second}
+
+	// Non-zero exit with stdout should return stdout and nil error.
+	stdout, err := f.runBdCmd(t.TempDir(), "warn")
+	if err != nil {
+		t.Fatalf("runBdCmd warn returned error: %v", err)
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "partial output" {
+		t.Fatalf("runBdCmd warn output = %q, want %q", got, "partial output")
+	}
+
+	// Timeout path should return explicit timeout error.
+	f.cmdTimeout = 20 * time.Millisecond
+	_, err = f.runBdCmd(t.TempDir(), "sleep")
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout error, got: %v", err)
 	}
 }

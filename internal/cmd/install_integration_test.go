@@ -22,9 +22,17 @@ func TestInstallCreatesCorrectStructure(t *testing.T) {
 	// Build gt binary for testing
 	gtBinary := buildGT(t)
 
+	// HOME is overridden for isolation; configure git identity so EnsureDoltIdentity works.
+	env := append(os.Environ(), "HOME="+tmpDir)
+	configureGitIdentity(t, env)
+
+	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
+	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+
 	// Run gt install
 	cmd := exec.Command(gtBinary, "install", hqPath, "--name", "test-town")
-	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	cmd.Env = env
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
@@ -80,9 +88,17 @@ func TestInstallBeadsHasCorrectPrefix(t *testing.T) {
 	// Build gt binary for testing
 	gtBinary := buildGT(t)
 
+	// HOME is overridden for isolation; configure git identity so EnsureDoltIdentity works.
+	env := append(os.Environ(), "HOME="+tmpDir)
+	configureGitIdentity(t, env)
+
+	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
+	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+
 	// Run gt install (includes beads init by default)
 	cmd := exec.Command(gtBinary, "install", hqPath)
-	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	cmd.Env = env
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
@@ -92,11 +108,50 @@ func TestInstallBeadsHasCorrectPrefix(t *testing.T) {
 	beadsDir := filepath.Join(hqPath, ".beads")
 	assertDirExists(t, beadsDir, ".beads/")
 
-	// Verify beads database was initialized (both metadata.json and dolt/ exist with dolt backend)
+	// Verify beads database was initialized: metadata.json present and dolt server
+	// data directory exists. Since bd v0.52.0 server mode, dolt data lives in
+	// .dolt-data/hq/ (centralized) rather than the legacy .beads/dolt/ path.
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 	assertFileExists(t, metadataPath, ".beads/metadata.json")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	assertDirExists(t, doltDir, ".beads/dolt/")
+	doltDataDir := filepath.Join(hqPath, ".dolt-data", "hq")
+	assertDirExists(t, doltDataDir, ".dolt-data/hq/")
+
+	// Verify metadata points to canonical HQ Dolt database, not beads_hq.
+	var metadata struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+	}
+	metadataBytes, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatalf("reading metadata.json: %v", err)
+	}
+	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+		t.Fatalf("parsing metadata.json: %v", err)
+	}
+	if metadata.DoltMode != "server" {
+		t.Errorf("metadata dolt_mode = %q, want %q", metadata.DoltMode, "server")
+	}
+	if metadata.DoltDatabase != "hq" {
+		t.Errorf("metadata dolt_database = %q, want %q", metadata.DoltDatabase, "hq")
+	}
+
+	// Verify top-level config.yaml exists with hq prefix keys.
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	assertFileExists(t, configPath, ".beads/config.yaml")
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("reading config.yaml: %v", err)
+	}
+	configText := string(configBytes)
+	if !strings.Contains(configText, "prefix: hq") {
+		t.Errorf("config.yaml missing prefix: hq, got:\n%s", configText)
+	}
+	if !strings.Contains(configText, "issue-prefix: hq") {
+		t.Errorf("config.yaml missing issue-prefix: hq, got:\n%s", configText)
+	}
+	if !strings.Contains(configText, "sync.mode: dolt-native") {
+		t.Errorf("config.yaml missing sync.mode: dolt-native, got:\n%s", configText)
+	}
 
 	// Verify prefix by running bd config get issue_prefix
 	bdCmd := exec.Command("bd", "config", "get", "issue_prefix")
@@ -290,9 +345,17 @@ func TestInstallFormulasProvisioned(t *testing.T) {
 
 	gtBinary := buildGT(t)
 
+	// HOME is overridden for isolation; configure git identity so EnsureDoltIdentity works.
+	env := append(os.Environ(), "HOME="+tmpDir)
+	configureGitIdentity(t, env)
+
+	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
+	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+
 	// Run gt install (includes beads and formula provisioning)
 	cmd := exec.Command(gtBinary, "install", hqPath)
-	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	cmd.Env = env
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gt install failed: %v\nOutput: %s", err, output)

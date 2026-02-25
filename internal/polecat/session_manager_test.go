@@ -1,15 +1,15 @@
 package polecat
 
 import (
-	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -250,6 +250,8 @@ func TestPolecatStartInjectsFallbackEnvVars(t *testing.T) {
 	polecatName := "Toast"
 	workDir := "/tmp/fake-worktree"
 
+	townRoot := "/tmp/fake-town"
+
 	// The env vars that should be injected via PrependEnv
 	requiredEnvVars := []string{
 		"GT_BRANCH",       // Git branch for nuked-worktree fallback
@@ -257,6 +259,7 @@ func TestPolecatStartInjectsFallbackEnvVars(t *testing.T) {
 		"GT_RIG",          // Rig name (was already there pre-PR)
 		"GT_POLECAT",      // Polecat name (was already there pre-PR)
 		"GT_ROLE",         // Role address (was already there pre-PR)
+		"GT_TOWN_ROOT",    // Town root for FindFromCwdWithFallback after worktree nuke
 	}
 
 	// Verify the env var map includes all required keys
@@ -265,6 +268,7 @@ func TestPolecatStartInjectsFallbackEnvVars(t *testing.T) {
 		"GT_POLECAT":      polecatName,
 		"GT_ROLE":         rigName + "/polecats/" + polecatName,
 		"GT_POLECAT_PATH": workDir,
+		"GT_TOWN_ROOT":    townRoot,
 	}
 
 	// GT_BRANCH is conditionally added (only if CurrentBranch succeeds)
@@ -366,6 +370,138 @@ func TestSessionManager_resolveBeadsDir(t *testing.T) {
 	}
 }
 
+// TestAgentEnvOmitsGTAgent_FallbackRequired verifies that the AgentEnv path
+// used by session_manager.Start does NOT include GT_AGENT when opts.Agent is
+// empty (the default dispatch path). This confirms the session_manager must
+// fall back to runtimeConfig.ResolvedAgent for setting GT_AGENT in the tmux
+// session table.
+//
+// Without the fallback, GT_AGENT is never written to the tmux session table,
+// and the post-startup validation kills the session with:
+//   "GT_AGENT not set in session ... witness patrol will misidentify this polecat"
+//
+// Regression test for the bug introduced in PR #1776 which removed the
+// unconditional runtimeConfig.ResolvedAgent → SetEnvironment("GT_AGENT") logic
+// and replaced it with an AgentEnv-only path that requires opts.Agent to be set.
+func TestAgentEnvOmitsGTAgent_FallbackRequired(t *testing.T) {
+	t.Parallel()
+
+	// Simulate what session_manager.Start calls for each dispatch scenario.
+	cases := []struct {
+		name       string
+		agent      string // opts.Agent value
+		wantGTAgent bool  // whether GT_AGENT should be in AgentEnv output
+	}{
+		{
+			name:       "default dispatch (no --agent flag)",
+			agent:      "",
+			wantGTAgent: false, // fallback needed
+		},
+		{
+			name:       "explicit --agent codex",
+			agent:      "codex",
+			wantGTAgent: true,
+		},
+		{
+			name:       "explicit --agent gemini",
+			agent:      "gemini",
+			wantGTAgent: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := config.AgentEnv(config.AgentEnvConfig{
+				Role:      "polecat",
+				Rig:       "gastown",
+				AgentName: "Toast",
+				TownRoot:  "/tmp/town",
+				Agent:     tc.agent,
+			})
+			_, hasGTAgent := env["GT_AGENT"]
+			if hasGTAgent != tc.wantGTAgent {
+				t.Errorf("AgentEnv(Agent=%q): GT_AGENT present=%v, want %v",
+					tc.agent, hasGTAgent, tc.wantGTAgent)
+			}
+		})
+	}
+}
+
+// TestVerifyStartupNudgeDelivery_IdleAgent tests that verifyStartupNudgeDelivery
+// detects an idle agent (at prompt) and retries the nudge. Uses a real tmux session
+// with a shell prompt that matches the ReadyPromptPrefix.
+func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
+	requireTmux(t)
+
+	tm := tmux.NewTmux()
+	sessionName := "gt-test-nudge-verify-" + t.Name()
+
+	// Create a tmux session with a shell
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+
+	// Configure the shell to show the Claude prompt prefix, simulating an idle agent.
+	// The prompt "❯ " is what Claude Code shows when idle.
+	time.Sleep(300 * time.Millisecond) // Let shell initialize
+	_ = tm.SendKeys(sessionName, "export PS1='❯ '")
+	time.Sleep(300 * time.Millisecond)
+
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	m := NewSessionManager(tm, r)
+
+	rc := &config.RuntimeConfig{
+		Tmux: &config.RuntimeTmuxConfig{
+			ReadyPromptPrefix: "❯ ",
+		},
+	}
+
+	// IsAtPrompt should detect the idle prompt
+	if !tm.IsAtPrompt(sessionName, rc) {
+		t.Log("Warning: prompt not detected (tmux timing); skipping idle verification")
+		t.Skip("prompt detection unreliable in test environment")
+	}
+
+	// verifyStartupNudgeDelivery should detect idle state and retry.
+	// We can't easily assert the retry happened, but we verify it doesn't panic/hang.
+	// Use a goroutine with timeout to prevent test hanging.
+	done := make(chan struct{})
+	go func() {
+		m.verifyStartupNudgeDelivery(sessionName, rc)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - function completed
+	case <-time.After(30 * time.Second):
+		t.Fatal("verifyStartupNudgeDelivery hung (exceeded 30s timeout)")
+	}
+}
+
+// TestVerifyStartupNudgeDelivery_NilConfig verifies that verifyStartupNudgeDelivery
+// exits immediately when runtime config has no prompt detection.
+func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
+	requireTmux(t)
+
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	// Should return immediately without error for nil config
+	m.verifyStartupNudgeDelivery("nonexistent-session", nil)
+
+	// And for config without prompt prefix
+	rc := &config.RuntimeConfig{
+		Tmux: &config.RuntimeTmuxConfig{
+			ReadyPromptPrefix: "",
+			ReadyDelayMs:      1000,
+		},
+	}
+	m.verifyStartupNudgeDelivery("nonexistent-session", rc)
+}
+
 func TestValidateSessionName(t *testing.T) {
 	// Register prefixes so validateSessionName can resolve them correctly.
 	reg := session.NewPrefixRegistry()
@@ -421,127 +557,4 @@ func TestValidateSessionName(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestHasValidWorktree(t *testing.T) {
-	root := t.TempDir()
-
-	tests := []struct {
-		name  string
-		setup func(dir string)
-		want  bool
-	}{
-		{
-			name:  "missing directory → false",
-			setup: func(dir string) {},
-			want:  false,
-		},
-		{
-			name: "directory exists but no .git → false",
-			setup: func(dir string) {
-				_ = os.MkdirAll(dir, 0755)
-			},
-			want: false,
-		},
-		{
-			name: "directory with .git file (worktree) → true",
-			setup: func(dir string) {
-				_ = os.MkdirAll(dir, 0755)
-				_ = os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: ../../.git/worktrees/foo"), 0644)
-			},
-			want: true,
-		},
-		{
-			name: "directory with .git directory (regular clone) → true",
-			setup: func(dir string) {
-				_ = os.MkdirAll(filepath.Join(dir, ".git"), 0755)
-			},
-			want: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := filepath.Join(root, "test-worktree-"+tc.name)
-			tc.setup(dir)
-			got := HasValidWorktree(dir)
-			if got != tc.want {
-				t.Errorf("hasValidWorktree(%q) = %v, want %v", dir, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestWorktreeStateClassification verifies the filesystem-level worktree
-// validation used by Start()'s session state classification. The tmux-dependent
-// paths (IsAgentAlive, GetPaneID, KillSessionWithProcesses) require a live
-// session and are not covered here.
-func TestWorktreeStateClassification(t *testing.T) {
-	root := t.TempDir()
-	r := &rig.Rig{Name: "gastown", Path: root}
-	m := NewSessionManager(tmux.NewTmux(), r)
-
-	// State: stale — worktree has no .git
-	t.Run("stale: no .git in worktree", func(t *testing.T) {
-		dir := filepath.Join(root, "stale-wt")
-		_ = os.MkdirAll(dir, 0755)
-		if HasValidWorktree(dir) {
-			t.Error("stale session should not have valid worktree (no .git)")
-		}
-	})
-
-	// State: zombie — directory doesn't exist
-	t.Run("zombie: worktree directory missing", func(t *testing.T) {
-		dir := filepath.Join(root, "nonexistent-wt")
-		if HasValidWorktree(dir) {
-			t.Error("zombie session should not have valid worktree (missing dir)")
-		}
-	})
-
-	// State: reusable — worktree with .git file
-	t.Run("reusable: valid worktree", func(t *testing.T) {
-		dir := filepath.Join(root, "valid-wt")
-		_ = os.MkdirAll(dir, 0755)
-		_ = os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: ../../../.git/worktrees/foo"), 0644)
-		if !HasValidWorktree(dir) {
-			t.Error("reusable session should have valid worktree")
-		}
-	})
-
-	// State: reusable with opts.WorkDir — custom path respected
-	t.Run("reusable: opts.WorkDir overrides clonePath", func(t *testing.T) {
-		customDir := filepath.Join(root, "custom-workdir")
-		_ = os.MkdirAll(customDir, 0755)
-		_ = os.WriteFile(filepath.Join(customDir, ".git"), []byte("gitdir: ../../.git/worktrees/custom"), 0644)
-		// hasValidWorktree should use customDir, not m.clonePath("somepolecat")
-		if !HasValidWorktree(customDir) {
-			t.Error("custom WorkDir with .git should be recognized as valid worktree")
-		}
-		// Verify clonePath for the same polecat is different (sanity check)
-		cloned := m.clonePath("somepolecat")
-		if cloned == customDir {
-			t.Error("test assumption violated: clonePath should differ from customDir")
-		}
-	})
-
-	// ErrSessionReused is exported and distinguishable from nil
-	t.Run("ErrSessionReused is non-nil and distinct", func(t *testing.T) {
-		if ErrSessionReused == nil {
-			t.Error("ErrSessionReused must be non-nil")
-		}
-		if ErrSessionReused == ErrSessionRunning {
-			t.Error("ErrSessionReused must differ from ErrSessionRunning")
-		}
-	})
-
-	// ErrSessionReused works with errors.Is (callers must use errors.Is)
-	t.Run("ErrSessionReused works with errors.Is", func(t *testing.T) {
-		if !errors.Is(ErrSessionReused, ErrSessionReused) {
-			t.Error("errors.Is(ErrSessionReused, ErrSessionReused) must be true")
-		}
-		wrapped := fmt.Errorf("context: %w", ErrSessionReused)
-		if !errors.Is(wrapped, ErrSessionReused) {
-			t.Error("errors.Is must match wrapped ErrSessionReused")
-		}
-	})
 }

@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // =============================================================================
@@ -397,9 +399,6 @@ func TestEnsureMetadata_Rig(t *testing.T) {
 	}
 	if metadata["dolt_database"] != "myrig" {
 		t.Errorf("dolt_database = %v, want myrig", metadata["dolt_database"])
-	}
-	if metadata["jsonl_export"] != "issues.jsonl" {
-		t.Errorf("jsonl_export = %v, want issues.jsonl", metadata["jsonl_export"])
 	}
 }
 
@@ -1599,8 +1598,8 @@ func TestDefaultConfig_MaxConnections(t *testing.T) {
 	if config.MaxConnections != DefaultMaxConnections {
 		t.Errorf("MaxConnections = %d, want %d", config.MaxConnections, DefaultMaxConnections)
 	}
-	if config.MaxConnections != 50 {
-		t.Errorf("DefaultMaxConnections = %d, want 50", config.MaxConnections)
+	if config.MaxConnections != 200 {
+		t.Errorf("DefaultMaxConnections = %d, want 200", config.MaxConnections)
 	}
 }
 
@@ -1767,51 +1766,6 @@ func TestEnsureMetadata_CreatesBeadsDir(t *testing.T) {
 	}
 }
 
-func TestEnsureMetadata_CorrectsStaleJSONLExport(t *testing.T) {
-	townRoot := t.TempDir()
-
-	beadsDir := filepath.Join(townRoot, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Simulate a stale jsonl_export value left by a historical migration
-	existing := map[string]interface{}{"jsonl_export": "beads.jsonl"}
-	data, _ := json.Marshal(existing)
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := EnsureMetadata(townRoot, "hq"); err != nil {
-		t.Fatalf("EnsureMetadata failed: %v", err)
-	}
-
-	updated, _ := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
-	var meta map[string]interface{}
-	json.Unmarshal(updated, &meta)
-	if meta["jsonl_export"] != "issues.jsonl" {
-		t.Errorf("jsonl_export = %v, want issues.jsonl (stale value should be corrected)", meta["jsonl_export"])
-	}
-}
-
-func TestEnsureMetadata_SetsDefaultJSONLExport(t *testing.T) {
-	townRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := EnsureMetadata(townRoot, "hq"); err != nil {
-		t.Fatalf("EnsureMetadata failed: %v", err)
-	}
-
-	data, _ := os.ReadFile(filepath.Join(townRoot, ".beads", "metadata.json"))
-	var meta map[string]interface{}
-	json.Unmarshal(data, &meta)
-	if meta["jsonl_export"] != "issues.jsonl" {
-		t.Errorf("jsonl_export = %v, want issues.jsonl", meta["jsonl_export"])
-	}
-}
-
 // =============================================================================
 // InitRig validation tests
 // =============================================================================
@@ -1834,6 +1788,44 @@ func TestInitRig_InvalidCharacters(t *testing.T) {
 	}
 }
 
+
+// =============================================================================
+// Catalog race condition tests (isDoltRetryableError coverage)
+// =============================================================================
+
+func TestIsDoltRetryableError_CatalogRace(t *testing.T) {
+	// After CREATE DATABASE, the Dolt server may not immediately make the
+	// database visible in its in-memory catalog. Subsequent USE queries
+	// fail with "Unknown database '<name>'". This must be retryable so that
+	// doltSQLWithRetry and doltSQLScriptWithRetry handle the race gracefully.
+	catalogErrors := []string{
+		"Unknown database 'myrig'",
+		"Unknown database 'wl_commons'",
+		"exit status 1 (output: Unknown database 'newrig')",
+	}
+	for _, msg := range catalogErrors {
+		err := fmt.Errorf("%s", msg)
+		if !isDoltRetryableError(err) {
+			t.Errorf("isDoltRetryableError(%q) = false, want true (catalog race)", msg)
+		}
+	}
+}
+
+func TestWaitForCatalog_NoServer(t *testing.T) {
+	// When no Dolt server is running, waitForCatalog should fail immediately
+	// (not retry) because the error is non-retryable (not a catalog race).
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	err := waitForCatalog(townRoot, "testdb")
+	if err == nil {
+		t.Fatal("expected error when no server is running")
+	}
+	if !strings.Contains(err.Error(), "non-retryable") {
+		t.Errorf("expected non-retryable error, got: %v", err)
+	}
+}
 
 // =============================================================================
 // ListDatabases edge cases
@@ -2131,23 +2123,6 @@ func TestMoveDir_SourceNotExists(t *testing.T) {
 // Branch name validation tests (SQL injection prevention)
 // =============================================================================
 
-func TestValidateBranchName_ValidNames(t *testing.T) {
-	valid := []string{
-		"main",
-		"polecat-furiosa-1707400000",
-		"feature/my-branch",
-		"release-v1.2.3",
-		"my_branch",
-		"UPPER-case",
-		"a",
-	}
-	for _, name := range valid {
-		if err := validateBranchName(name); err != nil {
-			t.Errorf("validateBranchName(%q) = %v, want nil", name, err)
-		}
-	}
-}
-
 // =============================================================================
 // DatabaseExists tests
 // =============================================================================
@@ -2429,6 +2404,8 @@ func TestIsDoltRetryableError_IncludesReadOnly(t *testing.T) {
 		{"serialization failure", true},
 		{"lock wait timeout exceeded", true},
 		{"try restarting transaction", true},
+		{"Unknown database 'myrig'", true},
+		{"database not found", false},
 		{"connection refused", false},
 		{"table not found", false},
 	}
@@ -2452,26 +2429,6 @@ func TestRecoverReadOnly_NoServer(t *testing.T) {
 	// Should succeed (no-op) since no server means no read-only state detectable
 	if err != nil {
 		t.Errorf("RecoverReadOnly with no server: got error %v, want nil", err)
-	}
-}
-
-func TestValidateBranchName_InvalidNames(t *testing.T) {
-	invalid := []string{
-		"",                          // empty
-		"branch'name",               // single quote (SQL injection)
-		"branch;DROP TABLE",         // semicolon
-		"branch name",               // space
-		"branch\tname",              // tab
-		"$(command)",                // command substitution
-		"branch`cmd`",               // backtick
-		"branch\"name",              // double quote
-		"branch\\name",              // backslash
-		"'); DROP TABLE issues; --", // classic SQL injection
-	}
-	for _, name := range invalid {
-		if err := validateBranchName(name); err == nil {
-			t.Errorf("validateBranchName(%q) = nil, want error", name)
-		}
 	}
 }
 
@@ -2521,45 +2478,12 @@ func TestDoltSQLScriptWithRetry_NonRetryableError(t *testing.T) {
 		"serialization failure",
 		"lock wait timeout",
 		"try restarting transaction",
+		"Unknown database 'myrig'",
 	}
 	for _, msg := range retryable {
 		if !isDoltRetryableError(fmt.Errorf("%s", msg)) {
 			t.Errorf("isDoltRetryableError(%q) = false, want true", msg)
 		}
-	}
-}
-
-// =============================================================================
-// MergePolecatBranch script generation tests
-// =============================================================================
-
-func TestMergePolecatBranch_NoBranchDeleteInScripts(t *testing.T) {
-	// Verify that MergePolecatBranch's SQL scripts don't contain DOLT_BRANCH('-D').
-	// Branch deletion must happen AFTER successful merge, not inside the scripts,
-	// to prevent branch loss if the merge script fails partway through.
-	//
-	// We can't run the actual merge (requires dolt server), but we can verify
-	// the function validates branch names correctly — invalid names are rejected
-	// before any script is generated.
-	err := MergePolecatBranch(t.TempDir(), "testrig", "'; DROP TABLE --")
-	if err == nil {
-		t.Error("expected error for SQL injection branch name")
-	}
-	if !strings.Contains(err.Error(), "invalid") {
-		t.Errorf("expected 'invalid' in error, got: %v", err)
-	}
-}
-
-func TestMergePolecatBranch_ValidBranchName(t *testing.T) {
-	// Verify that valid branch names pass validation (function will fail
-	// later at the dolt execution step, but validation should pass).
-	err := MergePolecatBranch(t.TempDir(), "testrig", "polecat-alpha-123")
-	if err == nil {
-		t.Skip("dolt server available — merge unexpectedly succeeded")
-	}
-	// Should NOT be a validation error
-	if strings.Contains(err.Error(), "invalid") {
-		t.Errorf("valid branch name rejected: %v", err)
 	}
 }
 
@@ -2826,7 +2750,6 @@ func setupRigMetadata(t *testing.T, townRoot, rigName, doltDatabase string) {
 		"backend":       "dolt",
 		"dolt_mode":     "server",
 		"dolt_database": doltDatabase,
-		"jsonl_export":  "issues.jsonl",
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {
@@ -3436,3 +3359,148 @@ func TestBuildDoltSQLCmd_RemoteNoPassword(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// WaitForReady tests (gt-zou1n)
+// =============================================================================
+
+func TestWaitForReady_NoServerConfigured(t *testing.T) {
+	// When no server mode metadata exists, WaitForReady should return nil
+	// immediately (nothing to wait for).
+	townRoot := t.TempDir()
+
+	err := WaitForReady(townRoot, 1*time.Second)
+	if err != nil {
+		t.Errorf("WaitForReady should succeed when no server configured, got: %v", err)
+	}
+}
+
+func TestWaitForReady_ServerAlreadyListening(t *testing.T) {
+	// Start a TCP listener, then verify WaitForReady succeeds quickly.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start listener: %v", err)
+	}
+	defer listener.Close()
+
+	// Extract the port from the listener
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	// Create a town root with server mode metadata pointing to this port
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := fmt.Sprintf(`{"backend":"dolt","dolt_mode":"server","port":%d}`, port)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Override port via env var so DefaultConfig picks it up
+	t.Setenv("GT_DOLT_PORT", fmt.Sprintf("%d", port))
+
+	start := time.Now()
+	err = WaitForReady(townRoot, 5*time.Second)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("WaitForReady should succeed when server is listening, got: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("WaitForReady took %v, should complete quickly when server is ready", elapsed)
+	}
+}
+
+func TestWaitForReady_TimeoutWhenNoServer(t *testing.T) {
+	// When server mode is configured but nothing is listening, WaitForReady
+	// should return an error after timeout.
+
+	// Find a free port, then immediately close to guarantee nothing is listening.
+	tmpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	port := tmpListener.Addr().(*net.TCPAddr).Port
+	tmpListener.Close()
+
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := fmt.Sprintf(`{"backend":"dolt","dolt_mode":"server","port":%d}`, port)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_DOLT_PORT", fmt.Sprintf("%d", port))
+
+	start := time.Now()
+	err = WaitForReady(townRoot, 500*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Error("WaitForReady should return error when server not reachable within timeout")
+	}
+	if elapsed < 400*time.Millisecond {
+		t.Errorf("WaitForReady returned too quickly (%v), should wait at least close to timeout", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("WaitForReady took %v, should not exceed timeout by much", elapsed)
+	}
+}
+
+func TestWaitForReady_ServerBecomesReady(t *testing.T) {
+	// Simulate the race: start WaitForReady, then start a listener after a delay.
+	// WaitForReady should eventually succeed.
+
+	// Find a free port first
+	tmpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	port := tmpListener.Addr().(*net.TCPAddr).Port
+	tmpListener.Close() // Free the port
+
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := fmt.Sprintf(`{"backend":"dolt","dolt_mode":"server","port":%d}`, port)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GT_DOLT_PORT", fmt.Sprintf("%d", port))
+
+	// Start the listener after 300ms delay. Use a done channel to
+	// synchronize goroutine lifetime with test lifecycle. (review finding #3)
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			return // Port may be taken (TOCTOU), test will timeout
+		}
+		defer listener.Close()
+		<-done
+	}()
+
+	start := time.Now()
+	err = WaitForReady(townRoot, 5*time.Second)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("WaitForReady should succeed after server starts, got: %v", err)
+	}
+	// Should take at least 300ms (delay before server starts) but not too long
+	if elapsed < 200*time.Millisecond {
+		t.Errorf("WaitForReady completed too quickly (%v), server shouldn't be ready yet", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("WaitForReady took too long (%v), should succeed shortly after server starts", elapsed)
+	}
+}
+

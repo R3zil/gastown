@@ -31,6 +31,11 @@ const (
 	AgentOpenCode AgentPreset = "opencode"
 	// AgentCopilot is GitHub Copilot CLI.
 	AgentCopilot AgentPreset = "copilot"
+	// AgentPi is Pi Coding Agent (extension-based lifecycle).
+	AgentPi AgentPreset = "pi"
+	// AgentOmp is Oh My Pi (OMP) — Pi fork with hook-based lifecycle.
+	// Inspired by github.com/ProbabilityEngineer/pi-mono gastown integration.
+	AgentOmp AgentPreset = "omp"
 )
 
 // AgentPresetInfo contains the configuration details for an agent preset.
@@ -61,10 +66,15 @@ type AgentPresetInfo struct {
 	// Used for resuming sessions across restarts.
 	SessionIDEnv string `json:"session_id_env,omitempty"`
 
-	// ResumeFlag is the flag/subcommand for resuming sessions.
+	// ResumeFlag is the flag/subcommand for resuming a specific session.
 	// For claude/gemini: "--resume"
 	// For codex: "resume" (subcommand)
 	ResumeFlag string `json:"resume_flag,omitempty"`
+
+	// ContinueFlag is the flag for auto-resuming the most recent session.
+	// For claude: "--continue" (--resume without args opens interactive picker)
+	// If empty, --resume without a session ID is rejected with a clear error.
+	ContinueFlag string `json:"continue_flag,omitempty"`
 
 	// ResumeStyle indicates how to invoke resume:
 	// "flag" - pass as --resume <id> argument
@@ -159,6 +169,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ProcessNames:        []string{"node", "claude"}, // Claude runs as Node.js
 		SessionIDEnv:        "CLAUDE_SESSION_ID",
 		ResumeFlag:          "--resume",
+		ContinueFlag:        "--continue",
 		ResumeStyle:         "flag",
 		SupportsHooks:       true,
 		SupportsForkSession: true,
@@ -314,6 +325,43 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ReadyDelayMs:       5000,
 		InstructionsFile:   "AGENTS.md",
 	},
+	AgentPi: {
+		Name:                AgentPi,
+		Command:             "pi",
+		Args:                []string{"-e", ".pi/extensions/gastown-hooks.js"},
+		ProcessNames:        []string{"pi", "node", "bun"}, // Pi runs as Node.js
+		SessionIDEnv:        "PI_SESSION_ID",
+		ResumeFlag:          "",    // No resume support yet
+		ResumeStyle:         "",
+		SupportsHooks:       true,  // Uses .pi/extensions/gastown-hooks.js
+		HooksProvider:       "pi",
+		HooksDir:            ".pi/extensions",
+		HooksSettingsFile:   "gastown-hooks.js",
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			PromptFlag: "-p",
+			OutputFlag: "--no-session",
+		},
+		// Pi's Node.js TUI takes several seconds to initialize before it can
+		// receive tmux input. Without a readiness delay, the startup nudge
+		// arrives before the TUI is ready and gets dropped silently.
+		ReadyDelayMs: 8000,
+	},
+	AgentOmp: {
+		Name:                AgentOmp,
+		Command:             "omp",
+		Args:                []string{"--hook", ".omp/hooks/gastown-hook.ts"},
+		ProcessNames:        []string{"omp", "node", "bun"},
+		SessionIDEnv:        "OMP_SESSION_ID",
+		SupportsHooks:       true,
+		HooksProvider:       "omp",
+		HooksDir:            ".omp/hooks",
+		HooksSettingsFile:   "gastown-hook.ts",
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			PromptFlag: "--prompt",
+		},
+	},
 }
 
 // Registry state with proper synchronization.
@@ -343,13 +391,6 @@ func initRegistryLocked() {
 		globalRegistry.Agents[string(name)] = preset
 	}
 	registryInitialized = true
-}
-
-// ensureRegistry ensures the registry is initialized for read operations.
-func ensureRegistry() {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	initRegistryLocked()
 }
 
 // loadAgentRegistryFromPath loads agent definitions from a JSON file and merges with built-ins.
@@ -423,26 +464,26 @@ func LoadRigAgentRegistry(path string) error {
 // GetAgentPreset returns the preset info for a given agent name.
 // Returns nil if the preset is not found.
 func GetAgentPreset(name AgentPreset) *AgentPresetInfo {
-	ensureRegistry()
-	registryMu.RLock()
-	defer registryMu.RUnlock()
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
 	return globalRegistry.Agents[string(name)]
 }
 
 // GetAgentPresetByName returns the preset info by string name.
 // Returns nil if not found, allowing caller to fall back to defaults.
 func GetAgentPresetByName(name string) *AgentPresetInfo {
-	ensureRegistry()
-	registryMu.RLock()
-	defer registryMu.RUnlock()
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
 	return globalRegistry.Agents[name]
 }
 
 // ListAgentPresets returns all known agent preset names.
 func ListAgentPresets() []string {
-	ensureRegistry()
-	registryMu.RLock()
-	defer registryMu.RUnlock()
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
 	names := make([]string, 0, len(globalRegistry.Agents))
 	for name := range globalRegistry.Agents {
 		names = append(names, name)
@@ -548,6 +589,55 @@ func GetProcessNames(agentName string) []string {
 	return info.ProcessNames
 }
 
+// ResolveProcessNames determines the correct process names for liveness detection
+// given an agent name and the actual command binary. This handles custom agents
+// that shadow built-in preset names (e.g., a custom "codex" agent that runs
+// "opencode" instead of the built-in "codex" binary).
+//
+// Resolution order:
+//  1. If agentName matches a built-in preset AND the preset's Command matches
+//     the actual command → use the preset's ProcessNames (no mismatch).
+//  2. Otherwise, find a built-in preset whose Command matches the actual command
+//     and use its ProcessNames (custom agent using a known launcher).
+//  3. Fallback: [command] (fully custom binary).
+func ResolveProcessNames(agentName, command string) []string {
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
+
+	// Normalize command to basename for comparison. Commands may be
+	// path-resolved (e.g., "/home/user/.claude/local/claude" from
+	// resolveClaudePath), but built-in presets store bare names ("claude").
+	// Process matching (processMatchesNames, pgrep) also uses basenames.
+	cmdBase := command
+	if command != "" {
+		cmdBase = filepath.Base(command)
+	}
+
+	// Check if agentName matches a built-in/registered preset with matching command.
+	// Compare against both the raw command and basename to handle registry entries
+	// that store absolute-path commands (e.g., "/opt/bin/my-tool").
+	if info, ok := globalRegistry.Agents[agentName]; ok && len(info.ProcessNames) > 0 {
+		if info.Command == command || info.Command == cmdBase || filepath.Base(info.Command) == cmdBase || cmdBase == "" {
+			return info.ProcessNames
+		}
+	}
+
+	// Agent name doesn't match or command differs — look up by command
+	if cmdBase != "" {
+		for _, info := range globalRegistry.Agents {
+			if (info.Command == command || filepath.Base(info.Command) == cmdBase) && len(info.ProcessNames) > 0 {
+				return info.ProcessNames
+			}
+		}
+		// Unknown command — use the binary basename itself
+		return []string{cmdBase}
+	}
+
+	// No command provided, agent not in registry — Claude defaults
+	return []string{"node", "claude"}
+}
+
 // MergeWithPreset applies preset defaults to a RuntimeConfig.
 // User-specified values take precedence over preset defaults.
 // Returns a new RuntimeConfig without modifying the original.
@@ -580,9 +670,9 @@ func (rc *RuntimeConfig) MergeWithPreset(preset AgentPreset) *RuntimeConfig {
 
 // IsKnownPreset checks if a string is a known agent preset name.
 func IsKnownPreset(name string) bool {
-	ensureRegistry()
-	registryMu.RLock()
-	defer registryMu.RUnlock()
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
 	_, ok := globalRegistry.Agents[name]
 	return ok
 }
@@ -654,6 +744,15 @@ func ResetRegistryForTesting() {
 	globalRegistry = nil
 	loadedPaths = make(map[string]bool)
 	registryInitialized = false
+}
+
+// RegisterAgentForTesting adds a custom agent preset to the registry.
+// The registry is initialized first if needed. Intended for test use only.
+func RegisterAgentForTesting(name string, info AgentPresetInfo) {
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
+	globalRegistry.Agents[name] = &info
 }
 
 // ResetHookInstallersForTesting clears all hook installer registrations.

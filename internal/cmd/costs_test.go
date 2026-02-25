@@ -91,6 +91,52 @@ func TestDeriveSessionName(t *testing.T) {
 			expected: "hq-deacon",
 		},
 		{
+			name: "mayor with stale GT_POLECAT is NOT polecat session",
+			envVars: map[string]string{
+				"GT_ROLE":    "mayor",
+				"GT_RIG":     "gastown",
+				"GT_POLECAT": "toast",
+				"GT_TOWN":    "ai",
+			},
+			expected: "hq-mayor",
+		},
+		{
+			name: "compound witness with stale GT_POLECAT is NOT polecat session",
+			envVars: map[string]string{
+				"GT_ROLE":    "gastown/witness",
+				"GT_RIG":     "gastown",
+				"GT_POLECAT": "toast",
+			},
+			expected: "gt-witness",
+		},
+		{
+			name: "compound refinery with stale GT_POLECAT is NOT polecat session",
+			envVars: map[string]string{
+				"GT_ROLE":    "gastown/refinery",
+				"GT_RIG":     "gastown",
+				"GT_POLECAT": "toast",
+			},
+			expected: "gt-refinery",
+		},
+		{
+			name: "compound crew with stale GT_POLECAT is NOT polecat session",
+			envVars: map[string]string{
+				"GT_ROLE":    "gastown/crew/alice",
+				"GT_RIG":     "gastown",
+				"GT_POLECAT": "toast",
+			},
+			expected: "gt-crew-alice",
+		},
+		{
+			name: "compound polecat role uses GT_POLECAT for session name",
+			envVars: map[string]string{
+				"GT_ROLE":    "gastown/polecats/toast",
+				"GT_RIG":     "gastown",
+				"GT_POLECAT": "toast",
+			},
+			expected: "gt-toast",
+		},
+		{
 			name:     "no env vars",
 			envVars:  map[string]string{},
 			expected: "",
@@ -125,6 +171,34 @@ func TestDeriveSessionName(t *testing.T) {
 				t.Errorf("deriveSessionName() = %q, want %q", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestRunCostsRecord_NoSession_ReturnsNil(t *testing.T) {
+	// Clear all session-related env vars so no session can be derived.
+	envKeys := []string{"GT_SESSION", "GT_ROLE", "GT_RIG", "GT_POLECAT", "GT_CREW", "GT_TOWN"}
+	saved := make(map[string]string)
+	for _, key := range envKeys {
+		saved[key] = os.Getenv(key)
+		os.Unsetenv(key)
+	}
+	defer func() {
+		for key, val := range saved {
+			if val != "" {
+				os.Setenv(key, val)
+			}
+		}
+	}()
+
+	// Clear the flag-based session too
+	oldSession := recordSession
+	recordSession = ""
+	defer func() { recordSession = oldSession }()
+
+	// runCostsRecord should return nil (silent skip) when no session is resolvable
+	err := runCostsRecord(nil, nil)
+	if err != nil {
+		t.Errorf("runCostsRecord() returned error %v, want nil for non-GT session", err)
 	}
 }
 
