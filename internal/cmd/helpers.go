@@ -78,21 +78,7 @@ func isInTmuxSession(targetSession string) bool {
 // isInSameTmuxSocket checks if we're inside a tmux session on the same socket
 // as the current town. Used to decide between switch-client and attach-session.
 func isInSameTmuxSocket() bool {
-	tmuxEnv := os.Getenv("TMUX")
-	if tmuxEnv == "" {
-		return false
-	}
-	// TMUX format: /tmp/tmux-UID/socketname,pid,index
-	// Extract socket name from path
-	parts := strings.SplitN(tmuxEnv, ",", 2)
-	socketPath := parts[0]
-	currentSocket := filepath.Base(socketPath)
-
-	targetSocket := tmux.GetDefaultSocket()
-	if targetSocket == "" {
-		targetSocket = "default"
-	}
-	return currentSocket == targetSocket
+	return tmux.IsInSameSocket()
 }
 
 // attachToTmuxSession attaches to a tmux session.

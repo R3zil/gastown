@@ -1,7 +1,6 @@
 package feed
 
 import (
-	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -610,11 +609,11 @@ func (m *Model) attachToSelected() (tea.Model, tea.Cmd) {
 	// Exit TUI and switch to/attach tmux session
 	m.closeOnce.Do(func() { close(m.done) })
 	var c *exec.Cmd
-	if os.Getenv("TMUX") != "" {
-		// Inside tmux: switch the current client to the target session
+	if tmux.IsInSameSocket() {
+		// Same tmux socket: switch the current client to the target session
 		c = tmux.BuildCommand("switch-client", "-t", agent.SessionID)
 	} else {
-		// Outside tmux: attach to the session
+		// Outside tmux or different socket: attach to the session
 		c = tmux.BuildCommand("attach-session", "-t", agent.SessionID)
 	}
 	return m, tea.Sequence(

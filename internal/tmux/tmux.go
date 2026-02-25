@@ -67,6 +67,25 @@ func SetDefaultSocket(name string) { defaultSocket = name }
 // GetDefaultSocket returns the current default tmux socket name.
 func GetDefaultSocket() string { return defaultSocket }
 
+// IsInSameSocket checks if the current process is inside a tmux session on the
+// same socket as the default town socket. Used to decide between switch-client
+// (same socket) and attach-session (different socket or outside tmux).
+func IsInSameSocket() bool {
+	tmuxEnv := os.Getenv("TMUX")
+	if tmuxEnv == "" {
+		return false
+	}
+	// TMUX format: /tmp/tmux-UID/socketname,pid,index
+	parts := strings.SplitN(tmuxEnv, ",", 2)
+	currentSocket := filepath.Base(parts[0])
+
+	targetSocket := defaultSocket
+	if targetSocket == "" {
+		targetSocket = "default"
+	}
+	return currentSocket == targetSocket
+}
+
 // BuildCommand creates an exec.Cmd for tmux with the default socket applied.
 // Use this instead of exec.Command("tmux", ...) for code outside the Tmux struct.
 func BuildCommand(args ...string) *exec.Cmd {
