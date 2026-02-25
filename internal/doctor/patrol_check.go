@@ -277,8 +277,11 @@ func (c *PatrolNotStuckCheck) checkStuckWispsDolt(rigPath string, rigName string
 
 	r := csv.NewReader(strings.NewReader(string(output)))
 	records, err := r.ReadAll()
-	if err != nil || len(records) < 2 {
-		return nil, nil // No results or parse error
+	if err != nil {
+		return nil, fmt.Errorf("csv parse: %w", err)
+	}
+	if len(records) < 2 {
+		return nil, nil // No results (header only or empty)
 	}
 
 	var stuck []string
