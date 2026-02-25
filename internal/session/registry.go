@@ -112,11 +112,20 @@ func SetDefaultRegistry(r *PrefixRegistry) {
 func InitRegistry(townRoot string) error {
 	var errs []error
 
-	// Set tmux socket from town name for multi-instance isolation.
-	// Each town gets its own tmux server socket, preventing session name collisions.
-	townName, err := workspace.GetTownName(townRoot)
-	if err == nil && townName != "" {
-		tmux.SetDefaultSocket(sanitizeTownName(townName))
+	// Set tmux socket for session discovery.
+	// If we're inside tmux, parse the socket from $TMUX (e.g. /tmp/tmux-501/default,pid,idx)
+	// so we query the same server our session lives on. Otherwise, fall back to the town
+	// name for multi-instance isolation when spawning new tmux servers.
+	if tmuxEnv := os.Getenv("TMUX"); tmuxEnv != "" {
+		// $TMUX format: /path/to/socket,server_pid,session_index
+		if socketPath, _, ok := strings.Cut(tmuxEnv, ","); ok && socketPath != "" {
+			tmux.SetDefaultSocket(filepath.Base(socketPath))
+		}
+	} else {
+		townName, err := workspace.GetTownName(townRoot)
+		if err == nil && townName != "" {
+			tmux.SetDefaultSocket(sanitizeTownName(townName))
+		}
 	}
 
 	r, err := BuildPrefixRegistryFromTown(townRoot)
