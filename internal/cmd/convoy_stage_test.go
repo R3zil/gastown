@@ -1695,17 +1695,17 @@ func TestCreateStagedConvoy_IDFormat(t *testing.T) {
 		t.Fatalf("createStagedConvoy: %v", err)
 	}
 
-	// Convoy ID must be non-empty and follow hq-cv-xxxxx format.
+	// Convoy ID must be non-empty and follow hq-cv-xxxxxxxx format.
 	if convoyID == "" {
 		t.Fatal("convoy ID should not be empty")
 	}
 	if !strings.HasPrefix(convoyID, "hq-cv-") {
 		t.Errorf("convoy ID should start with 'hq-cv-', got %q", convoyID)
 	}
-	// The suffix should be 5 chars.
+	// The suffix should be 8 chars.
 	suffix := strings.TrimPrefix(convoyID, "hq-cv-")
-	if len(suffix) != 5 {
-		t.Errorf("convoy ID suffix should be 5 chars, got %d: %q", len(suffix), suffix)
+	if len(suffix) != 8 {
+		t.Errorf("convoy ID suffix should be 8 chars, got %d: %q", len(suffix), suffix)
 	}
 	// All suffix chars should be lowercase alphanumeric.
 	for _, ch := range suffix {

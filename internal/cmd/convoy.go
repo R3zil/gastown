@@ -27,11 +27,12 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-// generateShortID generates a short random ID (5 lowercase chars).
+// generateShortID generates a collision-resistant convoy suffix.
+// 5 random bytes -> 8 base32 chars (lowercase a-z,2-7).
 func generateShortID() string {
-	b := make([]byte, 3)
+	b := make([]byte, 5)
 	_, _ = rand.Read(b)
-	return strings.ToLower(base32.StdEncoding.EncodeToString(b)[:5])
+	return strings.ToLower(base32.StdEncoding.EncodeToString(b)[:8])
 }
 
 // looksLikeIssueID checks if a string looks like a beads issue ID.
