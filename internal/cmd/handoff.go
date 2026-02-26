@@ -733,7 +733,7 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 		if opts.ContinuePrompt != "" {
 			beacon = opts.ContinuePrompt
 		} else {
-			beacon = "Continue your previous task."
+			beacon = "Your account was rotated to avoid a rate limit. Continue your previous task."
 		}
 	} else {
 		beacon = session.FormatStartupBeacon(session.BeaconConfig{
@@ -779,6 +779,8 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	}
 
 	// Add --continue flag to resume the most recent session.
+	// Note: runtimeCmd starts with the command name (e.g., "claude --settings ..."),
+	// not "exec claude" — the "exec" prefix is added later in the Sprintf.
 	if opts.ContinueSession {
 		runtimeCmd = strings.Replace(runtimeCmd, "claude ", "claude --continue ", 1)
 	}
