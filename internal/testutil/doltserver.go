@@ -107,6 +107,31 @@ func FindFreePort() (int, error) {
 	return port, nil
 }
 
+// EnsureDoltForTestMain starts an ephemeral Dolt server for use in TestMain
+// functions that don't have access to a testing.T. It also sets BEADS_DOLT_PORT
+// so that the beads SDK (which reads this env var in BEADS_TEST_MODE) connects
+// to the ephemeral server instead of the default port 3307.
+//
+// Call CleanupDoltServer() after m.Run() to tear down the server.
+func EnsureDoltForTestMain() error {
+	if _, err := exec.LookPath("dolt"); err != nil {
+		return fmt.Errorf("dolt not installed: %w", err)
+	}
+
+	doltServerOnce.Do(func() {
+		doltServerErr = startDoltServer()
+	})
+
+	if doltServerErr != nil {
+		return fmt.Errorf("dolt server setup: %w", doltServerErr)
+	}
+
+	// Bridge GT_DOLT_PORT → BEADS_DOLT_PORT so the beads SDK connects
+	// to the ephemeral server when BEADS_TEST_MODE=1 is set.
+	os.Setenv("BEADS_DOLT_PORT", doltTestPort) //nolint:tenv // intentional process-wide env
+	return nil
+}
+
 // portReady returns true if the dolt test port is accepting TCP connections.
 func portReady(timeout time.Duration) bool {
 	conn, err := net.DialTimeout("tcp", DoltTestAddr(), timeout)

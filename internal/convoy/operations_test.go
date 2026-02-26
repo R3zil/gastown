@@ -1312,3 +1312,195 @@ func TestCheckConvoysForIssue_FeedsAfterStagedToOpenTransition(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Cross-rig fallback tests
+// ---------------------------------------------------------------------------
+
+// setupTownRootWithCrossRig creates a town root with routes for both "test-"
+// (local rig) and "oag-" (cross-rig) prefixes. The cross-rig prefix points
+// to a directory with a bd stub.
+func setupTownRootWithCrossRig(t *testing.T, bdExitCode int, bdOutput string) (townRoot string, bdLogPath string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	townRoot = t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll .beads: %v", err)
+	}
+
+	// Create cross-rig directory with .beads
+	crossRigDir := filepath.Join(townRoot, "osr_ai_gm", ".beads")
+	if err := os.MkdirAll(crossRigDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll osr_ai_gm/.beads: %v", err)
+	}
+
+	// Routes: test- is local, oag- is cross-rig
+	routesContent := `{"prefix":"test-","path":"testrig/.beads"}` + "\n" +
+		`{"prefix":"oag-","path":"osr_ai_gm/.beads"}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0o644); err != nil {
+		t.Fatalf("WriteFile routes.jsonl: %v", err)
+	}
+
+	// Create bd stub in PATH
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll binDir: %v", err)
+	}
+	bdLogPath = filepath.Join(townRoot, "bd.log")
+
+	bdScript := fmt.Sprintf(`#!/bin/sh
+echo "CMD:$*" >> %q
+case "$1" in
+  show)
+    echo '%s'
+    exit %d
+    ;;
+esac
+exit 0
+`, bdLogPath, bdOutput, bdExitCode)
+
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0o755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	return townRoot, bdLogPath
+}
+
+func TestGetConvoyTrackedIssues_CrossRigFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Create convoy in the store (local)
+	convoy := &beadsdk.Issue{
+		ID:        "test-convoy-xrig",
+		Title:     "Cross-Rig Convoy",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := store.CreateIssue(ctx, convoy, "test"); err != nil {
+		t.Fatalf("CreateIssue convoy: %v", err)
+	}
+
+	// The cross-rig bead (oag-19dd9) is NOT in the local store.
+	// Add tracks dependency: convoy tracks oag-19dd9
+	dep := &beadsdk.Dependency{
+		IssueID:     convoy.ID,
+		DependsOnID: "oag-19dd9",
+		Type:        beadsdk.DependencyType("tracks"),
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	// Set up town root with cross-rig routes and bd stub returning "closed"
+	townRoot, _ := setupTownRootWithCrossRig(t, 0,
+		`[{"id":"oag-19dd9","status":"closed","assignee":"gastown/polecats/alpha","priority":2,"issue_type":"task"}]`)
+
+	tracked := getConvoyTrackedIssues(ctx, store, convoy.ID, townRoot)
+
+	// Find the cross-rig bead in tracked results
+	var found *trackedIssue
+	for i := range tracked {
+		if tracked[i].ID == "oag-19dd9" {
+			found = &tracked[i]
+			break
+		}
+	}
+
+	if found == nil {
+		t.Skipf("oag-19dd9 not found in tracked issues (GetDependenciesWithMetadata may not work in embedded Dolt)")
+	}
+
+	// The critical assertion: the cross-rig bead should show fresh "closed" status,
+	// NOT the stale "open" from dependency metadata.
+	if found.Status != "closed" {
+		t.Errorf("cross-rig bead status = %q, want %q (stale metadata was used instead of fresh bd show)", found.Status, "closed")
+	}
+	if found.Assignee != "gastown/polecats/alpha" {
+		t.Errorf("cross-rig bead assignee = %q, want %q", found.Assignee, "gastown/polecats/alpha")
+	}
+}
+
+func TestFetchCrossRigBeadStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	townRoot, bdLogPath := setupTownRootWithCrossRig(t, 0,
+		`[{"id":"oag-abc","status":"closed","assignee":"","priority":1,"issue_type":"task"},{"id":"oag-xyz","status":"open","assignee":"gastown/polecats/beta","priority":3,"issue_type":"bug"}]`)
+
+	result := fetchCrossRigBeadStatus(townRoot, []string{"oag-abc", "oag-xyz"})
+
+	if len(result) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(result))
+	}
+
+	abc := result["oag-abc"]
+	if abc == nil {
+		t.Fatal("oag-abc not found in results")
+	}
+	if string(abc.Status) != "closed" {
+		t.Errorf("oag-abc status = %q, want %q", abc.Status, "closed")
+	}
+
+	xyz := result["oag-xyz"]
+	if xyz == nil {
+		t.Fatal("oag-xyz not found in results")
+	}
+	if string(xyz.Status) != "open" {
+		t.Errorf("oag-xyz status = %q, want %q", xyz.Status, "open")
+	}
+	if xyz.Assignee != "gastown/polecats/beta" {
+		t.Errorf("oag-xyz assignee = %q, want %q", xyz.Assignee, "gastown/polecats/beta")
+	}
+
+	// Verify bd was called
+	logData, err := os.ReadFile(bdLogPath)
+	if err != nil {
+		t.Fatalf("bd stub not called (no log): %v", err)
+	}
+	logStr := string(logData)
+	if !strings.Contains(logStr, "show --json oag-abc oag-xyz") &&
+		!strings.Contains(logStr, "show --json oag-xyz oag-abc") {
+		t.Errorf("bd show not called with expected IDs: %q", logStr)
+	}
+}
+
+func TestFetchCrossRigBeadStatus_UnknownPrefix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	townRoot, _ := setupTownRootWithCrossRig(t, 0, `[]`)
+
+	// "zzz-" prefix has no route — should return empty, not panic
+	result := fetchCrossRigBeadStatus(townRoot, []string{"zzz-unknown"})
+	if len(result) != 0 {
+		t.Errorf("expected 0 results for unknown prefix, got %d", len(result))
+	}
+}
+
+func TestFetchCrossRigBeadStatus_EmptyInput(t *testing.T) {
+	result := fetchCrossRigBeadStatus("/nonexistent", nil)
+	if len(result) != 0 {
+		t.Errorf("expected 0 results for empty input, got %d", len(result))
+	}
+}

@@ -1,7 +1,6 @@
 package formula
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -87,13 +86,12 @@ func TestPatrolFormulasHaveSquashCycle(t *testing.T) {
 	type patrolFormula struct {
 		name       string
 		loopStepID string
-		molName    string // the formula name used in "bd mol wisp <name>"
 	}
 
 	patrolFormulas := []patrolFormula{
-		{"mol-witness-patrol.formula.toml", "loop-or-exit", "mol-witness-patrol"},
-		{"mol-deacon-patrol.formula.toml", "loop-or-exit", "mol-deacon-patrol"},
-		{"mol-refinery-patrol.formula.toml", "burn-or-loop", "mol-refinery-patrol"},
+		{"mol-witness-patrol.formula.toml", "loop-or-exit"},
+		{"mol-deacon-patrol.formula.toml", "loop-or-exit"},
+		{"mol-refinery-patrol.formula.toml", "burn-or-loop"},
 	}
 
 	for _, pf := range patrolFormulas {
@@ -120,18 +118,16 @@ func TestPatrolFormulasHaveSquashCycle(t *testing.T) {
 				t.Fatalf("%s: %s step not found or has empty description", pf.name, pf.loopStepID)
 			}
 
-			// The loop step must contain all three parts of the cycle:
+			// The loop step must contain all parts of the cycle:
 			// 1. Squash the current wisp (using gt mol squash --jitter to reduce lock contention)
-			// 2. Create a new patrol wisp
-			// 3. Hook/assign the new wisp
+			// 2. Create and hook a new patrol wisp via gt patrol new
 			requiredPatterns := []struct {
 				pattern string
 				reason  string
 			}{
 				{"gt mol squash", "squash current wisp using gt command (not bd) for jitter support"},
 				{"--jitter", "jitter flag required to desynchronize concurrent Dolt lock acquisitions (hq-vytww2)"},
-				{fmt.Sprintf("bd mol wisp %s", pf.molName), "create new patrol wisp for next cycle"},
-				{"--status=hooked", "hook the new wisp so findActivePatrol can find it"},
+				{"gt patrol new", "create and hook new patrol wisp for next cycle"},
 			}
 
 			for _, rp := range requiredPatterns {
@@ -193,5 +189,67 @@ func TestPatrolFormulasHaveWispGC(t *testing.T) {
 					name)
 			}
 		})
+	}
+}
+
+// TestDeaconPatrolHasHeartbeatSteps verifies the deacon patrol formula
+// includes heartbeat refresh steps to prevent the daemon from killing a
+// healthy Deacon mid-cycle.
+//
+// Without heartbeat refreshes, a patrol cycle that exceeds 15 minutes
+// (HeartbeatVeryStaleThreshold) causes the daemon to consider the Deacon
+// stuck and kill it, even though the Deacon is actively executing steps.
+func TestDeaconPatrolHasHeartbeatSteps(t *testing.T) {
+	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading deacon patrol formula: %v", err)
+	}
+
+	f, err := Parse(content)
+	if err != nil {
+		t.Fatalf("parsing deacon patrol formula: %v", err)
+	}
+
+	// The first step must be the heartbeat step (no dependencies)
+	if len(f.Steps) == 0 {
+		t.Fatal("deacon patrol formula has no steps")
+	}
+	if f.Steps[0].ID != "heartbeat" {
+		t.Errorf("first step should be \"heartbeat\", got %q", f.Steps[0].ID)
+	}
+	if !strings.Contains(f.Steps[0].Description, "gt deacon heartbeat") {
+		t.Error("heartbeat step must contain \"gt deacon heartbeat\" command")
+	}
+
+	// inbox-check must depend on heartbeat
+	for _, step := range f.Steps {
+		if step.ID == "inbox-check" {
+			hasHeartbeatDep := false
+			for _, dep := range step.Needs {
+				if dep == "heartbeat" {
+					hasHeartbeatDep = true
+					break
+				}
+			}
+			if !hasHeartbeatDep {
+				t.Error("inbox-check step must depend on \"heartbeat\" step")
+			}
+			break
+		}
+	}
+
+	// There should be a mid-cycle heartbeat step
+	foundMid := false
+	for _, step := range f.Steps {
+		if step.ID == "heartbeat-mid" {
+			foundMid = true
+			if !strings.Contains(step.Description, "gt deacon heartbeat") {
+				t.Error("heartbeat-mid step must contain \"gt deacon heartbeat\" command")
+			}
+			break
+		}
+	}
+	if !foundMid {
+		t.Error("deacon patrol formula must have a \"heartbeat-mid\" step for mid-cycle refresh")
 	}
 }

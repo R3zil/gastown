@@ -6,6 +6,7 @@ package hooks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,6 +45,28 @@ type SettingsJSON struct {
 	Hooks          HooksConfig     `json:"-"`
 	// Extra holds all raw fields for roundtrip preservation.
 	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// SettingsIntegrityError indicates a malformed settings.json that should be
+// treated as a fail-closed integrity violation by callers.
+type SettingsIntegrityError struct {
+	Path string
+	Err  error
+}
+
+func (e *SettingsIntegrityError) Error() string {
+	return fmt.Sprintf("settings integrity violation at %s: %v", e.Path, e.Err)
+}
+
+func (e *SettingsIntegrityError) Unwrap() error {
+	return e.Err
+}
+
+// IsSettingsIntegrityError reports whether an error chain contains a
+// SettingsIntegrityError.
+func IsSettingsIntegrityError(err error) bool {
+	var integrityErr *SettingsIntegrityError
+	return errors.As(err, &integrityErr)
 }
 
 // UnmarshalSettings parses a settings.json file, preserving all fields.
@@ -120,7 +143,14 @@ func LoadSettings(path string) (*SettingsJSON, error) {
 		}
 		return nil, err
 	}
-	return UnmarshalSettings(data)
+	settings, err := UnmarshalSettings(data)
+	if err != nil {
+		return nil, &SettingsIntegrityError{
+			Path: path,
+			Err:  err,
+		}
+	}
+	return settings, nil
 }
 
 // HooksEqual returns true if two HooksConfigs are structurally equal.
@@ -423,11 +453,11 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 			})
 		}
 
-		// Refinery — settings in the refinery working directory (refinery/rig/)
-		refineryRigDir := filepath.Join(rigPath, "refinery", "rig")
-		if info, err := os.Stat(refineryRigDir); err == nil && info.IsDir() {
+		// Refinery — settings in the refinery parent directory
+		refineryDir := filepath.Join(rigPath, "refinery")
+		if info, err := os.Stat(refineryDir); err == nil && info.IsDir() {
 			targets = append(targets, Target{
-				Path: filepath.Join(refineryRigDir, ".claude", "settings.json"),
+				Path: filepath.Join(refineryDir, ".claude", "settings.json"),
 				Key:  rigName + "/refinery",
 				Rig:  rigName,
 				Role: "refinery",

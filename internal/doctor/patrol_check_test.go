@@ -114,6 +114,37 @@ func TestPatrolMoleculesExistCheck_RigPathExists_FormulasPresent(t *testing.T) {
 	}
 }
 
+func TestPatrolMoleculesExistCheck_RigPathExists_TownLevelFormulas(t *testing.T) {
+	// When the rig directory exists but has no .beads/formulas/, the check should
+	// find patrol formulas at the town level (.beads/formulas/) instead of
+	// reporting them as missing.
+	tmpDir := t.TempDir()
+
+	// Create the rig directory WITHOUT formulas.
+	rigDir := filepath.Join(tmpDir, "gastown")
+	if err := os.MkdirAll(rigDir, 0755); err != nil {
+		t.Fatalf("MkdirAll rig: %v", err)
+	}
+
+	// Provision formulas at the town root level only.
+	if _, err := formula.ProvisionFormulas(tmpDir); err != nil {
+		t.Fatalf("ProvisionFormulas at town root: %v", err)
+	}
+
+	writeRigsJSON(t, tmpDir, "gastown")
+
+	check := NewPatrolMoleculesExistCheck()
+	ctx := &CheckContext{TownRoot: tmpDir}
+	result := check.Run(ctx)
+
+	if result.Status != StatusOK {
+		t.Errorf("Status = %v, want OK (formulas accessible from town root)", result.Status)
+		for _, d := range result.Details {
+			t.Logf("  detail: %s", d)
+		}
+	}
+}
+
 func TestNewPatrolHooksWiredCheck(t *testing.T) {
 	check := NewPatrolHooksWiredCheck()
 	if check == nil {

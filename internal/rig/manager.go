@@ -494,7 +494,7 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			}
 			// Drop orphaned beads_<prefix> database if it differs from rigName (gt-sv1h).
 			if orphanDB := "beads_" + opts.BeadsPrefix; orphanDB != opts.Name {
-				_ = doltserver.RemoveDatabase(m.townRoot, orphanDB)
+				_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
 			}
 		}
 
@@ -549,7 +549,7 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Safety-net: drop orphaned beads_<prefix> database if it differs from rigName (gt-sv1h).
 	// InitBeads already does this, but repeat here in case EnsureMetadata path diverges.
 	if orphanDB := "beads_" + opts.BeadsPrefix; orphanDB != opts.Name {
-		_ = doltserver.RemoveDatabase(m.townRoot, orphanDB)
+		_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
 	}
 
 	// Set issue_prefix on the correct server-side database.
@@ -860,7 +860,7 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 		if rigName != "" {
 			orphanDB := "beads_" + prefix
 			if orphanDB != rigName {
-				_ = doltserver.RemoveDatabase(m.townRoot, orphanDB)
+				_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
 			}
 		}
 	}

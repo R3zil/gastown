@@ -418,10 +418,12 @@ func (b *Beads) buildRunEnv() []string {
 		env := filterBeadsEnv(os.Environ())
 		if b.serverPort > 0 {
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
+			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
 		}
 		return env
 	}
-	return stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
+	env := stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
+	return translateDoltPort(env)
 }
 
 // buildRoutingEnv builds the environment for runWithRouting() calls.
@@ -432,10 +434,12 @@ func (b *Beads) buildRoutingEnv() []string {
 		env := filterBeadsEnv(os.Environ())
 		if b.serverPort > 0 {
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
+			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
 		}
 		return env
 	}
-	return stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
+	env := stripEnvPrefixes(os.Environ(), "BEADS_DIR=")
+	return translateDoltPort(env)
 }
 
 // filterBeadsEnv removes beads-related environment variables from the given
@@ -467,6 +471,27 @@ func filterBeadsEnv(environ []string) []string {
 		filtered = append(filtered, env)
 	}
 	return filtered
+}
+
+// translateDoltPort ensures BEADS_DOLT_PORT is set when GT_DOLT_PORT is present.
+// Gas Town uses GT_DOLT_PORT; beads uses BEADS_DOLT_PORT. This translation
+// prevents bd subprocesses from falling back to metadata.json's port 3307
+// (production) when a test or daemon has set GT_DOLT_PORT to an alternate port.
+func translateDoltPort(env []string) []string {
+	var gtPort string
+	hasBDP := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "GT_DOLT_PORT=") {
+			gtPort = strings.TrimPrefix(e, "GT_DOLT_PORT=")
+		}
+		if strings.HasPrefix(e, "BEADS_DOLT_PORT=") {
+			hasBDP = true
+		}
+	}
+	if gtPort != "" && !hasBDP {
+		env = append(env, "BEADS_DOLT_PORT="+gtPort)
+	}
+	return env
 }
 
 // stripEnvPrefixes removes entries matching any of the given prefixes from an

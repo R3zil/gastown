@@ -38,6 +38,15 @@ func initRegistryFromWorkDir(workDir string) {
 	}
 }
 
+// workDirToTownRoot resolves a workDir to the Gas Town root directory.
+// Falls back to workDir itself if workspace.Find fails.
+func workDirToTownRoot(workDir string) string {
+	if townRoot, err := workspace.Find(workDir); err == nil && townRoot != "" {
+		return townRoot
+	}
+	return workDir
+}
+
 // initRegistryFromTownRoot initializes registries from a known town root,
 // logging any errors so that misconfiguration is observable.
 func initRegistryFromTownRoot(townRoot string) {
@@ -58,10 +67,9 @@ type HandlerResult struct {
 }
 
 // HandlePolecatDone processes a POLECAT_DONE message from a polecat.
-// For ESCALATED/DEFERRED exits (no pending MR), auto-nukes if clean.
 // For PHASE_COMPLETE exits, recycles the polecat (session ends, worktree kept).
-// For COMPLETED exits with MR and clean state, auto-nukes immediately (ephemeral model).
-// For exits with pending MR but dirty state, creates cleanup wisp for manual intervention.
+// For exits with pending MR, creates cleanup wisp and sends MERGE_READY to Refinery.
+// For exits without MR, acknowledges completion (polecat goes idle).
 //
 // When a pending MR exists, sends MERGE_READY to the Refinery to trigger
 // immediate merge queue processing. This ensures work flows through the system
@@ -769,13 +777,21 @@ func extractPolecatFromJSON(output string) string {
 
 // NukePolecat executes the actual nuke operation for a polecat.
 // This kills the tmux session, removes the worktree, and cleans up beads.
-// Should only be called after all safety checks pass.
+// Refuses to nuke polecats with pending MRs in the refinery queue (gt-6a9d).
 func NukePolecat(workDir, rigName, polecatName string) error {
+	// Safety gate (gt-6a9d): refuse to nuke if MR is pending in refinery.
+	// Nuking deletes the remote branch, which the refinery needs to merge.
+	initRegistryFromWorkDir(workDir)
+	prefix := beads.GetPrefixForRig(workDirToTownRoot(workDir), rigName)
+	agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+	if hasPendingMR(workDir, rigName, polecatName, agentBeadID) {
+		return fmt.Errorf("refusing to nuke %s/%s: MR pending in refinery (gt-6a9d)", rigName, polecatName)
+	}
+
 	// CRITICAL: Kill the tmux session FIRST and unconditionally.
 	// We do this explicitly here because gt polecat nuke may fail to kill the
 	// session due to rig loading issues or race conditions with IsRunning checks.
 	// See: gt-g9ft5 - sessions were piling up because nuke wasn't killing them.
-	initRegistryFromWorkDir(workDir)
 	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
 	t := tmux.NewTmux()
 
@@ -1122,6 +1138,14 @@ func detectZombieDeadSession(workDir, rigName, polecatName, agentBeadID, session
 		// If bead is already closed, the polecat completed successfully.
 		// Just nuke the dead session; don't trigger re-dispatch. (gt-sy8)
 		beadAlreadyClosed := diHookBead != "" && getBeadStatus(workDir, diHookBead) == "closed"
+
+		// Persistent polecat model (gt-6a9d): Do NOT nuke if there's a pending MR.
+		// The polecat completed normally (gt done → session exit). Its MR is in the
+		// refinery queue. Nuking would delete the remote branch before the refinery
+		// can merge it. The dead session is expected, not a zombie.
+		if !beadAlreadyClosed && hasPendingMR(workDir, rigName, polecatName, agentBeadID) {
+			return ZombieResult{}, false
+		}
 
 		zombie := ZombieResult{
 			PolecatName: polecatName,
@@ -1908,4 +1932,40 @@ func findAnyCleanupWisp(workDir, polecatName string) string {
 		return ""
 	}
 	return items[0].ID
+}
+
+// hasPendingMR checks if a polecat has work waiting in the refinery merge queue.
+// Returns true if either:
+//  1. A cleanup wisp exists for this polecat (HandlePolecatDone created it for a pending MR)
+//  2. The agent bead has an active_mr field set
+//
+// Used to prevent zombie detection from nuking polecats whose MR is still being
+// processed by the refinery. Nuking would delete the remote branch and orphan the MR.
+// See: gt-6a9d
+func hasPendingMR(workDir, _, polecatName, agentBeadID string) bool {
+	// Check 1: Cleanup wisp with merge-requested state (created by HandlePolecatDone)
+	wispID, _ := findCleanupWisp(workDir, polecatName)
+	if wispID != "" {
+		return true
+	}
+
+	// Check 2: active_mr on agent bead (set by gt done when MR is created)
+	activeMR := getAgentActiveMR(workDir, agentBeadID)
+	return activeMR != ""
+}
+
+// getAgentActiveMR retrieves the active_mr field from a polecat's agent bead.
+// Returns empty string if the bead doesn't exist or has no active_mr.
+func getAgentActiveMR(workDir, agentBeadID string) string {
+	output, err := util.ExecWithOutput(workDir, "bd", "show", agentBeadID, "--json")
+	if err != nil || output == "" {
+		return ""
+	}
+	var issues []struct {
+		ActiveMR string `json:"active_mr"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return ""
+	}
+	return issues[0].ActiveMR
 }

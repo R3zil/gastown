@@ -119,6 +119,7 @@ type PatrolsConfig struct {
 	Handler     *PatrolConfig      `json:"handler,omitempty"`
 	DoltServer  *DoltServerConfig  `json:"dolt_server,omitempty"`
 	DoltRemotes *DoltRemotesConfig `json:"dolt_remotes,omitempty"`
+	DoltBackup  *DoltBackupConfig  `json:"dolt_backup,omitempty"`
 }
 
 // DoltRemotesConfig holds configuration for the dolt_remotes patrol.
@@ -139,6 +140,20 @@ type DoltRemotesConfig struct {
 
 	// Branch is the branch to push (default "main").
 	Branch string `json:"branch,omitempty"`
+}
+
+// DoltBackupConfig holds configuration for the dolt_backup patrol.
+// This patrol periodically syncs Dolt databases to local filesystem backups.
+type DoltBackupConfig struct {
+	// Enabled controls whether backup sync runs.
+	Enabled bool `json:"enabled"`
+
+	// IntervalStr is how often to sync, as a string (e.g., "15m").
+	IntervalStr string `json:"interval,omitempty"`
+
+	// Databases lists specific database names to back up.
+	// If empty, auto-discovers databases with configured backup remotes.
+	Databases []string `json:"databases,omitempty"`
 }
 
 // DaemonPatrolConfig is the structure of mayor/daemon.json.
@@ -186,6 +201,12 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 			return false
 		}
 		return config.Patrols.DoltRemotes.Enabled
+	}
+	if patrol == "dolt_backup" {
+		if config == nil || config.Patrols == nil || config.Patrols.DoltBackup == nil {
+			return false
+		}
+		return config.Patrols.DoltBackup.Enabled
 	}
 
 	if config == nil || config.Patrols == nil {

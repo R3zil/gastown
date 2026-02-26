@@ -74,7 +74,7 @@ func (c *PatrolMoleculesExistCheck) Run(ctx *CheckContext) *CheckResult {
 		if _, statErr := os.Stat(rigPath); os.IsNotExist(statErr) {
 			rigPath = ctx.TownRoot
 		}
-		missing := c.checkPatrolFormulas(rigPath)
+		missing := c.checkPatrolFormulas(rigPath, ctx.TownRoot)
 		if len(missing) > 0 {
 			c.missingFormulas[rigName] = missing
 			details = append(details, fmt.Sprintf("%s: missing %v", rigName, missing))
@@ -99,15 +99,33 @@ func (c *PatrolMoleculesExistCheck) Run(ctx *CheckContext) *CheckResult {
 }
 
 // checkPatrolFormulas returns missing patrol formula names for a rig.
-func (c *PatrolMoleculesExistCheck) checkPatrolFormulas(rigPath string) []string {
+func (c *PatrolMoleculesExistCheck) checkPatrolFormulas(rigPath string, townRoot string) []string {
 	// Check for formula files directly on the filesystem rather than shelling
 	// out to `bd formula list`, which may not be available in all environments
 	// (e.g., CI). Formulas are provisioned as .formula.toml files in .beads/formulas/.
-	formulasDir := filepath.Join(rigPath, ".beads", "formulas")
+	//
+	// Search the full formula path: rig-level → town-level → user-level,
+	// matching the beads SDK's formula resolution order.
+	homeDir, _ := os.UserHomeDir()
+	searchDirs := []string{
+		filepath.Join(rigPath, ".beads", "formulas"),
+		filepath.Join(townRoot, ".beads", "formulas"),
+	}
+	if homeDir != "" {
+		searchDirs = append(searchDirs, filepath.Join(homeDir, ".beads", "formulas"))
+	}
+
 	var missing []string
 	for _, formulaName := range patrolFormulas {
-		formulaPath := filepath.Join(formulasDir, formulaName+".formula.toml")
-		if _, err := os.Stat(formulaPath); os.IsNotExist(err) {
+		found := false
+		for _, dir := range searchDirs {
+			formulaPath := filepath.Join(dir, formulaName+".formula.toml")
+			if _, err := os.Stat(formulaPath); err == nil {
+				found = true
+				break
+			}
+		}
+		if !found {
 			missing = append(missing, formulaName)
 		}
 	}

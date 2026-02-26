@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -370,17 +371,19 @@ func (m *DoltServerManager) EnsureRunning() error {
 			m.logger("Dolt server unhealthy: %v, restarting...", err)
 			m.sendUnhealthyAlert(err)
 			m.writeUnhealthySignal("health_check_failed", err.Error())
+			m.captureGoroutineDump()
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
 		// Check write capability (read-only detection).
-		// The SELECT 1 health check above only verifies read connectivity.
+		// The health check above only verifies read connectivity.
 		// Under concurrent write load, Dolt can enter a persistent read-only
 		// state that requires a server restart to clear.
 		if err := m.checkWriteHealthLocked(); err != nil {
 			m.logger("Dolt server read-only: %v, restarting...", err)
 			m.sendReadOnlyAlert(err)
 			m.writeUnhealthySignal("read_only", err.Error())
+			m.captureGoroutineDump()
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
@@ -394,6 +397,7 @@ func (m *DoltServerManager) EnsureRunning() error {
 				m.logger("Dolt server identity check failed: %v, restarting...", err)
 				m.sendUnhealthyAlert(fmt.Errorf("identity check: %w", err))
 				m.writeUnhealthySignal("imposter_detected", err.Error())
+				m.captureGoroutineDump()
 				m.stopLocked()
 				// Also kill any imposters before restarting
 				if killErr := doltserver.KillImposters(m.townRoot); killErr != nil {
@@ -819,6 +823,29 @@ func (m *DoltServerManager) Stop() error {
 }
 
 // stopLocked stops the Dolt server. Must be called with m.mu held.
+// captureGoroutineDump sends SIGQUIT to the Dolt server to dump goroutine stacks
+// to its log file. Per Tim Sehn (Dolt CEO): kill -QUIT prints all goroutine stacks
+// to stderr, which is redirected to the server log. Called before stopping an
+// unhealthy server so the dump captures what it was stuck on.
+func (m *DoltServerManager) captureGoroutineDump() {
+	pid, running := m.isRunning()
+	if !running {
+		return
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	m.logger("Capturing goroutine dump from Dolt server (PID %d) before restart...", pid)
+	if err := process.Signal(syscall.SIGQUIT); err != nil {
+		m.logger("Warning: failed to send SIGQUIT for goroutine dump: %v", err)
+		return
+	}
+	// Give the server a moment to write the dump to its log file.
+	time.Sleep(500 * time.Millisecond)
+	m.logger("Goroutine dump written to server log. View with: gt dolt logs -n 200")
+}
+
 func (m *DoltServerManager) stopLocked() {
 	if m.stopFn != nil {
 		m.stopFn()
@@ -875,19 +902,22 @@ func (m *DoltServerManager) checkHealth() error {
 }
 
 // checkHealthLocked checks health. Must be called with m.mu held.
-// Performs a connectivity check (SELECT 1) with latency measurement, and logs
+// Performs a connectivity check (SELECT active_branch()) with latency measurement, and logs
 // warnings for degraded resource conditions (high latency, high connection count,
 // disk usage). Returns an error only if the server is unreachable.
 func (m *DoltServerManager) checkHealthLocked() error {
 	if m.healthCheckFn != nil {
 		return m.healthCheckFn()
 	}
-	// 1. Connectivity + latency: time a SELECT 1
+	// 1. Connectivity + latency: time a SELECT active_branch()
+	// Per Tim Sehn (Dolt CEO): active_branch() is a lightweight probe that
+	// won't block behind queued queries, unlike SELECT 1 which goes through
+	// the full query executor.
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
 
 	start := time.Now()
-	cmd := m.buildDoltSQLCmd(ctx, "-q", "SELECT 1")
+	cmd := m.buildDoltSQLCmd(ctx, "-q", "SELECT active_branch()")
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

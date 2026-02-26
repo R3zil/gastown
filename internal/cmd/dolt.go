@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -97,6 +98,18 @@ var doltLogsCmd = &cobra.Command{
 	Short: "View Dolt server logs",
 	Long:  `View the Dolt server log file.`,
 	RunE:  runDoltLogs,
+}
+
+var doltDumpCmd = &cobra.Command{
+	Use:   "dump",
+	Short: "Dump Dolt server goroutine stacks for debugging",
+	Long: `Send SIGQUIT to the Dolt server to dump goroutine stacks to its log file.
+
+Per Tim Sehn (Dolt CEO): kill -QUIT prints all goroutine stacks to stderr,
+which is redirected to the server log. Useful for diagnosing hung servers.
+
+The dump is written to the server log file. Use 'gt dolt logs' to view it.`,
+	RunE: runDoltDump,
 }
 
 var doltSQLCmd = &cobra.Command{
@@ -273,6 +286,7 @@ var (
 	doltLogFollow         bool
 	doltMigrateDry        bool
 	doltCleanupDry        bool
+	doltCleanupForce      bool
 
 	doltMigrateWispsDry   bool
 	doltMigrateWispsDB    string
@@ -291,6 +305,7 @@ func init() {
 	doltCmd.AddCommand(doltRestartCmd)
 	doltCmd.AddCommand(doltStatusCmd)
 	doltCmd.AddCommand(doltLogsCmd)
+	doltCmd.AddCommand(doltDumpCmd)
 	doltCmd.AddCommand(doltSQLCmd)
 	doltCmd.AddCommand(doltInitRigCmd)
 	doltCmd.AddCommand(doltListCmd)
@@ -303,6 +318,7 @@ func init() {
 	doltCmd.AddCommand(doltMigrateWispsCmd)
 
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupDry, "dry-run", false, "Preview what would be removed without making changes")
+	doltCleanupCmd.Flags().BoolVar(&doltCleanupForce, "force", false, "Remove databases even if they have user tables")
 	doltLogsCmd.Flags().IntVarP(&doltLogLines, "lines", "n", 50, "Number of lines to show")
 	doltLogsCmd.Flags().BoolVarP(&doltLogFollow, "follow", "f", false, "Follow log output")
 
@@ -620,6 +636,42 @@ func runDoltLogs(cmd *cobra.Command, args []string) error {
 	return tailCmd.Run()
 }
 
+func runDoltDump(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	running, pid, err := doltserver.IsRunning(townRoot)
+	if err != nil {
+		return fmt.Errorf("checking server status: %w", err)
+	}
+	if !running {
+		return fmt.Errorf("Dolt server is not running — nothing to dump")
+	}
+
+	config := doltserver.DefaultConfig(townRoot)
+
+	// Send SIGQUIT to get goroutine stack dump (written to server's stderr = log file)
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("finding process %d: %w", pid, err)
+	}
+
+	fmt.Printf("Sending SIGQUIT to Dolt server (PID %d)...\n", pid)
+	if err := proc.Signal(syscall.SIGQUIT); err != nil {
+		return fmt.Errorf("sending SIGQUIT: %w", err)
+	}
+
+	// Give the server a moment to write the dump
+	time.Sleep(500 * time.Millisecond)
+
+	fmt.Printf("Goroutine stack dump written to: %s\n", config.LogFile)
+	fmt.Printf("View with: gt dolt logs -n 200\n")
+
+	return nil
+}
+
 func runDoltSQL(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -812,15 +864,54 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// BALK: If there are too many orphans, SQL-based cleanup will take hours
+	// because each DROP DATABASE is a separate query against an overloaded server.
+	// Force the user to stop the server and clean the filesystem directly.
+	// (Clown Show #18: 245 orphans at 27s latency = ~2 hour cleanup)
+	const maxSQLCleanup = 50
+	if len(orphans) > maxSQLCleanup {
+		fmt.Printf("\n%s Too many orphans (%d) for SQL-based cleanup (max %d).\n",
+			style.Bold.Render("!"), len(orphans), maxSQLCleanup)
+		fmt.Printf("  The server is likely overloaded. SQL cleanup would take hours.\n\n")
+		fmt.Printf("  Instead, stop the server and clean the filesystem:\n\n")
+		fmt.Printf("    gt dolt stop\n")
+		fmt.Printf("    cd %s/.dolt-data && rm -rf testdb_* beads_t* beads_pt* beads_vr* doctest_* doctortest_*\n", townRoot)
+		fmt.Printf("    gt dolt start\n\n")
+		fmt.Printf("  This is safe — orphan databases have no production data.\n")
+		return fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans))
+	}
+
 	fmt.Println()
 	removed := 0
 	for _, o := range orphans {
-		if err := doltserver.RemoveDatabase(townRoot, o.Name); err != nil {
+		if err := doltserver.RemoveDatabase(townRoot, o.Name, doltCleanupForce); err != nil {
+			// If DROP caused read-only, stop immediately and recover (gt-r1cyd)
+			if doltserver.IsReadOnlyError(err.Error()) {
+				fmt.Printf("  %s DROP put server into read-only mode — attempting recovery...\n", style.Bold.Render("!"))
+				if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr != nil {
+					fmt.Printf("  %s Recovery failed: %v\n", style.Bold.Render("✗"), recoverErr)
+					fmt.Printf("  Run: gt dolt stop && gt dolt start\n")
+				} else {
+					fmt.Printf("  %s Server recovered from read-only state\n", style.Bold.Render("✓"))
+				}
+				break
+			}
 			fmt.Printf("  %s Failed to remove %s: %v\n", style.Bold.Render("✗"), o.Name, err)
 			continue
 		}
 		fmt.Printf("  %s Removed %s\n", style.Bold.Render("✓"), o.Name)
 		removed++
+
+		// Health check after each DROP to catch read-only early (gt-r1cyd)
+		if readOnly, _ := doltserver.CheckReadOnly(townRoot); readOnly {
+			fmt.Printf("  %s Server went read-only after DROP — attempting recovery...\n", style.Bold.Render("!"))
+			if recoverErr := doltserver.RecoverReadOnly(townRoot); recoverErr != nil {
+				fmt.Printf("  %s Recovery failed: %v\n", style.Bold.Render("✗"), recoverErr)
+				fmt.Printf("  Run: gt dolt stop && gt dolt start\n")
+				break
+			}
+			fmt.Printf("  %s Server recovered — continuing cleanup\n", style.Bold.Render("✓"))
+		}
 	}
 
 	fmt.Printf("\n%s Removed %d/%d orphaned database(s)\n",

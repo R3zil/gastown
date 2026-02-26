@@ -330,6 +330,18 @@ func (d *Daemon) Run() error {
 		d.logger.Printf("Dolt remotes push ticker started (interval %v)", interval)
 	}
 
+	// Start dedicated Dolt backup ticker if configured.
+	// Runs filesystem backup sync (dolt backup sync) for production databases.
+	var doltBackupTicker *time.Ticker
+	var doltBackupChan <-chan time.Time
+	if IsPatrolEnabled(d.patrolConfig, "dolt_backup") {
+		interval := doltBackupInterval(d.patrolConfig)
+		doltBackupTicker = time.NewTicker(interval)
+		doltBackupChan = doltBackupTicker.C
+		defer doltBackupTicker.Stop()
+		d.logger.Printf("Dolt backup ticker started (interval %v)", interval)
+	}
+
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
 	// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the
 	// per-session approach which has been tested to work for continuous recovery.
@@ -365,6 +377,13 @@ func (d *Daemon) Run() error {
 			// git remotes on a 15-minute cadence (independent of heartbeat).
 			if !d.isShutdownInProgress() {
 				d.pushDoltRemotes()
+			}
+
+		case <-doltBackupChan:
+			// Periodic Dolt filesystem backup — syncs production databases to
+			// local backup directory on a 15-minute cadence.
+			if !d.isShutdownInProgress() {
+				d.syncDoltBackups()
 			}
 
 		case <-timer.C:
