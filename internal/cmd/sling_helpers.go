@@ -727,16 +727,41 @@ func InstantiateFormulaOnBead(formulaName, beadID, title, hookWorkDir, townRoot 
 	// Some bd versions return a wisp ID from `mol wisp` that is not bond-resolvable
 	// ("<id> not found"), while direct formula->bead bond still works. If legacy
 	// wisp->bead bond fails, retry with direct formula bond in ephemeral mode.
-	bondArgs := []string{"mol", "bond", wispRootID, beadID, "--json"}
-	bondOut, err := BdCmd(bondArgs...).
-		Dir(formulaWorkDir).
-		WithAutoCommit().
-		WithGTRoot(townRoot).
-		Output()
-	if err != nil {
+	//
+	// gt-4gjd: Detect malformed wisp IDs (e.g., doubled "-wisp-" like "oag-wisp-wisp-rsia")
+	// and skip directly to fallback. This avoids the noisy error from a doomed bond attempt
+	// and prevents creating orphaned wisps from the failed path.
+	skipLegacyBond := isMalformedWispID(wispRootID)
+	if skipLegacyBond {
+		fmt.Fprintf(os.Stderr, "Warning: bd mol wisp returned malformed ID %q, using direct bond fallback\n", wispRootID)
+	}
+
+	var bondOut []byte
+	legacyBondFailed := skipLegacyBond
+	if !skipLegacyBond {
+		bondArgs := []string{"mol", "bond", wispRootID, beadID, "--json"}
+		bondOut, err = BdCmd(bondArgs...).
+			Dir(formulaWorkDir).
+			WithAutoCommit().
+			WithGTRoot(townRoot).
+			Output()
+		if err != nil {
+			legacyBondFailed = true
+		}
+	}
+
+	if legacyBondFailed {
+		// gt-4gjd: Clean up orphaned wisp from the failed legacy path.
+		// bd mol wisp may have created a wisp that we can't bond (bad ID or
+		// ephemeral storage issue). Best-effort cleanup to prevent wisp accumulation.
+		cleanupOrphanedWisp(wispRootID, formulaWorkDir)
+
 		fallbackRootID, fallbackErr := bondFormulaDirect(resolvedFormula, beadID, formulaWorkDir, townRoot, formulaVars)
 		if fallbackErr != nil {
-			return nil, fmt.Errorf("bonding formula to bead: %w (direct formula bond fallback failed: %v)", err, fallbackErr)
+			if err != nil {
+				return nil, fmt.Errorf("bonding formula to bead: %w (direct formula bond fallback failed: %v)", err, fallbackErr)
+			}
+			return nil, fmt.Errorf("bonding formula to bead (malformed wisp ID %q): direct formula bond fallback failed: %v", wispRootID, fallbackErr)
 		}
 		return &FormulaOnBeadResult{
 			WispRootID: fallbackRootID,
@@ -749,6 +774,9 @@ func InstantiateFormulaOnBead(formulaName, beadID, title, hookWorkDir, townRoot 
 	// still writing an error to stderr. If parsing fails, retry direct bond.
 	parsedRootID, parsed := parseBondSpawnRootIDWithStatus(bondOut, formulaName, beadID, wispRootID)
 	if !parsed {
+		// gt-4gjd: Clean up orphaned wisp before fallback.
+		cleanupOrphanedWisp(wispRootID, formulaWorkDir)
+
 		fallbackRootID, fallbackErr := bondFormulaDirect(resolvedFormula, beadID, formulaWorkDir, townRoot, formulaVars)
 		if fallbackErr != nil {
 			return nil, fmt.Errorf("bond output not parseable and direct formula bond fallback failed: %v", fallbackErr)
@@ -1076,6 +1104,32 @@ func shouldAcceptPermissionWarning(agentName string) bool {
 		return false
 	}
 	return preset.EmitsPermissionWarning
+}
+
+// isMalformedWispID detects obviously malformed wisp IDs from bd mol wisp output.
+// Known bd bug (gt-4gjd): some versions generate wisp IDs with doubled "-wisp-"
+// infix (e.g., "oag-wisp-wisp-rsia" instead of "oag-wisp-rsia"). Detecting these
+// early avoids a doomed bond attempt and the associated noisy error.
+func isMalformedWispID(wispID string) bool {
+	// Look for "wisp-wisp-" anywhere in the ID — the hallmark of the doubled-infix bug.
+	return strings.Contains(wispID, "wisp-wisp-")
+}
+
+// cleanupOrphanedWisp attempts to force-close a wisp that was created by
+// bd mol wisp but could not be bonded. This prevents orphaned wisp accumulation
+// when the legacy bond path fails and the direct-bond fallback is used (gt-4gjd).
+// Best-effort: errors are logged but not propagated.
+func cleanupOrphanedWisp(wispID, formulaWorkDir string) {
+	if wispID == "" {
+		return
+	}
+	bd := beads.New(formulaWorkDir)
+	if err := bd.ForceCloseWithReason("burned: orphaned wisp from failed bond (gt-4gjd)", wispID); err != nil {
+		// Non-fatal: the wisp may not exist (phantom ID from bd bug),
+		// or it may be in a different database. Orphaned wisps will be
+		// caught by the doctor's DetectOrphanedMolecules.
+		fmt.Fprintf(os.Stderr, "Warning: could not clean up orphaned wisp %s: %v\n", wispID, err)
+	}
 }
 
 // updateAgentMode updates the mode field on the agent bead.
