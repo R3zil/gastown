@@ -468,7 +468,7 @@ func previousCommitLineCount(gitRepo, relPath string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "show", "HEAD:"+relPath)
+	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "show", "HEAD:"+filepath.ToSlash(relPath))
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	// stderr intentionally not captured — "does not exist" is an expected case.
