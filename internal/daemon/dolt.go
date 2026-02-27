@@ -1005,21 +1005,47 @@ func (m *DoltServerManager) checkDiskUsage() {
 }
 
 // checkDatabaseCount queries the database list and warns if the count exceeds
-// a threshold (orphan/phantom database detection). Non-fatal: failures are silently ignored.
-// Threshold is intentionally generous — accounts for all registered rigs plus headroom.
+// what's expected based on the data directory contents. Non-fatal: failures are silently ignored.
+// The expected count is derived from subdirectories in the data dir (each is a registered DB).
 func (m *DoltServerManager) checkDatabaseCount() {
 	databases, err := m.getDatabases()
 	if err != nil {
 		return // non-fatal
 	}
 
-	// Expected: one database per rig (hq, beads, gastown, wyvern, sky, beads_hop, etc.)
-	// plus potential new rigs the user adds. Threshold of 10 gives plenty of headroom.
-	const orphanThreshold = 10
-	if len(databases) > orphanThreshold {
-		m.logger("Warning: %d databases detected (threshold %d) — possible orphan/test database accumulation: %v",
-			len(databases), orphanThreshold, databases)
+	// Derive expected count from data directory — each subdirectory is a database.
+	// This adapts automatically as users add/remove rigs.
+	expected := m.countDataDirDatabases()
+	if expected == 0 {
+		expected = 6 // Fallback if data dir can't be read
 	}
+
+	// Allow a small buffer (3) above expected for transient states.
+	threshold := expected + 3
+	if len(databases) > threshold {
+		m.logger("Warning: %d databases detected (expected ~%d, threshold %d) — possible orphan/test database accumulation: %v",
+			len(databases), expected, threshold, databases)
+	}
+}
+
+// countDataDirDatabases counts subdirectories in the Dolt data directory.
+// Each subdirectory corresponds to a registered database.
+func (m *DoltServerManager) countDataDirDatabases() int {
+	dataDir := m.config.DataDir
+	if dataDir == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			count++
+		}
+	}
+	return count
 }
 
 // checkBackupFreshness checks if Dolt backups are fresh. Warns if any configured
