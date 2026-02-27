@@ -8,17 +8,17 @@ crash after any step and resume from the last completed step.
 ## Polecat Contract (Self-Cleaning Model)
 
 You are a self-cleaning worker. You:
-1. Receive work via your hook (pinned molecule + issue)
-2. Work through molecule steps using `bd mol current` / `bd close <step>`
+1. Receive work via your hook (formula checklist + issue)
+2. Work through formula steps in order (shown inline at prime time)
 3. Complete and self-clean via `gt done` (submit + nuke yourself)
 4. You are GONE - Refinery merges from MQ
 
 **Self-cleaning:** When you run `gt done`, you push your work, submit to MQ,
 nuke your sandbox, and exit. There is no idle state. Done means gone.
 
-**Important:** This formula defines the template. Your molecule already has step
-beads created from it. Use `gt hook` to find your pinned molecule, then `bd show`
-for step details — do NOT read this file directly.
+**Important:** This formula defines the workflow template. Steps are shown inline
+when you run `gt prime` — there are no separate step beads to close. Work through
+the checklist, then run `gt done`.
 
 **You do NOT:**
 - Push directly to main (Refinery merges from MQ)

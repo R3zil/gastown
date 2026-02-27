@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -106,9 +105,10 @@ func showMoleculeExecutionPrompt(workDir, moleculeID string) {
 	}
 }
 
-// showPatrolFormulaSteps renders the formula steps inline in the prime output.
-// Patrol agents read these steps instead of materializing them as wisp rows.
-func showPatrolFormulaSteps(formulaName string) {
+// showFormulaSteps renders the formula steps inline in the prime output.
+// Agents read these steps instead of materializing them as wisp rows.
+// The label parameter customizes the section header (e.g., "Patrol Steps", "Work Steps").
+func showFormulaSteps(formulaName, label string) {
 	content, err := formula.GetEmbeddedFormulaContent(formulaName)
 	if err != nil {
 		style.PrintWarning("could not load formula %s: %v", formulaName, err)
@@ -126,11 +126,41 @@ func showPatrolFormulaSteps(formulaName string) {
 	}
 
 	fmt.Println()
-	fmt.Printf("**Patrol Steps** (%d steps from %s):\n", len(f.Steps), formulaName)
+	fmt.Printf("**%s** (%d steps from %s):\n", label, len(f.Steps), formulaName)
 	for i, step := range f.Steps {
 		fmt.Printf("  %d. **%s** — %s\n", i+1, step.Title, truncateDescription(step.Description, 120))
 	}
 	fmt.Println()
+}
+
+// showFormulaStepsFull renders formula steps with full descriptions.
+// Used for polecat work formulas where step details are the primary instructions.
+func showFormulaStepsFull(formulaName string) {
+	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+	if err != nil {
+		style.PrintWarning("could not load formula %s: %v", formulaName, err)
+		return
+	}
+
+	f, err := formula.Parse(content)
+	if err != nil {
+		style.PrintWarning("could not parse formula %s: %v", formulaName, err)
+		return
+	}
+
+	if len(f.Steps) == 0 {
+		return
+	}
+
+	fmt.Println()
+	fmt.Printf("**Formula Checklist** (%d steps from %s):\n\n", len(f.Steps), formulaName)
+	for i, step := range f.Steps {
+		fmt.Printf("### Step %d: %s\n\n", i+1, step.Title)
+		if step.Description != "" {
+			fmt.Println(step.Description)
+			fmt.Println()
+		}
+	}
 }
 
 // truncateDescription truncates a multi-line description to a single line summary.
@@ -174,111 +204,11 @@ func outputMoleculeContext(ctx RoleContext) {
 		return
 	}
 
-	// Check for in-progress issues
-	b := beads.New(ctx.WorkDir)
-	issues, err := b.List(beads.ListOptions{
-		Status:   "in_progress",
-		Assignee: ctx.Polecat,
-		Priority: -1,
-	})
-	if err != nil || len(issues) == 0 {
-		return
-	}
-
-	// Check if any in-progress issue is a molecule step
-	for _, issue := range issues {
-		moleculeID := parseMoleculeMetadata(issue.Description)
-		if moleculeID == "" {
-			continue
-		}
-
-		// Get the parent (root) issue ID
-		rootID := issue.Parent
-		if rootID == "" {
-			continue
-		}
-
-		// This is a molecule step - show context
-		fmt.Println()
-		fmt.Printf("%s\n\n", style.Bold.Render("## 🧬 Molecule Workflow"))
-		fmt.Printf("You are working on a molecule step.\n")
-		fmt.Printf("  Current step: %s\n", issue.ID)
-		fmt.Printf("  Molecule: %s\n", moleculeID)
-		fmt.Printf("  Root issue: %s\n\n", rootID)
-
-		// Show molecule progress by finding sibling steps
-		showMoleculeProgress(b, rootID)
-
-		fmt.Println()
-		fmt.Println("**Molecule Work Loop:**")
-		fmt.Println("1. Complete current step, then `bd close " + issue.ID + "`")
-		fmt.Println("2. Check for next steps: `bd mol current`")
-		fmt.Println("3. Work on next ready step(s)")
-		fmt.Println("4. When all steps done, run `" + cli.Name() + " done`")
-		break // Only show context for first molecule step found
-	}
+	// For polecats with root-only wisps, formula steps are shown inline
+	// in outputMoleculeWorkflow() via the attached_formula field.
+	// No child-based tracking needed.
 }
 
-// parseMoleculeMetadata extracts molecule info from a step's description.
-// Looks for lines like:
-//
-//	instantiated_from: mol-xyz
-func parseMoleculeMetadata(description string) string {
-	lines := strings.Split(description, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "instantiated_from:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "instantiated_from:"))
-		}
-	}
-	return ""
-}
-
-// showMoleculeProgress displays the progress through a molecule's steps.
-func showMoleculeProgress(b *beads.Beads, rootID string) {
-	if rootID == "" {
-		return
-	}
-
-	// Find all children of the root issue
-	children, err := b.List(beads.ListOptions{
-		Parent:   rootID,
-		Status:   "all",
-		Priority: -1,
-	})
-	if err != nil || len(children) == 0 {
-		return
-	}
-
-	total := len(children)
-	done := 0
-	inProgress := 0
-	var readySteps []string
-
-	for _, child := range children {
-		switch child.Status {
-		case "closed":
-			done++
-		case "in_progress":
-			inProgress++
-		case "open":
-			// Check if ready (no open dependencies)
-			if len(child.DependsOn) == 0 {
-				readySteps = append(readySteps, child.ID)
-			}
-		}
-	}
-
-	fmt.Printf("Progress: %d/%d steps complete", done, total)
-	if inProgress > 0 {
-		fmt.Printf(" (%d in progress)", inProgress)
-	}
-	fmt.Println()
-
-	if len(readySteps) > 0 {
-		fmt.Printf("Ready steps: %s\n", strings.Join(readySteps, ", "))
-	}
-}
 
 // outputDeaconPatrolContext shows patrol molecule status for the Deacon.
 // Deacon uses wisps (Wisp:true issues in main .beads/) for patrol cycles.
@@ -304,7 +234,7 @@ func outputDeaconPatrolContext(ctx RoleContext) {
 		},
 	}
 	outputPatrolContext(cfg)
-	showPatrolFormulaSteps("mol-deacon-patrol")
+	showFormulaSteps("mol-deacon-patrol", "Patrol Steps")
 }
 
 // outputWitnessPatrolContext shows patrol molecule status for the Witness.
@@ -323,7 +253,7 @@ func outputWitnessPatrolContext(ctx RoleContext) {
 		},
 	}
 	outputPatrolContext(cfg)
-	showPatrolFormulaSteps("mol-witness-patrol")
+	showFormulaSteps("mol-witness-patrol", "Patrol Steps")
 }
 
 // outputRefineryPatrolContext shows patrol molecule status for the Refinery.
@@ -343,7 +273,7 @@ func outputRefineryPatrolContext(ctx RoleContext) {
 		},
 	}
 	outputPatrolContext(cfg)
-	showPatrolFormulaSteps("mol-refinery-patrol")
+	showFormulaSteps("mol-refinery-patrol", "Patrol Steps")
 }
 
 // buildRefineryPatrolVars loads rig MQ settings and returns --var key=value

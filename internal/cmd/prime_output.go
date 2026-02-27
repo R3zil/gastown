@@ -524,8 +524,12 @@ func outputAttachmentStatus(ctx RoleContext) {
 	}
 	fmt.Println()
 
-	// Show current step from molecule
-	showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
+	// Show inline formula steps if formula name is known, else fall back to bd mol current
+	if attachment.AttachedFormula != "" {
+		showFormulaStepsFull(attachment.AttachedFormula)
+	} else {
+		showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
+	}
 }
 
 // outputContinuationDirective displays a brief continuation prompt for post-compact/resume.

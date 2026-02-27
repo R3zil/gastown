@@ -869,6 +869,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		Dispatcher:       actor,
 		Args:             slingArgs,
 		AttachedMolecule: attachedMoleculeID,
+		AttachedFormula:  formulaName,
 		NoMerge:          slingNoMerge,
 	}
 	if err := storeFieldsInBead(beadID, fieldUpdates); err != nil {
