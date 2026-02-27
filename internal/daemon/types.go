@@ -10,6 +10,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -210,6 +211,8 @@ func LoadPatrolConfig(townRoot string) *DaemonPatrolConfig {
 
 	var config DaemonPatrolConfig
 	if err := json.Unmarshal(data, &config); err != nil {
+		// Log parse errors to help debug config issues (was previously silent).
+		fmt.Fprintf(os.Stderr, "daemon: failed to parse %s: %v\n", configFile, err)
 		return nil
 	}
 	return &config
