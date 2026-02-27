@@ -679,6 +679,27 @@ func DefaultBase() *HooksConfig {
 					Command: fmt.Sprintf("%s && gt tap guard pr-workflow", pathSetup),
 				}},
 			},
+			{
+				Matcher: "Bash(rm -rf /*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+				}},
+			},
+			{
+				Matcher: "Bash(git push --force*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+				}},
+			},
+			{
+				Matcher: "Bash(git push -f*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: fmt.Sprintf("%s && gt tap guard dangerous-command", pathSetup),
+				}},
+			},
 		},
 		SessionStart: []HookEntry{
 			{

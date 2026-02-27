@@ -282,20 +282,20 @@ After migration, 'bd mol wisp list' will work and agent lifecycle
 }
 
 var (
-	doltLogLines          int
-	doltLogFollow         bool
-	doltMigrateDry        bool
-	doltCleanupDry        bool
-	doltCleanupForce      bool
+	doltLogLines     int
+	doltLogFollow    bool
+	doltMigrateDry   bool
+	doltCleanupDry   bool
+	doltCleanupForce bool
 
-	doltMigrateWispsDry   bool
-	doltMigrateWispsDB    string
-	doltRollbackDry       bool
-	doltRollbackList      bool
-	doltSyncDry           bool
-	doltSyncForce         bool
-	doltSyncDB            string
-	doltSyncGC            bool
+	doltMigrateWispsDry bool
+	doltMigrateWispsDB  string
+	doltRollbackDry     bool
+	doltRollbackList    bool
+	doltSyncDry         bool
+	doltSyncForce       bool
+	doltSyncDB          string
+	doltSyncGC          bool
 )
 
 func init() {
@@ -1362,6 +1362,30 @@ func runDoltSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Park all rigs before stopping the server.
+	// This stops witnesses/refineries so they don't detect the outage
+	// and restart the server while we're pushing.
+	var parkedRigs []string
+	if wasRunning && !doltSyncDry {
+		rigs, discoverErr := discoverAllRigs(townRoot)
+		if discoverErr != nil {
+			fmt.Printf("%s Could not discover rigs (continuing without parking): %v\n",
+				style.Warning.Render("!"), discoverErr)
+		} else {
+			for _, r := range rigs {
+				name := r.Name
+				if IsRigParked(townRoot, name) {
+					continue // already parked, don't touch it
+				}
+				if err := parkOneRig(name); err != nil {
+					fmt.Printf("%s Failed to park %s: %v\n", style.Warning.Render("!"), name, err)
+				} else {
+					parkedRigs = append(parkedRigs, name)
+				}
+			}
+		}
+	}
+
 	if wasRunning {
 		fmt.Printf("Stopping Dolt server (PID %d)...\n", pid)
 		if err := doltserver.Stop(townRoot); err != nil {
@@ -1387,11 +1411,18 @@ func runDoltSync(cmd *cobra.Command, args []string) error {
 			if startErr := doltserver.Start(townRoot); startErr != nil {
 				fmt.Printf("%s Failed to restart Dolt server: %v\n", style.Bold.Render("✗"), startErr)
 				fmt.Printf("  Start manually with: %s\n", style.Dim.Render("gt dolt start"))
-				return
+			} else {
+				// Start() now verifies the server is accepting connections,
+				// so if we get here it's genuinely ready.
+				fmt.Printf("%s Dolt server restarted (accepting connections)\n", style.Bold.Render("✓"))
 			}
-			// Start() now verifies the server is accepting connections,
-			// so if we get here it's genuinely ready.
-			fmt.Printf("%s Dolt server restarted (accepting connections)\n", style.Bold.Render("✓"))
+
+			// Unpark rigs that we parked
+			for _, name := range parkedRigs {
+				if err := unparkOneRig(name); err != nil {
+					fmt.Printf("%s Failed to unpark %s: %v\n", style.Warning.Render("!"), name, err)
+				}
+			}
 		}()
 	}
 
@@ -1496,9 +1527,12 @@ func runDoltMigrateWisps(cmd *cobra.Command, args []string) error {
 		if db == "wl_commons" || strings.HasPrefix(db, "testdb_") {
 			continue
 		}
-		// Find the rig directory for this database
+		// Find the rig directory for this database.
+		// The "hq" database lives at the town root itself, not townRoot/hq.
 		rigDir := filepath.Join(townRoot, db)
-		if _, err := os.Stat(rigDir); os.IsNotExist(err) {
+		if db == "hq" {
+			rigDir = townRoot
+		} else if _, err := os.Stat(rigDir); os.IsNotExist(err) {
 			continue // Not a rig directory
 		}
 		fmt.Printf("\n%s Migrating: %s\n", style.Bold.Render("→"), db)
@@ -1541,5 +1575,3 @@ func printMigrateWispsResult(result *doltserver.MigrateWispsResult) {
 		fmt.Printf("  %s Already migrated (no changes needed)\n", style.Bold.Render("✓"))
 	}
 }
-
-

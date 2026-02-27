@@ -305,6 +305,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		Dispatcher:       actor,
 		Args:             params.Args,
 		AttachedMolecule: attachedMoleculeID,
+		AttachedFormula:  params.FormulaName,
 		NoMerge:          params.NoMerge,
 		Mode:             params.Mode,
 	}

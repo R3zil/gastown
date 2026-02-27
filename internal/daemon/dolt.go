@@ -131,6 +131,10 @@ type DoltServerManager struct {
 	// Identity verification state
 	lastIdentityCheck time.Time // Last time we ran the database identity check
 
+	// Health check warnings (Option B throttling for doctor molecule).
+	// Populated by checkHealthLocked(), consumed by Daemon.ensureDoltServerRunning().
+	lastWarnings []string // Warnings from the most recent health check
+
 	// Test hooks (nil = use real implementations; set only in tests)
 	healthCheckFn      func() error
 	writeProbeCheckFn  func() error
@@ -175,8 +179,13 @@ func (m *DoltServerManager) doSleep(d time.Duration) {
 }
 
 // pidFile returns the path to the Dolt server PID file.
+// Production (port 3307) uses the canonical "dolt.pid" for compatibility with
+// gt dolt start/stop. Other ports get a port-specific name to avoid collisions.
 func (m *DoltServerManager) pidFile() string {
-	return filepath.Join(m.townRoot, "daemon", "dolt.pid")
+	if m.config.Port == 3307 {
+		return filepath.Join(m.townRoot, "daemon", "dolt.pid")
+	}
+	return filepath.Join(m.townRoot, "daemon", fmt.Sprintf("dolt-%d.pid", m.config.Port))
 }
 
 // IsEnabled returns whether Dolt server management is enabled.
@@ -697,8 +706,13 @@ func sendDoltAlertToWitnesses(townRoot, subject, body string, logger func(format
 
 // unhealthySignalFile returns the path to the DOLT_UNHEALTHY signal file.
 // Witness patrols can check for this file to detect degraded Dolt state.
+// Production (port 3307) uses the canonical name; other ports get a suffix
+// so multiple instances don't clobber each other's signal files.
 func (m *DoltServerManager) unhealthySignalFile() string {
-	return filepath.Join(m.townRoot, "daemon", "DOLT_UNHEALTHY")
+	if m.config.Port == 3307 {
+		return filepath.Join(m.townRoot, "daemon", "DOLT_UNHEALTHY")
+	}
+	return filepath.Join(m.townRoot, "daemon", fmt.Sprintf("DOLT_UNHEALTHY_%d", m.config.Port))
 }
 
 // writeUnhealthySignal writes the DOLT_UNHEALTHY signal file.
@@ -905,7 +919,11 @@ func (m *DoltServerManager) checkHealth() error {
 // Performs a connectivity check (SELECT active_branch()) with latency measurement, and logs
 // warnings for degraded resource conditions (high latency, high connection count,
 // disk usage). Returns an error only if the server is unreachable.
+// Warnings are collected in m.lastWarnings for Option B throttling: the daemon
+// pours a mol-dog-doctor molecule only when anomalies are detected.
 func (m *DoltServerManager) checkHealthLocked() error {
+	m.lastWarnings = nil // Reset warnings each check cycle.
+
 	if m.healthCheckFn != nil {
 		return m.healthCheckFn()
 	}
@@ -928,21 +946,50 @@ func (m *DoltServerManager) checkHealthLocked() error {
 
 	latency := time.Since(start)
 	if latency > 1*time.Second {
-		m.logger("Warning: Dolt health check latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond))
+		w := fmt.Sprintf("Dolt health check latency %v exceeds 1s threshold — server may be under stress", latency.Round(time.Millisecond))
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
 	}
 
 	// 2. Connection count (best-effort, non-fatal)
-	m.checkConnectionCount()
+	if w := m.checkConnectionCount(); w != "" {
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+	}
 
 	// 3. Disk space (best-effort, non-fatal)
-	m.checkDiskUsage()
+	if w := m.checkDiskUsage(); w != "" {
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+	}
+
+	// 4. Database count (best-effort, non-fatal) — orphan detection
+	if w := m.checkDatabaseCount(); w != "" {
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+	}
+
+	// 5. Backup freshness (best-effort, non-fatal)
+	for _, w := range m.checkBackupFreshness() {
+		m.lastWarnings = append(m.lastWarnings, w)
+		m.logger("Warning: %s", w)
+	}
 
 	return nil
 }
 
-// checkConnectionCount queries the connection count and logs a warning if approaching the limit.
-// Non-fatal: failures are silently ignored.
-func (m *DoltServerManager) checkConnectionCount() {
+// LastWarnings returns warnings from the most recent health check.
+// Used by the Daemon for Option B throttling: only pour a mol-dog-doctor
+// molecule when anomalies are detected.
+func (m *DoltServerManager) LastWarnings() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastWarnings
+}
+
+// checkConnectionCount queries the connection count and returns a warning if approaching the limit.
+// Non-fatal: failures return empty string.
+func (m *DoltServerManager) checkConnectionCount() string {
 	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
 	defer cancel()
 	cmd := m.buildDoltSQLCmd(ctx,
@@ -952,33 +999,34 @@ func (m *DoltServerManager) checkConnectionCount() {
 
 	output, err := cmd.Output()
 	if err != nil {
-		return // non-fatal
+		return "" // non-fatal
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if len(lines) < 2 {
-		return
+		return ""
 	}
 	count, err := strconv.Atoi(strings.TrimSpace(lines[len(lines)-1]))
 	if err != nil {
-		return
+		return ""
 	}
 
 	// Use the doltserver package default (50) as a reasonable cap reference
 	maxConn := 50
 	threshold := (maxConn * 80) / 100
 	if count >= threshold {
-		m.logger("Warning: Dolt connection count %d is at %d%% of max %d — approaching limit",
+		return fmt.Sprintf("Dolt connection count %d is at %d%% of max %d — approaching limit",
 			count, (count*100)/maxConn, maxConn)
 	}
+	return ""
 }
 
-// checkDiskUsage checks disk usage of the data directory and logs a warning
-// if it exceeds 1 GB. Non-fatal: failures are silently ignored.
-func (m *DoltServerManager) checkDiskUsage() {
+// checkDiskUsage checks disk usage of the data directory and returns a warning
+// if it exceeds 1 GB. Non-fatal: failures return empty string.
+func (m *DoltServerManager) checkDiskUsage() string {
 	dataDir := m.config.DataDir
 	if dataDir == "" {
-		return
+		return ""
 	}
 
 	var total int64
@@ -994,8 +1042,88 @@ func (m *DoltServerManager) checkDiskUsage() {
 
 	const gb = 1024 * 1024 * 1024
 	if total > gb {
-		m.logger("Warning: Dolt data directory %s is %.1f GB", dataDir, float64(total)/float64(gb))
+		return fmt.Sprintf("Dolt data directory %s is %.1f GB", dataDir, float64(total)/float64(gb))
 	}
+	return ""
+}
+
+// checkDatabaseCount queries the database list and returns a warning if the count exceeds
+// what's expected based on the data directory contents. Non-fatal: failures return empty string.
+// The expected count is derived from subdirectories in the data dir (each is a registered DB).
+func (m *DoltServerManager) checkDatabaseCount() string {
+	databases, err := m.getDatabases()
+	if err != nil {
+		return "" // non-fatal
+	}
+
+	// Derive expected count from data directory — each subdirectory is a database.
+	// This adapts automatically as users add/remove rigs.
+	expected := m.countDataDirDatabases()
+	if expected == 0 {
+		expected = 6 // Fallback if data dir can't be read
+	}
+
+	// Allow a small buffer (3) above expected for transient states.
+	threshold := expected + 3
+	if len(databases) > threshold {
+		return fmt.Sprintf("%d databases detected (expected ~%d, threshold %d) — possible orphan/test database accumulation: %v",
+			len(databases), expected, threshold, databases)
+	}
+	return ""
+}
+
+// countDataDirDatabases counts subdirectories in the Dolt data directory.
+// Each subdirectory corresponds to a registered database.
+func (m *DoltServerManager) countDataDirDatabases() int {
+	dataDir := m.config.DataDir
+	if dataDir == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			count++
+		}
+	}
+	return count
+}
+
+// checkBackupFreshness checks if Dolt backups are fresh. Returns warnings for any configured
+// backup database that hasn't been synced in over 2 hours. Non-fatal: failures return nil.
+func (m *DoltServerManager) checkBackupFreshness() []string {
+	backupDir := filepath.Join(m.townRoot, ".dolt-backup")
+	info, err := os.Stat(backupDir)
+	if err != nil || !info.IsDir() {
+		return nil // No backup directory — backup patrol may not be configured
+	}
+
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return nil
+	}
+
+	const staleThreshold = 2 * time.Hour
+	now := time.Now()
+	var warnings []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dbInfo, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		age := now.Sub(dbInfo.ModTime())
+		if age > staleThreshold {
+			warnings = append(warnings, fmt.Sprintf("Dolt backup %q is %.0f minutes old (threshold %.0fm) — backup patrol may be stalled",
+				entry.Name(), age.Minutes(), staleThreshold.Minutes()))
+		}
+	}
+	return warnings
 }
 
 // checkWriteHealthLocked probes the Dolt server's write capability by attempting
