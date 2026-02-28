@@ -91,6 +91,16 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		}
 	}
 
+	// Acquire per-bead flock to prevent concurrent dispatch races (TOCTOU).
+	// The CLI path (runSling) has its own flock; this closes the gap where
+	// batch sling and queue dispatch could race against each other or against
+	// a concurrent CLI invocation.
+	releaseLock, err := tryAcquireSlingBeadLock(townRoot, params.BeadID)
+	if err != nil {
+		return &SlingResult{BeadID: params.BeadID, ErrMsg: err.Error()}, err
+	}
+	defer releaseLock()
+
 	beadsDir := params.BeadsDir
 	if beadsDir == "" {
 		beadsDir = filepath.Join(townRoot, ".beads")
@@ -100,10 +110,16 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		BeadID: params.BeadID,
 	}
 
-	// 0. Check if rig is parked before dispatching (gt-4owfd.1)
-	if params.RigName != "" && IsRigParked(townRoot, params.RigName) {
-		result.ErrMsg = "rig parked"
-		return result, fmt.Errorf("cannot sling to parked rig %q\nUnpark with: gt rig unpark %s", params.RigName, params.RigName)
+	// 0. Check if rig is parked or docked before dispatching (gt-4owfd.1, gt-11y)
+	if params.RigName != "" {
+		if blocked, reason := IsRigParkedOrDocked(townRoot, params.RigName); blocked {
+			result.ErrMsg = "rig " + reason
+			undoCmd := "gt rig unpark"
+			if reason == "docked" {
+				undoCmd = "gt rig undock"
+			}
+			return result, fmt.Errorf("cannot sling to %s rig %q\n%s %s", reason, params.RigName, undoCmd, params.RigName)
+		}
 	}
 
 	// 1. Get bead info + status check

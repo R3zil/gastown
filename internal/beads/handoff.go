@@ -11,13 +11,27 @@ import (
 	"github.com/steveyegge/gastown/internal/lock"
 )
 
-// StatusPinned is the status for pinned beads that never get closed.
-// These are "domain table" beads like role definitions that persist permanently.
-const StatusPinned = "pinned"
+// Issue status constants. These are the well-known status values used by the
+// beads system. Defining them here prevents hardcoded string comparisons
+// scattered throughout the codebase.
+const (
+	// StatusOpen is the default status for new issues.
+	StatusOpen = "open"
 
-// StatusHooked is the status for beads on an agent's hook (work assignment).
-// This is distinct from pinned - hooked beads are active work, not permanent records.
-const StatusHooked = "hooked"
+	// StatusInProgress means an agent is actively working on the issue.
+	StatusInProgress = "in_progress"
+
+	// StatusPinned is the status for pinned beads that never get closed.
+	// These are "domain table" beads like role definitions that persist permanently.
+	StatusPinned = "pinned"
+
+	// StatusHooked is the status for beads on an agent's hook (work assignment).
+	// This is distinct from pinned - hooked beads are active work, not permanent records.
+	StatusHooked = "hooked"
+
+	// StatusTombstone marks a bead as deleted/archived.
+	StatusTombstone = "tombstone"
+)
 
 // HandoffBeadTitle returns the well-known title for a role's handoff bead.
 func HandoffBeadTitle(role string) string {
