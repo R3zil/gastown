@@ -283,7 +283,8 @@ func HandleLifecycleShutdown(workDir, rigName string, msg *mail.Message) *Handle
 }
 
 // HandleHelp processes a HELP message from a polecat requesting intervention.
-// Assesses the request and either helps directly or escalates to Mayor.
+// Parses the HELP payload and presents it to the witness agent for triage.
+// The agent decides whether to help directly, escalate, and to whom.
 func HandleHelp(workDir, rigName string, msg *mail.Message, router *mail.Router) *HandlerResult {
 	result := &HandlerResult{
 		MessageID:    msg.ID,
@@ -297,29 +298,11 @@ func HandleHelp(workDir, rigName string, msg *mail.Message, router *mail.Router)
 		return result
 	}
 
-	// Assess the help request
-	assessment := AssessHelpRequest(payload)
+	// Format the help request summary for the witness agent to triage
+	summary := FormatHelpSummary(payload)
 
-	if assessment.CanHelp {
-		// Log that we can help - actual help is done by the Claude agent
-		result.Handled = true
-		result.Action = fmt.Sprintf("can help with '%s': %s", payload.Topic, assessment.HelpAction)
-		return result
-	}
-
-	// Need to escalate to Deacon (first line of escalation for routine ops)
-	if assessment.NeedsEscalation {
-		mailID, err := escalateToDeacon(router, rigName, payload, assessment.EscalationReason)
-		if err != nil {
-			result.Error = fmt.Errorf("escalating to deacon: %w", err)
-			return result
-		}
-
-		result.Handled = true
-		result.MailSent = mailID
-		result.Action = fmt.Sprintf("escalated '%s' to deacon: %s", payload.Topic, assessment.EscalationReason)
-	}
-
+	result.Handled = true
+	result.Action = summary
 	return result
 }
 
@@ -709,39 +692,6 @@ func nudgeRefinery(townRoot, rigName string) error {
 	// nudges would be stuck forever. Direct delivery is safe: if the
 	// agent is busy, text buffers in tmux and is processed at next prompt.
 	return t.NudgeSession(sessionName, "MERGE_READY received - check inbox for pending work")
-}
-
-// escalateToDeacon sends an escalation mail to the Deacon for routine operational issues.
-// The Deacon is the first line of escalation for witness operations. Only truly strategic
-// issues (deacon down, cross-rig coordination) should go directly to Mayor.
-func escalateToDeacon(router *mail.Router, rigName string, payload *HelpPayload, reason string) (string, error) {
-	msg := &mail.Message{
-		From:     fmt.Sprintf("%s/witness", rigName),
-		To:       "deacon/",
-		Subject:  fmt.Sprintf("Escalation: %s needs help", payload.Agent),
-		Priority: mail.PriorityHigh,
-		Body: fmt.Sprintf(`Agent: %s
-Issue: %s
-Topic: %s
-Problem: %s
-Tried: %s
-Escalation reason: %s
-Requested at: %s`,
-			payload.Agent,
-			payload.IssueID,
-			payload.Topic,
-			payload.Problem,
-			payload.Tried,
-			reason,
-			payload.RequestedAt.Format(time.RFC3339),
-		),
-	}
-
-	if err := router.Send(msg); err != nil {
-		return "", err
-	}
-
-	return msg.ID, nil
 }
 
 // RecoveryPayload contains data for RECOVERY_NEEDED escalation.

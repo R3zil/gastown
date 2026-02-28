@@ -1,7 +1,9 @@
 package witness
 
 import (
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestClassifyMessage(t *testing.T) {
@@ -383,80 +385,64 @@ func TestCleanupWispLabels(t *testing.T) {
 	}
 }
 
-func TestAssessHelpRequest_GitConflict(t *testing.T) {
+func TestFormatHelpSummary_FullPayload(t *testing.T) {
+	ts := time.Date(2026, 2, 28, 12, 0, 0, 0, time.UTC)
 	payload := &HelpPayload{
-		Topic:   "Git issue",
-		Problem: "Merge conflict in main.go",
+		Agent:       "gastown/polecats/nux",
+		IssueID:     "gt-1234",
+		Topic:       "Git conflict",
+		Problem:     "Merge conflict in main.go",
+		Tried:       "Attempted rebase, still conflicts",
+		RequestedAt: ts,
 	}
 
-	assessment := AssessHelpRequest(payload)
+	summary := FormatHelpSummary(payload)
 
-	if assessment.CanHelp {
-		t.Error("Should not be able to help with git conflicts")
+	if !strings.Contains(summary, "HELP REQUEST from gastown/polecats/nux") {
+		t.Errorf("summary should contain agent name, got: %s", summary)
 	}
-	if !assessment.NeedsEscalation {
-		t.Error("Git conflicts should need escalation")
+	if !strings.Contains(summary, "(issue: gt-1234)") {
+		t.Errorf("summary should contain issue ID, got: %s", summary)
+	}
+	if !strings.Contains(summary, "Topic: Git conflict") {
+		t.Errorf("summary should contain topic, got: %s", summary)
+	}
+	if !strings.Contains(summary, "Problem: Merge conflict in main.go") {
+		t.Errorf("summary should contain problem, got: %s", summary)
+	}
+	if !strings.Contains(summary, "Tried: Attempted rebase") {
+		t.Errorf("summary should contain tried, got: %s", summary)
+	}
+	if !strings.Contains(summary, "Requested: 2026-02-28") {
+		t.Errorf("summary should contain timestamp, got: %s", summary)
 	}
 }
 
-func TestAssessHelpRequest_GitPush(t *testing.T) {
+func TestFormatHelpSummary_MinimalPayload(t *testing.T) {
 	payload := &HelpPayload{
-		Topic:   "Git push failing",
-		Problem: "Cannot push to remote",
-	}
-
-	assessment := AssessHelpRequest(payload)
-
-	if !assessment.CanHelp {
-		t.Error("Should be able to help with git push issues")
-	}
-	if assessment.HelpAction == "" {
-		t.Error("HelpAction should not be empty")
-	}
-}
-
-func TestAssessHelpRequest_TestFailures(t *testing.T) {
-	payload := &HelpPayload{
-		Topic:   "Test failures",
+		Agent:   "gastown/polecats/furiosa",
 		Problem: "Tests fail on CI",
 	}
 
-	assessment := AssessHelpRequest(payload)
+	summary := FormatHelpSummary(payload)
 
-	if assessment.CanHelp {
-		t.Error("Should not be able to help with test failures")
+	if !strings.Contains(summary, "HELP REQUEST from gastown/polecats/furiosa") {
+		t.Errorf("summary should contain agent name, got: %s", summary)
 	}
-	if !assessment.NeedsEscalation {
-		t.Error("Test failures should need escalation")
+	if strings.Contains(summary, "issue:") {
+		t.Errorf("summary should not contain issue line when empty, got: %s", summary)
 	}
-}
-
-func TestAssessHelpRequest_RequirementsUnclear(t *testing.T) {
-	payload := &HelpPayload{
-		Topic:   "Requirements unclear",
-		Problem: "Don't understand the requirements for this task",
+	if strings.Contains(summary, "Topic:") {
+		t.Errorf("summary should not contain topic line when empty, got: %s", summary)
 	}
-
-	assessment := AssessHelpRequest(payload)
-
-	if assessment.CanHelp {
-		t.Error("Should not be able to help with unclear requirements")
+	if !strings.Contains(summary, "Problem: Tests fail on CI") {
+		t.Errorf("summary should contain problem, got: %s", summary)
 	}
-	if !assessment.NeedsEscalation {
-		t.Error("Unclear requirements should need escalation")
+	if strings.Contains(summary, "Tried:") {
+		t.Errorf("summary should not contain tried line when empty, got: %s", summary)
 	}
-}
-
-func TestAssessHelpRequest_BuildIssues(t *testing.T) {
-	payload := &HelpPayload{
-		Topic:   "Build failing",
-		Problem: "Cannot compile the project",
-	}
-
-	assessment := AssessHelpRequest(payload)
-
-	if !assessment.CanHelp {
-		t.Error("Should be able to help with build issues")
+	if strings.Contains(summary, "Requested:") {
+		t.Errorf("summary should not contain timestamp when zero, got: %s", summary)
 	}
 }
 
