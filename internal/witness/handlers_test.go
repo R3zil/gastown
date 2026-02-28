@@ -1354,3 +1354,164 @@ esac
 	}
 }
 
+func TestCompletionDiscovery_Types(t *testing.T) {
+	// Verify CompletionDiscovery has all expected fields
+	d := CompletionDiscovery{
+		PolecatName:    "nux",
+		AgentBeadID:    "gt-gastown-polecat-nux",
+		ExitType:       "COMPLETED",
+		IssueID:        "gt-abc123",
+		MRID:           "gt-mr-xyz",
+		Branch:         "polecat/nux/gt-abc123@hash",
+		MRFailed:       false,
+		CompletionTime: "2026-02-28T02:00:00Z",
+		Action:         "merge-ready-sent",
+		WispCreated:    "gt-wisp-123",
+	}
+
+	if d.PolecatName != "nux" {
+		t.Errorf("PolecatName = %q, want %q", d.PolecatName, "nux")
+	}
+	if d.ExitType != "COMPLETED" {
+		t.Errorf("ExitType = %q, want %q", d.ExitType, "COMPLETED")
+	}
+	if d.Branch != "polecat/nux/gt-abc123@hash" {
+		t.Errorf("Branch = %q, want correct value", d.Branch)
+	}
+}
+
+func TestDiscoverCompletionsResult_EmptyResult(t *testing.T) {
+	result := &DiscoverCompletionsResult{}
+	if result.Checked != 0 {
+		t.Errorf("Checked = %d, want 0", result.Checked)
+	}
+	if len(result.Discovered) != 0 {
+		t.Errorf("Discovered = %d, want 0", len(result.Discovered))
+	}
+	if len(result.Errors) != 0 {
+		t.Errorf("Errors = %d, want 0", len(result.Errors))
+	}
+}
+
+func TestDiscoverCompletions_NonexistentDir(t *testing.T) {
+	// When workDir doesn't exist, should return empty result
+	result := DiscoverCompletions("/nonexistent/path", "testrig", nil)
+	if result.Checked != 0 {
+		t.Errorf("Checked = %d, want 0 for nonexistent dir", result.Checked)
+	}
+}
+
+func TestDiscoverCompletions_EmptyPolecatsDir(t *testing.T) {
+	// When polecats directory exists but is empty, should scan 0
+	tmpDir := t.TempDir()
+	rigName := "testrig"
+	polecatsDir := filepath.Join(tmpDir, rigName, "polecats")
+	if err := os.MkdirAll(polecatsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Create workspace marker
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gt-root"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result := DiscoverCompletions(tmpDir, rigName, nil)
+	if result.Checked != 0 {
+		t.Errorf("Checked = %d, want 0 for empty polecats dir", result.Checked)
+	}
+}
+
+func TestDiscoverCompletions_NoCompletionMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+	// Polecat exists but agent bead has no completion metadata — should be skipped
+	tmpDir := t.TempDir()
+	rigName := "testrig"
+	polecatsDir := filepath.Join(tmpDir, rigName, "polecats")
+	if err := os.MkdirAll(filepath.Join(polecatsDir, "nux"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gt-root"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mock bd that returns agent bead with no completion fields
+	mockBd := filepath.Join(tmpDir, "bd")
+	mockScript := `#!/bin/sh
+case "$1" in
+  show)
+    cat <<'EOJSON'
+[{"id":"gt-testrig-polecat-nux","description":"Agent: testrig/polecats/nux\n\nrole_type: polecat\nrig: testrig\nagent_state: working\nhook_bead: gt-work-001","agent_state":"working","hook_bead":"gt-work-001"}]
+EOJSON
+    ;;
+esac
+`
+	if err := os.WriteFile(mockBd, []byte(mockScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tmpDir+":"+os.Getenv("PATH"))
+
+	result := DiscoverCompletions(tmpDir, rigName, nil)
+	if result.Checked != 1 {
+		t.Errorf("Checked = %d, want 1", result.Checked)
+	}
+	if len(result.Discovered) != 0 {
+		t.Errorf("Discovered = %d, want 0 (no completion metadata)", len(result.Discovered))
+	}
+}
+
+func TestProcessDiscoveredCompletion_PhaseComplete(t *testing.T) {
+	payload := &PolecatDonePayload{
+		PolecatName: "nux",
+		Exit:        "PHASE_COMPLETE",
+	}
+	discovery := &CompletionDiscovery{}
+	processDiscoveredCompletion("/tmp", "testrig", payload, nil, discovery)
+	if discovery.Action != "phase-complete" {
+		t.Errorf("Action = %q, want %q", discovery.Action, "phase-complete")
+	}
+}
+
+func TestProcessDiscoveredCompletion_NoMR(t *testing.T) {
+	payload := &PolecatDonePayload{
+		PolecatName: "nux",
+		Exit:        "COMPLETED",
+		MRFailed:    true, // Prevents fallback MR lookup
+	}
+	discovery := &CompletionDiscovery{}
+	processDiscoveredCompletion("/tmp", "testrig", payload, nil, discovery)
+	if !strings.Contains(discovery.Action, "acknowledged-idle") {
+		t.Errorf("Action = %q, want to contain %q", discovery.Action, "acknowledged-idle")
+	}
+}
+
+func TestProcessDiscoveredCompletion_EscalatedNoMR(t *testing.T) {
+	payload := &PolecatDonePayload{
+		PolecatName: "nux",
+		Exit:        "ESCALATED",
+	}
+	discovery := &CompletionDiscovery{}
+	processDiscoveredCompletion("/tmp", "testrig", payload, nil, discovery)
+	if !strings.Contains(discovery.Action, "acknowledged-idle") {
+		t.Errorf("Action = %q, want to contain %q for ESCALATED exit", discovery.Action, "acknowledged-idle")
+	}
+}
+
+func TestGetAgentBeadFields_NoAgentBead(t *testing.T) {
+	// When bd is not available, should return nil
+	t.Setenv("PATH", "/nonexistent")
+	fields := getAgentBeadFields("/tmp", "gt-fake-agent")
+	if fields != nil {
+		t.Error("expected nil fields when bd unavailable")
+	}
+}
+
+func TestClearCompletionMetadata_NoBd(t *testing.T) {
+	// When bd is not available, should return error
+	t.Setenv("PATH", "/nonexistent")
+	err := clearCompletionMetadata("/tmp", "gt-fake-agent")
+	if err == nil {
+		t.Error("expected error when bd unavailable")
+	}
+}
+

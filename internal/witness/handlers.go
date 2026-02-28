@@ -1517,6 +1517,224 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 	return result
 }
 
+// CompletionDiscovery represents a polecat completion discovered from agent bead
+// metadata rather than POLECAT_DONE mail. This is the primary discovery mechanism
+// for polecat state transitions (gt-w0br).
+type CompletionDiscovery struct {
+	PolecatName    string
+	AgentBeadID    string
+	ExitType       string // COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE
+	IssueID        string // from hook_bead
+	MRID           string
+	Branch         string
+	MRFailed       bool
+	CompletionTime string
+	Action         string // What was done: "merge-ready-sent", "acknowledged-idle", "phase-complete"
+	WispCreated    string // ID of cleanup wisp if created
+	Error          error
+}
+
+// DiscoverCompletionsResult contains results from scanning agent beads for completions.
+type DiscoverCompletionsResult struct {
+	Checked    int                   // Number of polecats scanned
+	Discovered []CompletionDiscovery // Completions found and processed
+	Errors     []error               // Transient errors
+}
+
+// DiscoverCompletions scans all polecat agent beads for completion metadata
+// written by gt done. This is the PRIMARY mechanism for discovering polecat
+// state transitions, replacing the mail-based POLECAT_DONE flow (gt-w0br).
+//
+// For each polecat with completion metadata (exit_type + completion_time set):
+//   - PHASE_COMPLETE: acknowledge (polecat recycled, awaiting gate)
+//   - COMPLETED with MR: create cleanup wisp, send MERGE_READY to refinery
+//   - COMPLETED without MR: acknowledge idle state
+//   - ESCALATED/DEFERRED: acknowledge (polecat goes idle)
+//
+// After processing, clears the completion metadata on the agent bead to prevent
+// re-processing on the next patrol cycle.
+//
+// This implements 'Discover Don't Track' (PRIMING.md principle #4): the witness
+// observes completion state from beads each cycle rather than relying on mail.
+func DiscoverCompletions(workDir, rigName string, router *mail.Router) *DiscoverCompletionsResult {
+	result := &DiscoverCompletionsResult{}
+
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" {
+		townRoot = workDir
+	}
+	initRegistryFromTownRoot(townRoot)
+
+	polecatsDir := filepath.Join(townRoot, rigName, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		return result
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		polecatName := entry.Name()
+		prefix := beads.GetPrefixForRig(townRoot, rigName)
+		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+		result.Checked++
+
+		// Get full agent fields including completion metadata
+		fields := getAgentBeadFields(workDir, agentBeadID)
+		if fields == nil || fields.ExitType == "" || fields.CompletionTime == "" {
+			continue // No completion metadata — skip
+		}
+
+		discovery := CompletionDiscovery{
+			PolecatName:    polecatName,
+			AgentBeadID:    agentBeadID,
+			ExitType:       fields.ExitType,
+			IssueID:        fields.HookBead,
+			MRID:           fields.MRID,
+			Branch:         fields.Branch,
+			MRFailed:       fields.MRFailed,
+			CompletionTime: fields.CompletionTime,
+		}
+
+		// Build a payload compatible with the existing routing logic
+		payload := &PolecatDonePayload{
+			PolecatName: polecatName,
+			Exit:        fields.ExitType,
+			IssueID:     fields.HookBead,
+			MRID:        fields.MRID,
+			Branch:      fields.Branch,
+			MRFailed:    fields.MRFailed,
+		}
+
+		// Route based on exit type and MR presence
+		processDiscoveredCompletion(workDir, rigName, payload, router, &discovery)
+
+		// Clear completion metadata to prevent re-processing next cycle
+		if err := clearCompletionMetadata(workDir, agentBeadID); err != nil {
+			result.Errors = append(result.Errors,
+				fmt.Errorf("clearing completion metadata for %s: %w", polecatName, err))
+		}
+
+		result.Discovered = append(result.Discovered, discovery)
+	}
+
+	return result
+}
+
+// processDiscoveredCompletion routes a discovered completion through the same
+// logic as HandlePolecatDone, creating cleanup wisps and sending MERGE_READY
+// as appropriate. This is the bead-based equivalent of POLECAT_DONE mail handling.
+func processDiscoveredCompletion(workDir, rigName string, payload *PolecatDonePayload, router *mail.Router, discovery *CompletionDiscovery) {
+	if payload.Exit == string(ExitTypePhaseComplete) {
+		discovery.Action = "phase-complete"
+		return
+	}
+
+	hasMR := payload.MRID != ""
+
+	// When Exit==COMPLETED but MRID is empty and MR creation didn't explicitly
+	// fail, query beads to check if an MR bead exists for this branch.
+	if !hasMR && payload.Exit == string(ExitTypeCompleted) && !payload.MRFailed && payload.Branch != "" {
+		if mrID := findMRBeadForBranch(workDir, payload.Branch); mrID != "" {
+			payload.MRID = mrID
+			hasMR = true
+		}
+	}
+
+	if hasMR {
+		wispID, err := createCleanupWisp(workDir, payload.PolecatName, payload.IssueID, payload.Branch)
+		if err != nil {
+			discovery.Error = fmt.Errorf("creating cleanup wisp: %w", err)
+			return
+		}
+		discovery.WispCreated = wispID
+
+		if err := UpdateCleanupWispState(workDir, wispID, "merge-requested"); err != nil {
+			discovery.Error = fmt.Errorf("updating wisp state: %w", err)
+		}
+
+		if router != nil {
+			mailID, err := sendMergeReady(router, rigName, payload)
+			if err != nil {
+				if discovery.Error != nil {
+					discovery.Error = fmt.Errorf("sending MERGE_READY: %w (also: %v)", err, discovery.Error)
+				} else {
+					discovery.Error = fmt.Errorf("sending MERGE_READY: %w (non-fatal)", err)
+				}
+			} else {
+				_ = mailID // Logged via discovery.Action
+
+				townRoot, _ := workspace.Find(workDir)
+				if nudgeErr := nudgeRefinery(townRoot, rigName); nudgeErr != nil {
+					if discovery.Error == nil {
+						discovery.Error = fmt.Errorf("nudging refinery: %w (non-fatal)", nudgeErr)
+					}
+				}
+			}
+		}
+
+		discovery.Action = fmt.Sprintf("merge-ready-sent (MR=%s, wisp=%s)", payload.MRID, wispID)
+		return
+	}
+
+	// No MR — polecat is idle (persistent polecat model, gt-4ac)
+	discovery.Action = fmt.Sprintf("acknowledged-idle (exit=%s)", payload.Exit)
+}
+
+// getAgentBeadFields reads the full agent description fields from an agent bead,
+// including completion metadata (exit_type, mr_id, branch, mr_failed, completion_time).
+// Returns nil if the bead doesn't exist or can't be parsed.
+func getAgentBeadFields(workDir, agentBeadID string) *beads.AgentFields {
+	output, err := util.ExecWithOutput(workDir, "bd", "show", agentBeadID, "--json")
+	if err != nil || output == "" {
+		return nil
+	}
+
+	var issues []struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return nil
+	}
+
+	return beads.ParseAgentFields(issues[0].Description)
+}
+
+// clearCompletionMetadata removes completion metadata fields from an agent bead
+// by reading the current description, clearing the fields, and writing back.
+// This prevents the same completion from being re-processed on the next patrol cycle.
+func clearCompletionMetadata(workDir, agentBeadID string) error {
+	output, err := util.ExecWithOutput(workDir, "bd", "show", agentBeadID, "--json")
+	if err != nil || output == "" {
+		return fmt.Errorf("reading agent bead %s: %w", agentBeadID, err)
+	}
+
+	var issues []struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return fmt.Errorf("parsing agent bead JSON for %s: %w", agentBeadID, err)
+	}
+
+	fields := beads.ParseAgentFields(issues[0].Description)
+	if fields == nil {
+		return nil
+	}
+
+	// Clear completion metadata fields
+	fields.ExitType = ""
+	fields.MRID = ""
+	fields.Branch = ""
+	fields.MRFailed = false
+	fields.CompletionTime = ""
+
+	newDesc := beads.FormatAgentDescription(issues[0].Title, fields)
+	return util.ExecRun(workDir, "bd", "update", agentBeadID, "--description", newDesc)
+}
+
 // getAgentBeadState reads agent_state and hook_bead from an agent bead.
 // Returns the agent_state string and hook_bead ID.
 func getAgentBeadState(workDir, agentBeadID string) (agentState, hookBead string) {
