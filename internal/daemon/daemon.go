@@ -560,7 +560,7 @@ func (d *Daemon) Run() error {
 
 		case <-compactorDogChan:
 			// Compactor dog — flattens Dolt commit history on production databases.
-			// Reclaims commit graph storage. Doctor Dog gc reclaims chunks after.
+			// Reclaims commit graph storage, then runs gc to reclaim chunks.
 			if !d.isShutdownInProgress() {
 				d.runCompactorDog()
 			}

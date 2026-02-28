@@ -160,8 +160,8 @@ func TestDoctorDogReportOmitsNilFields(t *testing.T) {
 	if _, ok := raw["databases"]; ok {
 		t.Error("expected databases to be omitted when nil")
 	}
-	if _, ok := raw["gc"]; ok {
-		t.Error("expected gc to be omitted when nil")
+	if _, ok := raw["zombies"]; ok {
+		t.Error("expected zombies to be omitted when nil")
 	}
 }
 

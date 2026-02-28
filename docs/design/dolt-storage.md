@@ -196,7 +196,7 @@ EPHEMERAL (wisps, patrol data)          PERMANENT (issues, molecules, agents)
   → CLOSE (>24h)                          → CLOSE
   → DELETE rows (Reaper)                  → JSONL export (scrubbed)
   → REBASE history (Compactor)            → git push to GitHub
-  → gc unreferenced chunks (Doctor)       → COMPACT history periodically
+  → gc unreferenced chunks (Compactor)    → COMPACT history periodically
                                           → FLATTEN history quarterly
 ```
 
@@ -238,8 +238,9 @@ dolt gc
 ### Dolt GC
 
 `dolt gc` compacts old chunk data AFTER rebase removes commits from the
-graph. Run gc after rebase, not instead of it. The Doctor Dog runs gc
-daily. Order matters: rebase first, gc second.
+graph. Run gc after rebase, not instead of it. The Compactor Dog runs gc
+automatically after each successful compaction. Order matters: rebase
+first, gc second.
 
 ```bash
 # Manual gc (stop server first for exclusive access)
@@ -264,8 +265,8 @@ Prevention is layered:
 - **Prompting**: Agents prefer `gt nudge` over `gt mail send` (zero commits)
 - **Firewall** (store.go): refuses test-prefixed CREATE DATABASE on port 3307
 - **Reaper Dog**: DELETEs closed wisps, auto-closes stale issues
-- **Compactor Dog**: REBASEs old commits to compress history (NEW)
-- **Doctor Dog**: runs gc, kills zombie servers, detects orphan DBs
+- **Compactor Dog**: REBASEs old commits to compress history, runs gc after
+- **Doctor Dog**: kills zombie servers, detects orphan DBs, monitors health
 - **JSONL Dog**: scrubs exports, rejects pollution, spike-detects before commit
 - **Janitor Dog**: cleans test server (port 3308)
 

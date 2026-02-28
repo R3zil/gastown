@@ -21,7 +21,6 @@ const (
 	defaultDoctorDogInterval = 5 * time.Minute
 	doctorDogTCPTimeout      = 5 * time.Second
 	doctorDogQueryTimeout    = 10 * time.Second
-	doctorDogGCTimeout       = 5 * time.Minute
 )
 
 // Response thresholds — when to take automated action.
@@ -67,7 +66,6 @@ type DoctorDogReport struct {
 	TCPReachable   bool                       `json:"tcp_reachable"`
 	Latency        *DoctorDogLatencyReport    `json:"latency,omitempty"`
 	Databases      *DoctorDogDatabasesReport  `json:"databases,omitempty"`
-	GC             []DoctorDogGCReport        `json:"gc,omitempty"`
 	Zombies        []DoctorDogZombieReport    `json:"zombies,omitempty"`
 	BackupAge      *DoctorDogBackupReport     `json:"backup_age,omitempty"`
 	JsonlBackupAge *DoctorDogBackupReport     `json:"jsonl_backup_age,omitempty"`
@@ -85,15 +83,6 @@ type DoctorDogDatabasesReport struct {
 	Names []string `json:"names"`
 	Count int      `json:"count"`
 	Error string   `json:"error,omitempty"`
-}
-
-// DoctorDogGCReport records the result of dolt gc on one database.
-type DoctorDogGCReport struct {
-	Database   string  `json:"database"`
-	DurationMs float64 `json:"duration_ms"`
-	Success    bool    `json:"success"`
-	TimedOut   bool    `json:"timed_out,omitempty"`
-	Error      string  `json:"error,omitempty"`
 }
 
 // DoctorDogZombieReport records a detected zombie dolt sql-server process.
@@ -128,7 +117,7 @@ func doctorDogInterval(config *DaemonPatrolConfig) time.Duration {
 	return defaultDoctorDogInterval
 }
 
-// doctorDogDatabases returns the list of production databases for gc.
+// doctorDogDatabases returns the list of production databases for health checks.
 func doctorDogDatabases(config *DaemonPatrolConfig) []string {
 	if config != nil && config.Patrols != nil && config.Patrols.DoctorDog != nil {
 		if len(config.Patrols.DoctorDog.Databases) > 0 {
@@ -169,23 +158,20 @@ func (d *Daemon) runDoctorDog() {
 		report.Databases = d.doctorDogDatabasesReport(host, port)
 	}
 
-	// 4. Dolt GC on each production database (filesystem-based)
-	report.GC = d.doctorDogRunGC()
-
-	// 5. Zombie server detection
+	// 4. Zombie server detection
 	expectedPorts := []int{port}
 	if d.doltTestServer != nil && d.doltTestServer.IsEnabled() {
 		expectedPorts = append(expectedPorts, d.doltTestServer.config.Port)
 	}
 	report.Zombies = d.doctorDogZombieReport(expectedPorts)
 
-	// 6. Backup staleness (Dolt filesystem)
+	// 5. Backup staleness (Dolt filesystem)
 	report.BackupAge = d.doctorDogBackupAgeReport()
 
-	// 6b. JSONL git backup freshness
+	// 5b. JSONL git backup freshness
 	report.JsonlBackupAge = d.doctorDogJsonlBackupAgeReport()
 
-	// 7. Disk usage per DB
+	// 6. Disk usage per DB
 	report.DiskUsage = d.doctorDogDiskUsageReport()
 
 	// Write structured report for agent consumption
@@ -266,63 +252,6 @@ func (d *Daemon) doctorDogDatabasesReport(host string, port int) *DoctorDogDatab
 
 	d.logger.Printf("doctor_dog: databases: %d found", len(databases))
 	return &DoctorDogDatabasesReport{Names: databases, Count: len(databases)}
-}
-
-// doctorDogRunGC runs dolt gc on each production database from the filesystem.
-// GC is maintenance, not a judgment call — the doctor runs it and reports results.
-func (d *Daemon) doctorDogRunGC() []DoctorDogGCReport {
-	var dataDir string
-	if d.doltServer != nil && d.doltServer.IsEnabled() && d.doltServer.config.DataDir != "" {
-		dataDir = d.doltServer.config.DataDir
-	} else {
-		dataDir = filepath.Join(d.config.TownRoot, ".dolt-data")
-	}
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		d.logger.Printf("doctor_dog: gc: data dir %s does not exist, skipping", dataDir)
-		return nil
-	}
-
-	databases := doctorDogDatabases(d.patrolConfig)
-	d.logger.Printf("doctor_dog: gc: running on %d databases", len(databases))
-
-	var results []DoctorDogGCReport
-	for _, dbName := range databases {
-		dbDir := filepath.Join(dataDir, dbName)
-		if _, err := os.Stat(dbDir); os.IsNotExist(err) {
-			d.logger.Printf("doctor_dog: gc: %s: directory not found, skipping", dbName)
-			continue
-		}
-
-		results = append(results, d.doctorDogGCDatabase(dbDir, dbName))
-	}
-	return results
-}
-
-// doctorDogGCDatabase runs dolt gc on a single database directory and reports result.
-func (d *Daemon) doctorDogGCDatabase(dbDir, dbName string) DoctorDogGCReport {
-	ctx, cancel := context.WithTimeout(context.Background(), doctorDogGCTimeout)
-	defer cancel()
-
-	start := time.Now()
-	cmd := exec.CommandContext(ctx, "dolt", "gc")
-	cmd.Dir = dbDir
-
-	output, err := cmd.CombinedOutput()
-	elapsed := time.Since(start)
-	durationMs := float64(elapsed.Microseconds()) / 1000.0
-
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			d.logger.Printf("doctor_dog: gc: %s: TIMEOUT after %v", dbName, elapsed)
-			return DoctorDogGCReport{Database: dbName, DurationMs: durationMs, TimedOut: true, Error: "timeout"}
-		}
-		errMsg := strings.TrimSpace(string(output))
-		d.logger.Printf("doctor_dog: gc: %s: failed after %v: %v (%s)", dbName, elapsed, err, errMsg)
-		return DoctorDogGCReport{Database: dbName, DurationMs: durationMs, Error: fmt.Sprintf("%v: %s", err, errMsg)}
-	}
-
-	d.logger.Printf("doctor_dog: gc: %s: completed in %v", dbName, elapsed)
-	return DoctorDogGCReport{Database: dbName, DurationMs: durationMs, Success: true}
 }
 
 // doctorDogZombieReport scans for dolt sql-server processes NOT on any expected port.

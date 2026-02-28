@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -17,6 +21,8 @@ const (
 	defaultCompactorCommitThreshold = 500
 	// compactorQueryTimeout is the timeout for individual SQL queries during compaction.
 	compactorQueryTimeout = 30 * time.Second
+	// compactorGCTimeout is the timeout for dolt gc after compaction.
+	compactorGCTimeout = 5 * time.Minute
 	// compactorBranchName is the temporary branch used during compaction.
 	compactorBranchName = "gt-compaction"
 )
@@ -64,7 +70,9 @@ func compactorDogThreshold(config *DaemonPatrolConfig) int {
 //  5. Verify row counts match (integrity check)
 //  6. Move main to the new single commit
 //  7. Delete temp branch
-//  8. Run gc to reclaim space
+//
+// After successful compaction, runs dolt gc to reclaim unreferenced chunks.
+// Order matters: rebase first (compaction), gc second.
 //
 // Concurrency safety: if main HEAD moves during compaction, abort.
 func (d *Daemon) runCompactorDog() {
@@ -113,6 +121,11 @@ func (d *Daemon) runCompactorDog() {
 			errors++
 		} else {
 			compacted++
+			// Run gc after successful compaction to reclaim unreferenced chunks.
+			// Order matters: rebase first (compactDatabase), gc second.
+			if err := d.compactorRunGC(dbName); err != nil {
+				d.logger.Printf("compactor_dog: %s: gc after compaction failed: %v", dbName, err)
+			}
 		}
 	}
 
@@ -384,4 +397,43 @@ func (d *Daemon) compactorGetRowCounts(db *sql.DB, dbName string) (map[string]in
 	}
 
 	return counts, nil
+}
+
+// compactorRunGC runs dolt gc on a single database directory after compaction.
+// GC reclaims unreferenced chunks left behind by the rebase operation.
+func (d *Daemon) compactorRunGC(dbName string) error {
+	var dataDir string
+	if d.doltServer != nil && d.doltServer.IsEnabled() && d.doltServer.config.DataDir != "" {
+		dataDir = d.doltServer.config.DataDir
+	} else {
+		dataDir = filepath.Join(d.config.TownRoot, ".dolt-data")
+	}
+
+	dbDir := filepath.Join(dataDir, dbName)
+	if _, err := os.Stat(dbDir); os.IsNotExist(err) {
+		return fmt.Errorf("database directory %s does not exist", dbDir)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), compactorGCTimeout)
+	defer cancel()
+
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "dolt", "gc")
+	cmd.Dir = dbDir
+
+	output, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			d.logger.Printf("compactor_dog: gc: %s: TIMEOUT after %v", dbName, elapsed)
+			return fmt.Errorf("gc timeout after %v", elapsed)
+		}
+		errMsg := strings.TrimSpace(string(output))
+		d.logger.Printf("compactor_dog: gc: %s: failed after %v: %v (%s)", dbName, elapsed, err, errMsg)
+		return fmt.Errorf("%v: %s", err, errMsg)
+	}
+
+	d.logger.Printf("compactor_dog: gc: %s: completed in %v", dbName, elapsed)
+	return nil
 }
