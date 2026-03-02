@@ -1104,7 +1104,7 @@ func Start(townRoot string) error {
 	// signals sent to the parent process group (e.g. SIGHUP when the caller
 	// calls syscall.Exec to become tmux) don't reach the dolt server.
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
 		if closeErr := logFile.Close(); closeErr != nil {
