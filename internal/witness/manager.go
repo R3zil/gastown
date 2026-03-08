@@ -1,6 +1,7 @@
 package witness
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -9,11 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
-	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -121,7 +123,24 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 			// Healthy - Claude is running
 			return ErrAlreadyRunning
 		}
-		// Zombie - tmux alive but Claude dead. Kill and recreate.
+		// Zombie detected — tmux alive but agent dead.
+		// Mitigate TOCTOU gap: the agent may be slow to start, appearing
+		// dead during initialization. Record session creation time, wait
+		// briefly, then re-verify before killing to avoid destroying a
+		// session that just became healthy.
+		createdAt, _ := t.GetSessionCreatedUnix(sessionID)
+		time.Sleep(constants.ZombieKillGracePeriod)
+
+		// Re-check: abort kill if agent started or session was replaced
+		if t.IsAgentAlive(sessionID) {
+			return ErrAlreadyRunning
+		}
+		if createdNow, _ := t.GetSessionCreatedUnix(sessionID); createdAt > 0 && createdNow != createdAt {
+			// Session was replaced between checks — another process already
+			// handled the zombie. Treat as already running; caller can retry.
+			return ErrAlreadyRunning
+		}
+
 		if err := t.KillSession(sessionID); err != nil {
 			return fmt.Errorf("killing zombie session: %w", err)
 		}
@@ -165,6 +184,9 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		return err
 	}
 
+	// Generate the GASTA run ID for this witness session.
+	runID := uuid.New().String()
+
 	// Create session with command directly to avoid send-keys race condition.
 	// See: https://github.com/anthropics/gastown/issues/280
 	if err := t.NewSessionWithCommand(sessionID, witnessDir, command); err != nil {
@@ -174,17 +196,26 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	// Set environment variables (non-fatal: session works without these)
 	// Use centralized AgentEnv for consistency across all role startup paths
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:     "witness",
-		Rig:      m.rig.Name,
-		TownRoot: townRoot,
-		Agent:    agentOverride,
+		Role:        "witness",
+		Rig:         m.rig.Name,
+		TownRoot:    townRoot,
+		Agent:       agentOverride,
+		SessionName: sessionID,
 	})
 	envVars = session.MergeRuntimeLivenessEnv(envVars, runtimeConfig)
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
 	}
+	_ = t.SetEnvironment(sessionID, "GT_RUN", runID)
 	// Apply role config env vars if present (non-fatal).
+	// Skip keys already set by AgentEnv — AgentEnv is the single source of truth
+	// for identity vars (GT_ROLE, BD_ACTOR, etc.) and produces fully-qualified
+	// values (e.g., "beacon/witness"). TOML [env] sections contain unqualified
+	// values (e.g., "witness") that would overwrite the correct ones.
 	for key, value := range roleConfigEnvVars(roleConfig, townRoot, m.rig.Name) {
+		if _, alreadySet := envVars[key]; alreadySet {
+			continue
+		}
 		_ = t.SetEnvironment(sessionID, key, value)
 	}
 	// Apply CLI env overrides (highest priority, non-fatal).
@@ -215,20 +246,35 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 		log.Printf("warning: tracking session PID for %s: %v", sessionID, err)
 	}
 
+	// Stream witness's Claude Code JSONL conversation log to VictoriaLogs (opt-in).
+	if os.Getenv("GT_LOG_AGENT_OUTPUT") == "true" && os.Getenv("GT_OTEL_LOGS_URL") != "" {
+		if err := session.ActivateAgentLogging(sessionID, witnessDir, runID); err != nil {
+			log.Printf("warning: agent log watcher setup failed for %s: %v", sessionID, err)
+		}
+	}
+
+	// Record the agent instantiation event (GASTA root span).
+	session.RecordAgentInstantiateFromDir(context.Background(), runID, runtimeConfig.ResolvedAgent,
+		"witness", "witness", sessionID, m.rig.Name, townRoot, "", witnessDir)
+
 	time.Sleep(constants.ShutdownNotifyDelay)
 
 	return nil
 }
 
 func (m *Manager) roleConfig() (*beads.RoleConfig, error) {
-	// Role beads use hq- prefix and live in town-level beads, not rig beads
 	townRoot := m.townRoot()
-	bd := beads.NewWithBeadsDir(townRoot, beads.ResolveBeadsDir(townRoot))
-	roleConfig, err := bd.GetRoleConfig(beads.RoleBeadIDTown("witness"))
+	roleDef, err := config.LoadRoleDefinition(townRoot, m.rig.Path, "witness")
 	if err != nil {
 		return nil, fmt.Errorf("loading witness role config: %w", err)
 	}
-	return roleConfig, nil
+	return &beads.RoleConfig{
+		SessionPattern: roleDef.Session.Pattern,
+		WorkDirPattern: roleDef.Session.WorkDir,
+		NeedsPreSync:   roleDef.Session.NeedsPreSync,
+		StartCommand:   roleDef.Session.StartCommand,
+		EnvVars:        roleDef.Env,
+	}, nil
 }
 
 func (m *Manager) townRoot() string {
@@ -255,7 +301,14 @@ func buildWitnessStartCommand(rigPath, rigName, townRoot, sessionName, agentOver
 		roleConfig = nil
 	}
 	if roleConfig != nil && roleConfig.StartCommand != "" {
-		return beads.ExpandRolePattern(roleConfig.StartCommand, townRoot, rigName, "", "witness", session.PrefixFor(rigName)), nil
+		// Skip the hardcoded start_command when a non-Claude agent is configured.
+		// Built-in role TOMLs hardcode "exec claude ..." which bypasses the
+		// declarative agent resolution system. Fall through to
+		// BuildStartupCommandFromConfig so the correct agent command is built.
+		rc := config.ResolveRoleAgentConfig("witness", townRoot, rigPath)
+		if config.IsResolvedAgentClaude(rc) {
+			return beads.ExpandRolePattern(roleConfig.StartCommand, townRoot, rigName, "", "witness", session.PrefixFor(rigName)), nil
+		}
 	}
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
 		Recipient: session.BeaconRecipient("witness", "", rigName),

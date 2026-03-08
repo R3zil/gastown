@@ -13,6 +13,30 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// TestExtractRoleFromIdentity verifies that role names are correctly extracted
+// from agent identity strings, including trailing slashes and compound paths.
+func TestExtractRoleFromIdentity(t *testing.T) {
+	tests := []struct {
+		target string
+		want   string
+	}{
+		{"gastown/refinery", "refinery"},
+		{"gastown/witness", "witness"},
+		{"gastown/crew/jack", "jack"},
+		{"gastown/polecats/nux", "nux"},
+		{"mayor/", "mayor"},
+		{"deacon/", "deacon"},
+		{"deacon/boot", "boot"},
+		{"refinery", "refinery"},
+	}
+	for _, tc := range tests {
+		got := extractRoleFromIdentity(tc.target)
+		if got != tc.want {
+			t.Errorf("extractRoleFromIdentity(%q) = %q, want %q", tc.target, got, tc.want)
+		}
+	}
+}
+
 // TestSquashJitterInvalidDuration verifies that an invalid --jitter value
 // returns a parse error immediately (before any workspace operations).
 func TestSquashJitterInvalidDuration(t *testing.T) {
@@ -998,7 +1022,8 @@ exit /b 0
 
 	// Call the unexported function directly (same package)
 	// updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
-	updateAgentStateOnDone(rigPath, townRoot, ExitCompleted, "")
+	// Pass issueID directly — hq-l6mm5 removed agent bead hook slot lookup
+	updateAgentStateOnDone(rigPath, townRoot, ExitCompleted, "gt-abc123")
 
 	// Read the close log to see what got closed
 	closesBytes, err := os.ReadFile(closesPath)

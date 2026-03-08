@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -59,6 +60,9 @@ exit 0
 // Regression test for gt-1z0:
 // daemon should not spawn a fresh Boot session every heartbeat when triage was just run.
 func TestEnsureBootRunning_DoesNotSpawnEveryTick(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows — fake tmux requires bash")
+	}
 	townRoot := t.TempDir()
 	fakeBinDir := t.TempDir()
 	tmuxLog := filepath.Join(t.TempDir(), "tmux.log")

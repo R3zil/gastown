@@ -44,10 +44,6 @@ func TestDefaultLifecycleConfig(t *testing.T) {
 		t.Error("expected doctor_dog to be enabled")
 	}
 
-	if p.JanitorDog == nil || !p.JanitorDog.Enabled {
-		t.Error("expected janitor_dog to be enabled")
-	}
-
 	if p.JsonlGitBackup == nil || !p.JsonlGitBackup.Enabled {
 		t.Error("expected jsonl_git_backup to be enabled")
 	}
@@ -141,7 +137,6 @@ func TestEnsureLifecycleDefaults_FullyConfigured(t *testing.T) {
 			WispReaper:   &WispReaperConfig{Enabled: false},
 			CompactorDog: &CompactorDogConfig{Enabled: false},
 			DoctorDog:    &DoctorDogConfig{Enabled: false},
-			JanitorDog:   &JanitorDogConfig{Enabled: false},
 			JsonlGitBackup:       &JsonlGitBackupConfig{Enabled: false},
 			DoltBackup:           &DoltBackupConfig{Enabled: false},
 			ScheduledMaintenance: &ScheduledMaintenanceConfig{Enabled: false, Threshold: &threshold},
@@ -249,6 +244,80 @@ func TestEnsureLifecycleConfigFile_ExistingPartial(t *testing.T) {
 	}
 	if config.Patrols.ScheduledMaintenance == nil || !config.Patrols.ScheduledMaintenance.Enabled {
 		t.Error("expected scheduled_maintenance to be added")
+	}
+}
+
+func TestEnsureLifecycleConfigFile_ProductionScenario(t *testing.T) {
+	// Simulates the actual production daemon.json: has core patrols (deacon,
+	// refinery, witness) and explicitly disabled dolt_backup, but is missing
+	// all data maintenance tickers (wisp_reaper, compactor_dog, doctor_dog,
+	// jsonl_git_backup, scheduled_maintenance).
+	tmpDir := t.TempDir()
+	mayorDir := filepath.Join(tmpDir, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	existing := &DaemonPatrolConfig{
+		Type:    "daemon-patrol-config",
+		Version: 1,
+		Patrols: &PatrolsConfig{
+			Deacon:   &PatrolConfig{Enabled: true, Interval: "5m", Agent: "deacon"},
+			Refinery: &PatrolConfig{Enabled: true, Interval: "5m", Agent: "refinery"},
+			Witness:  &PatrolConfig{Enabled: true, Interval: "5m", Agent: "witness"},
+			DoltBackup: &DoltBackupConfig{Enabled: false},
+		},
+	}
+	data, _ := json.MarshalIndent(existing, "", "  ")
+	configFile := filepath.Join(mayorDir, "daemon.json")
+	if err := os.WriteFile(configFile, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := EnsureLifecycleConfigFile(tmpDir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Reload and verify
+	data, _ = os.ReadFile(configFile)
+	var config DaemonPatrolConfig
+	json.Unmarshal(data, &config)
+
+	// Core patrols preserved
+	if config.Patrols.Deacon == nil || !config.Patrols.Deacon.Enabled {
+		t.Error("expected deacon to remain enabled")
+	}
+	if config.Patrols.Refinery == nil || !config.Patrols.Refinery.Enabled {
+		t.Error("expected refinery to remain enabled")
+	}
+	if config.Patrols.Witness == nil || !config.Patrols.Witness.Enabled {
+		t.Error("expected witness to remain enabled")
+	}
+
+	// Explicitly disabled dolt_backup preserved (user intent)
+	if config.Patrols.DoltBackup == nil {
+		t.Fatal("expected dolt_backup config to be preserved")
+	}
+	if config.Patrols.DoltBackup.Enabled {
+		t.Error("expected dolt_backup to remain disabled (user explicitly set false)")
+	}
+
+	// Missing lifecycle tickers auto-populated with defaults
+	if config.Patrols.WispReaper == nil || !config.Patrols.WispReaper.Enabled {
+		t.Error("expected wisp_reaper to be auto-populated and enabled")
+	}
+	if config.Patrols.CompactorDog == nil || !config.Patrols.CompactorDog.Enabled {
+		t.Error("expected compactor_dog to be auto-populated and enabled")
+	}
+	if config.Patrols.DoctorDog == nil || !config.Patrols.DoctorDog.Enabled {
+		t.Error("expected doctor_dog to be auto-populated and enabled")
+	}
+	if config.Patrols.JsonlGitBackup == nil || !config.Patrols.JsonlGitBackup.Enabled {
+		t.Error("expected jsonl_git_backup to be auto-populated and enabled")
+	}
+	if config.Patrols.ScheduledMaintenance == nil || !config.Patrols.ScheduledMaintenance.Enabled {
+		t.Error("expected scheduled_maintenance to be auto-populated and enabled")
 	}
 }
 

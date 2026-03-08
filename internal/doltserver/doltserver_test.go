@@ -1470,6 +1470,56 @@ func TestEnsureMetadata_RepairsMissingDoltFields(t *testing.T) {
 	}
 }
 
+// TestEnsureMetadata_RepairsStalePort tests that EnsureMetadata overwrites
+// a stale dolt_server_port (e.g., 13729 from a previous bd init) with the
+// correct port from DefaultConfig. This is the root cause of "connection
+// refused" errors reported by community users after gt dolt fix-metadata.
+func TestEnsureMetadata_RepairsStalePort(t *testing.T) {
+	townRoot := t.TempDir()
+
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate stale metadata with wrong port (13729 instead of 3307)
+	stale := map[string]interface{}{
+		"backend":          "dolt",
+		"database":         "dolt",
+		"dolt_mode":        "server",
+		"dolt_database":    "hq",
+		"dolt_server_host": "127.0.0.1",
+		"dolt_server_port": 13729,
+	}
+	data, _ := json.Marshal(stale)
+	metaPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metaPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureMetadata(townRoot, "hq"); err != nil {
+		t.Fatalf("EnsureMetadata failed: %v", err)
+	}
+
+	repaired, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("reading metadata: %v", err)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(repaired, &meta); err != nil {
+		t.Fatalf("parsing metadata: %v", err)
+	}
+
+	// Port should now be the default (3307), not the stale 13729
+	wantPort := float64(DefaultPort)
+	if meta["dolt_server_port"] != wantPort {
+		t.Errorf("dolt_server_port = %v, want %v", meta["dolt_server_port"], wantPort)
+	}
+	if meta["dolt_server_host"] != "127.0.0.1" {
+		t.Errorf("dolt_server_host = %v, want 127.0.0.1", meta["dolt_server_host"])
+	}
+}
+
 // TestEnsureAllMetadata_RepairsAllCorrupt tests that EnsureAllMetadata
 // repairs metadata for all known databases, even if some are corrupt.
 func TestEnsureAllMetadata_RepairsAllCorrupt(t *testing.T) {
@@ -3498,3 +3548,247 @@ func TestWaitForReady_ServerBecomesReady(t *testing.T) {
 	}
 }
 
+func TestInvalidateDBCache(t *testing.T) {
+	// Ensure InvalidateDBCache clears cached data so subsequent calls re-query.
+	InvalidateDBCache()
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	setupDoltDB(t, dataDir, "cachetestdb")
+
+	// First call populates.
+	dbs1, err := ListDatabases(townRoot)
+	if err != nil {
+		t.Fatalf("first ListDatabases: %v", err)
+	}
+	if len(dbs1) != 1 || dbs1[0] != "cachetestdb" {
+		t.Fatalf("expected [cachetestdb], got %v", dbs1)
+	}
+
+	// Add another database on disk.
+	setupDoltDB(t, dataDir, "cachetestdb2")
+
+	// Without invalidation, local path re-scans filesystem (no caching for local).
+	dbs2, err := ListDatabases(townRoot)
+	if err != nil {
+		t.Fatalf("second ListDatabases: %v", err)
+	}
+	if len(dbs2) != 2 {
+		t.Fatalf("expected 2 databases after adding cachetestdb2, got %d: %v", len(dbs2), dbs2)
+	}
+}
+
+func TestDBCache_ReturnsCopy(t *testing.T) {
+	// Verify that callers get a defensive copy, not the cached slice.
+	InvalidateDBCache()
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	setupDoltDB(t, dataDir, "copytest")
+
+	dbs1, _ := ListDatabases(townRoot)
+	if len(dbs1) > 0 {
+		dbs1[0] = "MUTATED"
+	}
+
+	dbs2, _ := ListDatabases(townRoot)
+	for _, db := range dbs2 {
+		if db == "MUTATED" {
+			t.Fatal("ListDatabases returned shared slice — callers can corrupt the cache")
+		}
+	}
+}
+
+func TestCollectDatabaseOwners_HQOnly(t *testing.T) {
+	townRoot := t.TempDir()
+
+	setupRigMetadata(t, townRoot, "hq", "hq")
+	setupRigsJSON(t, townRoot, []string{})
+
+	owners := CollectDatabaseOwners(townRoot)
+	if owners["hq"] != "town beads" {
+		t.Errorf("expected 'hq' owner to be 'town beads', got %q", owners["hq"])
+	}
+	if len(owners) != 1 {
+		t.Errorf("expected 1 owner, got %d: %v", len(owners), owners)
+	}
+}
+
+func TestCollectDatabaseOwners_MultipleRigs(t *testing.T) {
+	townRoot := t.TempDir()
+
+	setupRigsJSON(t, townRoot, []string{"gastown", "beads"})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+	setupRigMetadata(t, townRoot, "gastown", "gt")
+	setupRigMetadata(t, townRoot, "beads", "beads")
+
+	owners := CollectDatabaseOwners(townRoot)
+	if owners["hq"] != "town beads" {
+		t.Errorf("expected 'hq' owner 'town beads', got %q", owners["hq"])
+	}
+	if owners["gt"] != "gastown rig beads" {
+		t.Errorf("expected 'gt' owner 'gastown rig beads', got %q", owners["gt"])
+	}
+	if owners["beads"] != "beads rig beads" {
+		t.Errorf("expected 'beads' owner 'beads rig beads', got %q", owners["beads"])
+	}
+	if len(owners) != 3 {
+		t.Errorf("expected 3 owners, got %d: %v", len(owners), owners)
+	}
+}
+
+func TestCollectDatabaseOwners_CustomDatabaseName(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Rig name differs from dolt_database name (like gastown → gt)
+	setupRigsJSON(t, townRoot, []string{"myrig"})
+	setupRigMetadata(t, townRoot, "myrig", "custom_db")
+
+	owners := CollectDatabaseOwners(townRoot)
+	if owners["custom_db"] != "myrig rig beads" {
+		t.Errorf("expected 'custom_db' owner 'myrig rig beads', got %q", owners["custom_db"])
+	}
+	if _, exists := owners["myrig"]; exists {
+		t.Error("rig name 'myrig' should not be a key in owners (only dolt_database value)")
+	}
+}
+
+func TestCollectDatabaseOwners_UnknownDB(t *testing.T) {
+	townRoot := t.TempDir()
+
+	setupRigsJSON(t, townRoot, []string{})
+	setupRigMetadata(t, townRoot, "hq", "hq")
+
+	owners := CollectDatabaseOwners(townRoot)
+	if _, exists := owners["unknown_db"]; exists {
+		t.Error("unknown_db should not have an owner")
+	}
+}
+
+// =============================================================================
+// writeServerConfig tests
+// =============================================================================
+
+func TestWriteServerConfig_Defaults(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:           3307,
+		DataDir:        dir,
+		MaxConnections: 1000,
+		ReadTimeoutMs:  DefaultReadTimeoutMs,
+		WriteTimeoutMs: DefaultWriteTimeoutMs,
+		LogLevel:       "warning",
+	}
+
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatalf("writeServerConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+	content := string(data)
+
+	checks := []string{
+		"port: 3307",
+		"max_connections: 1000",
+		fmt.Sprintf("read_timeout_millis: %d", DefaultReadTimeoutMs),
+		fmt.Sprintf("write_timeout_millis: %d", DefaultWriteTimeoutMs),
+		"data_dir: \"" + dir + "\"",
+		"log_level: warning",
+		"auto_gc_behavior:",
+	}
+	for _, want := range checks {
+		if !strings.Contains(content, want) {
+			t.Errorf("config missing %q\nfull content:\n%s", want, content)
+		}
+	}
+}
+
+func TestWriteServerConfig_NoHost(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:    3307,
+		DataDir: dir,
+		// Host is empty — should not appear in config
+	}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	if strings.Contains(string(data), "host:") {
+		t.Error("empty Host should not write host line to config")
+	}
+}
+
+func TestWriteServerConfig_WithHost(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:    3307,
+		Host:    "127.0.0.1",
+		DataDir: dir,
+	}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	if !strings.Contains(string(data), "host: 127.0.0.1") {
+		t.Error("explicit Host should appear in config")
+	}
+}
+
+func TestWriteServerConfig_ZeroTimeoutsOmitted(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	config := &Config{
+		Port:           3307,
+		DataDir:        dir,
+		ReadTimeoutMs:  0, // zero = use Dolt default
+		WriteTimeoutMs: 0,
+	}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	content := string(data)
+	if strings.Contains(content, "read_timeout_millis") {
+		t.Error("zero ReadTimeoutMs should not write read_timeout_millis")
+	}
+	if strings.Contains(content, "write_timeout_millis") {
+		t.Error("zero WriteTimeoutMs should not write write_timeout_millis")
+	}
+}
+
+func TestWriteServerConfig_Overwrites(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	// Write initial config
+	if err := os.WriteFile(configPath, []byte("old content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &Config{Port: 3307, DataDir: dir, LogLevel: "info"}
+	if err := writeServerConfig(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(configPath)
+	if strings.Contains(string(data), "old content") {
+		t.Error("writeServerConfig should overwrite existing file")
+	}
+	if !strings.Contains(string(data), "log_level: info") {
+		t.Error("new config should have updated log level")
+	}
+}

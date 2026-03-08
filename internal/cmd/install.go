@@ -1,9 +1,9 @@
 package cmd
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"github.com/steveyegge/gastown/internal/cli"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -160,8 +162,25 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			if installDoltPort != 0 {
 				port = installDoltPort
 				os.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+			} else if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+				if envPort, err := strconv.Atoi(p); err == nil {
+					port = envPort
+				}
 			}
 			if err := doltserver.CheckPortAvailable(port); err != nil {
+				// Port is in use — but if a Dolt server is already running
+				// on it, we can reuse it instead of starting a new one.
+				dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/", port)
+				if db, connErr := sql.Open("mysql", dsn); connErr == nil {
+					if pingErr := db.Ping(); pingErr == nil {
+						db.Close()
+						// Usable Dolt server on this port — skip the check.
+						fmt.Printf("   %s Using existing Dolt server on port %d\n",
+							style.Dim.Render("ℹ"), port)
+						goto portOK
+					}
+					db.Close()
+				}
 				pid, dataDir := doltserver.PortHolder(port)
 				msg := fmt.Sprintf("Dolt port %d is already in use", port)
 				if pid > 0 && dataDir != "" {
@@ -178,6 +197,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 				}
 				return fmt.Errorf("%s", msg)
 			}
+		portOK:
 		}
 	}
 
@@ -360,14 +380,15 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			fmt.Printf("   %s Could not initialize town beads: %v\n", style.Dim.Render("⚠"), err)
 		} else {
 			fmt.Printf("   ✓ Initialized .beads/ (town-level beads with hq- prefix)\n")
+		}
 
-			// Provision embedded formulas to .beads/formulas/
-			if count, err := formula.ProvisionFormulas(absPath); err != nil {
-				// Non-fatal: formulas are optional, just convenience
-				fmt.Printf("   %s Could not provision formulas: %v\n", style.Dim.Render("⚠"), err)
-			} else if count > 0 {
-				fmt.Printf("   ✓ Provisioned %d formulas\n", count)
-			}
+		// Provision embedded formulas to .beads/formulas/ even when beads init emitted
+		// warnings. Formula files are static assets and don't require a healthy DB.
+		if count, err := formula.ProvisionFormulas(absPath); err != nil {
+			// Non-fatal: formulas are optional, just convenience
+			fmt.Printf("   %s Could not provision formulas: %v\n", style.Dim.Render("⚠"), err)
+		} else if count > 0 {
+			fmt.Printf("   ✓ Provisioned %d formulas\n", count)
 		}
 
 		// Create town-level agent beads (Mayor, Deacon).
@@ -551,7 +572,13 @@ func initTownBeads(townPath string) error {
 	// Run: bd init --prefix hq --server
 	// Dolt is the only backend since bd v0.51.0; no --backend flag needed.
 	// Filter inherited BEADS_DIR so bd init targets this town, not a parent .beads.
-	cmd := exec.Command("bd", "init", "--prefix", "hq", "--server")
+	bdInitArgs := []string{"init", "--prefix", "hq", "--server"}
+	// Forward GT_DOLT_PORT so bd connects to the correct server when a
+	// non-default port is configured (e.g., ephemeral test servers in CI).
+	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		bdInitArgs = append(bdInitArgs, "--server-port", p)
+	}
+	cmd := exec.Command("bd", bdInitArgs...)
 	cmd.Dir = townPath
 	cmd.Env = withBeadsDirEnv(filepath.Join(townPath, ".beads"))
 
@@ -703,7 +730,7 @@ func initTownAgentBeads(townPath string) error {
 
 	existingAgents, err := bd.List(beads.ListOptions{
 		Status:   "all",
-		Type:     "agent",
+		Label:    "gt:agent",
 		Priority: -1,
 	})
 	if err != nil {

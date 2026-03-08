@@ -45,7 +45,7 @@ Shutdown levels (progressively more aggressive):
   gt down                    Stop infrastructure (default)
   gt down --polecats         Also stop all polecat sessions
   gt down --all              Full shutdown with orphan cleanup
-  gt down --nuke             Also kill this town's tmux server
+  gt down --nuke             Also kill the shared tmux server
 
 Infrastructure agents stopped:
   • Refineries - Per-rig work processors
@@ -80,7 +80,7 @@ func init() {
 	downCmd.Flags().BoolVarP(&downForce, "force", "f", false, "Force kill without graceful shutdown")
 	downCmd.Flags().BoolVarP(&downPolecats, "polecats", "p", false, "Also stop all polecat sessions")
 	downCmd.Flags().BoolVarP(&downAll, "all", "a", false, "Full shutdown with orphan cleanup and verification")
-	downCmd.Flags().BoolVar(&downNuke, "nuke", false, "Kill this town's tmux server and all its sessions")
+	downCmd.Flags().BoolVar(&downNuke, "nuke", false, "Kill the shared tmux server (default socket) and all its sessions")
 	downCmd.Flags().BoolVar(&downDryRun, "dry-run", false, "Preview what would be stopped without taking action")
 	rootCmd.AddCommand(downCmd)
 }
@@ -223,8 +223,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 			if err := daemon.StopDaemon(townRoot); err != nil {
 				printDownStatus("Daemon", false, err.Error())
 				allOK = false
-			} else {
+			} else if pid > 0 {
 				printDownStatus("Daemon", true, fmt.Sprintf("stopped (was PID %d)", pid))
+			} else {
+				printDownStatus("Daemon", true, "stopped (stale lock cleaned)")
 			}
 		} else {
 			printDownStatus("Daemon", true, "not running")
@@ -253,6 +255,23 @@ func runDown(cmd *cobra.Command, args []string) error {
 			} else {
 				printDownStatus("Dolt", true, "not running")
 			}
+		}
+	}
+
+	// Phase 4c: Clean up legacy "default" socket sessions.
+	// Old binaries created sessions on the "default" tmux socket. After
+	// transitioning to a per-town socket (e.g., "gt"), those ghost sessions
+	// persist and cause split-brain: the daemon sees them on "gt" but tools
+	// querying bare tmux see (or miss) them on "default".
+	if !downDryRun {
+		cleaned := cleanupLegacyDefaultSocket()
+		if cleaned > 0 {
+			printDownStatus("Legacy sessions", true, fmt.Sprintf("cleaned %d from 'default' socket", cleaned))
+		}
+	} else {
+		count := countLegacyDefaultSocketSessions()
+		if count > 0 {
+			printDownStatus("Legacy sessions", true, fmt.Sprintf("%d would be cleaned from 'default' socket", count))
 		}
 	}
 
@@ -290,25 +309,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Phase 5b: Cross-socket zombie sweep (--all or --force)
-	// After the socket isolation fix (gt-qkekp), agent sessions may remain on the
-	// default socket. Sweep them when doing a full shutdown.
-	if (downAll || downForce) && !downDryRun {
-		swept := sweepCrossSocketZombies()
-		if swept > 0 {
-			fmt.Printf("  Swept %d cross-socket zombie session(s) from default socket\n", swept)
-		}
-	} else if (downAll || downForce) && downDryRun {
-		count := countCrossSocketZombies()
-		if count > 0 {
-			fmt.Printf("  Would sweep %d cross-socket zombie session(s) from default socket\n", count)
-		}
-	}
-
 	// Phase 6: Nuke tmux server (--nuke only)
-	// With per-town tmux sockets, this only kills this town's tmux server,
-	// not other towns or the default socket. However, users may have opened
-	// custom windows/panes in this server, so we still require confirmation.
+	// Each town uses a per-town tmux socket derived from the town directory name
+	// (see registry.go InitRegistry), so --nuke only affects this town's server.
+	// Users may also have opened custom windows/panes, so we require confirmation.
 	if downNuke {
 		socket := tmux.GetDefaultSocket()
 		socketLabel := "default"
@@ -319,9 +323,9 @@ func runDown(cmd *cobra.Command, args []string) error {
 			printDownStatus("Tmux server", true, fmt.Sprintf("would kill (socket: %s)", socketLabel))
 		} else if os.Getenv("GT_NUKE_ACKNOWLEDGED") == "" {
 			fmt.Println()
-			fmt.Printf("%s The --nuke flag kills the tmux server for this town (socket: %s).\n",
+			fmt.Printf("%s The --nuke flag kills the shared tmux server (socket: %s).\n",
 				style.Bold.Render("⚠ BLOCKED:"), socketLabel)
-			fmt.Printf("This will destroy all sessions on this socket, including any custom windows you opened.\n")
+			fmt.Printf("All towns share this socket — this will destroy all tmux sessions, including any custom windows you opened.\n")
 			fmt.Println()
 			fmt.Printf("To proceed, run with: %s\n", style.Bold.Render("GT_NUKE_ACKNOWLEDGED=1 gt down --nuke"))
 			allOK = false
@@ -560,85 +564,49 @@ func findOrphanedClaudeProcesses(townRoot string) []int {
 	return orphaned
 }
 
-// legacyNamedSockets lists tmux socket names that Gas Town historically used
-// before migrating to the "default" socket. During shutdown, these are checked
-// for zombie sessions that survived the migration.
-var legacyNamedSockets = []string{"gt", "gas-town"}
+// cleanupLegacyDefaultSocket removes Gas Town sessions left on the "default"
+// tmux socket by old binaries. Returns the number of sessions cleaned.
+func cleanupLegacyDefaultSocket() int {
+	currentSocket := tmux.GetDefaultSocket()
+	if currentSocket == "" || currentSocket == "default" {
+		return 0 // Already on the default socket, nothing to clean up
+	}
 
-// crossSocketTargets returns the tmux socket names to sweep for zombie sessions.
-// When the town uses the "default" socket, it sweeps legacy named sockets.
-// When the town uses a named socket, it sweeps the "default" socket.
-// Returns nil if there's no cross-socket scenario (empty town socket).
-func crossSocketTargets() []string {
-	townSocket := tmux.GetDefaultSocket()
-	if townSocket == "" {
-		return nil
+	legacyTmux := tmux.NewTmuxWithSocket("default")
+	sessions, err := legacyTmux.ListSessions()
+	if err != nil {
+		return 0 // No server on default socket
 	}
-	if townSocket == "default" {
-		return legacyNamedSockets
+
+	var cleaned int
+	for _, sess := range sessions {
+		if session.IsKnownSession(sess) {
+			if err := legacyTmux.KillSessionWithProcesses(sess); err == nil {
+				cleaned++
+			}
+		}
 	}
-	return []string{"default"}
+	return cleaned
 }
 
-// sweepCrossSocketZombies kills Gas Town agent sessions on other tmux sockets.
-// When the town socket is "default", sweeps legacy named sockets (gt, gas-town).
-// When the town socket is named, sweeps the default socket.
-// Only kills sessions that match Gas Town naming patterns; user sessions are preserved.
-// Returns the number of sessions killed.
-func sweepCrossSocketZombies() int {
-	targets := crossSocketTargets()
-	if len(targets) == 0 {
+// countLegacyDefaultSocketSessions counts Gas Town sessions on the "default"
+// tmux socket (for dry-run output).
+func countLegacyDefaultSocketSessions() int {
+	currentSocket := tmux.GetDefaultSocket()
+	if currentSocket == "" || currentSocket == "default" {
 		return 0
 	}
 
-	killed := 0
-	for _, socketName := range targets {
-		t := tmux.NewTmuxWithSocket(socketName)
-		sessions, err := t.ListSessions()
-		if err != nil {
-			continue // No server on this socket or error
-		}
-
-		for _, sess := range sessions {
-			if sess == "" {
-				continue
-			}
-			if !session.IsKnownSession(sess) {
-				continue // Not a Gas Town session — preserve it
-			}
-
-			_ = events.LogFeed(events.TypeSessionDeath, sess,
-				events.SessionDeathPayload(sess, "unknown", "cross-socket sweep", "gt down"))
-
-			if err := t.KillSessionWithProcesses(sess); err == nil {
-				killed++
-			}
-		}
-	}
-
-	return killed
-}
-
-// countCrossSocketZombies counts Gas Town agent sessions on other tmux sockets
-// without killing them. Used for dry-run mode.
-func countCrossSocketZombies() int {
-	targets := crossSocketTargets()
-	if len(targets) == 0 {
+	legacyTmux := tmux.NewTmuxWithSocket("default")
+	sessions, err := legacyTmux.ListSessions()
+	if err != nil {
 		return 0
 	}
 
-	count := 0
-	for _, socketName := range targets {
-		t := tmux.NewTmuxWithSocket(socketName)
-		sessions, err := t.ListSessions()
-		if err != nil {
-			continue
-		}
-
-		for _, sess := range sessions {
-			if sess != "" && session.IsKnownSession(sess) {
-				count++
-			}
+	var count int
+	for _, sess := range sessions {
+		if session.IsKnownSession(sess) {
+			count++
 		}
 	}
 	return count

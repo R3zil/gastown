@@ -68,44 +68,55 @@ func TestStripANSI(t *testing.T) {
 	}
 }
 
-func TestExtractJSONField(t *testing.T) {
+func TestParseChildrenJSON(t *testing.T) {
 	tests := []struct {
-		name  string
-		line  string
-		field string
-		want  string
+		name      string
+		input     string
+		wantCount int
+		wantErr   bool
 	}{
 		{
-			name:  "simple field",
-			line:  `{"id":"gt-wisp-abc","title":"Scan databases"}`,
-			field: "id",
-			want:  "gt-wisp-abc",
+			name:      "bare array",
+			input:     `[{"id":"a","title":"Probe","status":"open"}]`,
+			wantCount: 1,
 		},
 		{
-			name:  "field with space after colon",
-			line:  `{"id": "gt-wisp-abc", "title": "Scan databases"}`,
-			field: "title",
-			want:  "Scan databases",
+			name:      "map wrapper from bd show",
+			input:     `{"hq-wisp-root":[{"id":"hq-wisp-a","title":"Probe","status":"open"},{"id":"hq-wisp-b","title":"Report","status":"open"}]}`,
+			wantCount: 2,
 		},
 		{
-			name:  "missing field",
-			line:  `{"id":"gt-wisp-abc"}`,
-			field: "title",
-			want:  "",
+			name:      "empty map wrapper",
+			input:     `{"hq-wisp-root":[]}`,
+			wantCount: 0,
 		},
 		{
-			name:  "empty line",
-			line:  "",
-			field: "id",
-			want:  "",
+			name:      "empty array",
+			input:     `[]`,
+			wantCount: 0,
+		},
+		{
+			name:    "invalid json",
+			input:   `not json`,
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := extractJSONField(tt.line, tt.field)
-			if got != tt.want {
-				t.Errorf("extractJSONField(%q, %q) = %q, want %q", tt.line, tt.field, got, tt.want)
+			got, err := parseChildrenJSON(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			if len(got) != tt.wantCount {
+				t.Errorf("got %d children, want %d", len(got), tt.wantCount)
 			}
 		})
 	}

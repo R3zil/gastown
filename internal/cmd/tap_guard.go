@@ -20,7 +20,12 @@ forbidden operation entirely.
 
 Available guards:
   pr-workflow        - Block PR creation and feature branches
+  bd-init            - Block bd init in wrong directories
+  mol-patrol         - Block mol patrol from agent contexts
   dangerous-command  - Block rm -rf, force push, hard reset, git clean
+
+External guards (standalone scripts, not compiled into gt):
+  context-budget   - scripts/guards/context-budget-guard.sh
 
 Example hook configuration:
   {

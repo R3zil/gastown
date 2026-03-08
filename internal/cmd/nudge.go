@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
@@ -49,33 +50,34 @@ func init() {
 	nudgeCmd.Flags().BoolVarP(&nudgeForceFlag, "force", "f", false, "Send even if target has DND enabled")
 	nudgeCmd.Flags().BoolVar(&nudgeStdinFlag, "stdin", false, "Read message from stdin (avoids shell quoting issues)")
 	nudgeCmd.Flags().BoolVar(&nudgeIfFreshFlag, "if-fresh", false, "Only send if caller's tmux session is <60s old (suppresses compaction nudges)")
-	nudgeCmd.Flags().StringVar(&nudgeModeFlag, "mode", NudgeModeImmediate, "Delivery mode: immediate (default), queue, or wait-idle")
+	nudgeCmd.Flags().StringVar(&nudgeModeFlag, "mode", NudgeModeWaitIdle, "Delivery mode: wait-idle (default), queue, or immediate")
 	nudgeCmd.Flags().StringVar(&nudgePriorityFlag, "priority", nudge.PriorityNormal, "Queue priority: normal (default) or urgent")
 }
 
 var nudgeCmd = &cobra.Command{
-	Use:     "nudge <target> [message]",
-	GroupID: GroupComm,
-	Short:   "Send a synchronous message to any Gas Town worker",
+	Use:         "nudge <target> [message]",
+	GroupID:     GroupComm,
+	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
+	Short:       "Send a synchronous message to any Gas Town worker",
 	Long: `Universal messaging API for Gas Town worker-to-worker communication.
 
 Delivers a message to any worker's Claude Code session: polecats, crew,
 witness, refinery, mayor, or deacon.
 
 Delivery modes (--mode):
-  immediate  Send directly via tmux send-keys (default). Interrupts in-flight
-             work but guarantees immediate delivery.
-  queue      Write to a file queue; agent picks up via hook at next turn
-             boundary. Zero interruption. Use for non-urgent coordination.
   wait-idle  Wait for agent to become idle (prompt visible), then deliver
              directly. Falls back to queue on timeout. If both idle-wait and
              queue fail, falls back to immediate delivery as a last resort.
+             This is the default — it avoids interrupting active tool calls.
+  queue      Write to a file queue; agent picks up via hook at next turn
+             boundary. Zero interruption. Use for non-urgent coordination.
+  immediate  Send directly via tmux send-keys. Interrupts in-flight work
+             but guarantees immediate delivery. Use only when you need to
+             break through (e.g., stuck agent, emergency).
 
 Queue and wait-idle modes require the target agent to support hooks
-(UserPromptSubmit) for drain. Agents without hook support should use immediate.
-
-The default is immediate for backward compatibility. For non-urgent messages
-where you don't want to interrupt the agent's current work, use --mode=queue.
+(UserPromptSubmit) for drain. Agents without hook support should use
+--mode=immediate.
 
 This is the ONLY way to send messages to Claude sessions.
 Do not use raw tmux send-keys elsewhere.
@@ -254,7 +256,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	if roleInfo, err := GetRole(); err == nil {
 		switch roleInfo.Role {
 		case RoleMayor:
-			sender = "mayor"
+			sender = constants.RoleMayor
 		case RoleCrew:
 			sender = fmt.Sprintf("%s/crew/%s", roleInfo.Rig, roleInfo.Polecat)
 		case RolePolecat:
@@ -264,7 +266,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		case RoleRefinery:
 			sender = fmt.Sprintf("%s/refinery", roleInfo.Rig)
 		case RoleDeacon:
-			sender = "deacon"
+			sender = constants.RoleDeacon
 		default:
 			sender = string(roleInfo.Role)
 		}
@@ -292,9 +294,9 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	// Expand role shortcuts to session names
 	// These shortcuts let users type "mayor" instead of "gt-mayor"
 	switch target {
-	case "mayor":
+	case constants.RoleMayor:
 		target = session.MayorSessionName()
-	case "witness", "refinery":
+	case constants.RoleWitness, constants.RoleRefinery:
 		// These need the current rig
 		roleInfo, err := GetRole()
 		if err != nil {
@@ -304,7 +306,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("cannot determine rig for %s shortcut (not in a rig context)", target)
 		}
 		rigPrefix := session.PrefixFor(roleInfo.Rig)
-		if target == "witness" {
+		if target == constants.RoleWitness {
 			target = session.WitnessSessionName(rigPrefix)
 		} else {
 			target = session.RefinerySessionName(rigPrefix)
@@ -312,7 +314,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	// Special case: "deacon" target maps to the Deacon session
-	if target == "deacon" {
+	if target == constants.RoleDeacon {
 		deaconSession := session.DeaconSessionName()
 		// Check if Deacon session exists
 		exists, err := t.HasSession(deaconSession)
@@ -333,9 +335,9 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 
 		// Log nudge event
 		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
-			_ = LogNudge(townRoot, "deacon", message)
+			_ = LogNudge(townRoot, constants.RoleDeacon, message)
 		}
-		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", "deacon", message))
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", constants.RoleDeacon, message))
 		return nil
 	}
 
@@ -552,9 +554,9 @@ func resolveNudgePattern(pattern string, agents []*AgentSession) []string {
 
 	// Handle special cases
 	switch pattern {
-	case "mayor":
+	case constants.RoleMayor:
 		return []string{session.MayorSessionName()}
-	case "deacon":
+	case constants.RoleDeacon:
 		return []string{session.DeaconSessionName()}
 	}
 
@@ -593,11 +595,11 @@ func resolveNudgePattern(pattern string, agents []*AgentSession) []string {
 			if suffix != "*" && suffix != agent.AgentName {
 				continue
 			}
-		} else if targetPattern == "witness" {
+		} else if targetPattern == constants.RoleWitness {
 			if agent.Type != AgentWitness {
 				continue
 			}
-		} else if targetPattern == "refinery" {
+		} else if targetPattern == constants.RoleRefinery {
 			if agent.Type != AgentRefinery {
 				continue
 			}
@@ -658,9 +660,9 @@ func sessionNameToAddress(sessionName string) string {
 	// Use short address format: rig/name (not rig/polecats/name)
 	switch identity.Role {
 	case session.RoleMayor:
-		return "mayor"
+		return constants.RoleMayor
 	case session.RoleDeacon:
-		return "deacon"
+		return constants.RoleDeacon
 	case session.RoleWitness:
 		return fmt.Sprintf("%s/witness", identity.Rig)
 	case session.RoleRefinery:
@@ -685,9 +687,9 @@ func sessionNameToAddress(sessionName string) string {
 func addressToAgentBeadID(address string) string {
 	// Handle special cases
 	switch address {
-	case "mayor":
+	case constants.RoleMayor:
 		return session.MayorSessionName()
-	case "deacon":
+	case constants.RoleDeacon:
 		return session.DeaconSessionName()
 	}
 
@@ -705,9 +707,9 @@ func addressToAgentBeadID(address string) string {
 	role := parts[1]
 
 	switch role {
-	case "witness":
+	case constants.RoleWitness:
 		return session.WitnessSessionName(session.PrefixFor(rig))
-	case "refinery":
+	case constants.RoleRefinery:
 		return session.RefinerySessionName(session.PrefixFor(rig))
 	default:
 		// Assume polecat

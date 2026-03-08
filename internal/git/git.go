@@ -605,6 +605,60 @@ func (g *Git) SetRemoteURL(name, url string) (string, error) {
 	return g.run("remote", "set-url", name, url)
 }
 
+// AddUpstreamRemote adds or updates the 'upstream' git remote.
+// This is idempotent - if the remote already exists with the same URL, it's a no-op.
+// If the remote exists with a different URL, it's updated.
+func (g *Git) AddUpstreamRemote(upstreamURL string) error {
+	has, err := g.HasUpstreamRemote()
+	if err != nil {
+		return err
+	}
+	if has {
+		current, err := g.GetUpstreamURL()
+		if err != nil {
+			return err
+		}
+		if current == upstreamURL {
+			return nil
+		}
+		_, err = g.run("remote", "set-url", "upstream", upstreamURL)
+		return err
+	}
+	_, err = g.run("remote", "add", "upstream", upstreamURL)
+	return err
+}
+
+// GetUpstreamURL returns the URL of the upstream remote.
+// Returns empty string if upstream remote doesn't exist.
+func (g *Git) GetUpstreamURL() (string, error) {
+	out, err := g.run("remote", "get-url", "upstream")
+	if err != nil {
+		if strings.Contains(err.Error(), "No such remote") {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// HasUpstreamRemote returns true if an upstream remote is configured.
+func (g *Git) HasUpstreamRemote() (bool, error) {
+	_, err := g.run("remote", "get-url", "upstream")
+	if err != nil {
+		if strings.Contains(err.Error(), "No such remote") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// FetchUpstream fetches from the upstream remote.
+func (g *Git) FetchUpstream() error {
+	_, err := g.run("fetch", "upstream")
+	return err
+}
+
 // Remotes returns the list of configured remote names.
 func (g *Git) Remotes() ([]string, error) {
 	out, err := g.run("remote")
@@ -637,6 +691,14 @@ func (g *Git) Merge(branch string) error {
 // MergeNoFF merges the given branch with --no-ff flag and a custom message.
 func (g *Git) MergeNoFF(branch, message string) error {
 	_, err := g.run("merge", "--no-ff", "-m", message, branch)
+	return err
+}
+
+// MergeFFOnly performs a fast-forward-only merge of the given ref into the current branch.
+// This ensures what you tested is exactly what lands — no merge commits are created.
+// Returns an error if the merge cannot be performed as a fast-forward.
+func (g *Git) MergeFFOnly(ref string) error {
+	_, err := g.run("merge", "--ff-only", ref)
 	return err
 }
 
@@ -697,6 +759,21 @@ func (g *Git) ListRemoteRefs(remote, prefix string) ([]string, error) {
 		}
 	}
 	return refs, nil
+}
+
+// ListPushRemoteRefs lists remote refs from the push URL when it differs from
+// the fetch URL. With a fork-based workflow (pushurl configured), branches are
+// pushed to the fork but ls-remote reads from the fetch URL (upstream). This
+// method queries the push URL so cleanup can find branches that were pushed.
+// Falls back to ListRemoteRefs if no custom push URL is configured.
+func (g *Git) ListPushRemoteRefs(remote, prefix string) ([]string, error) {
+	fetchURL, fetchErr := g.RemoteURL(remote)
+	pushURL, pushErr := g.GetPushURL(remote)
+	if fetchErr != nil || pushErr != nil || pushURL == fetchURL {
+		return g.ListRemoteRefs(remote, prefix)
+	}
+	// Query the push URL directly
+	return g.ListRemoteRefs(pushURL, prefix)
 }
 
 // Rebase rebases the current branch onto the given ref.
@@ -1045,6 +1122,14 @@ func (g *Git) WorktreeRemove(path string, force bool) error {
 	return err
 }
 
+// WorktreeMove moves a worktree to a new path, updating all git references.
+// This is the correct way to relocate a worktree — using os.Rename breaks
+// the .git file and worktree registry references. (GH#2056)
+func (g *Git) WorktreeMove(oldPath, newPath string) error {
+	_, err := g.run("worktree", "move", oldPath, newPath)
+	return err
+}
+
 // WorktreePrune removes worktree entries for deleted paths.
 func (g *Git) WorktreePrune() error {
 	_, err := g.run("worktree", "prune")
@@ -1169,6 +1254,34 @@ func (g *Git) CountCommitsBehind(ref string) (int, error) {
 	return count, nil
 }
 
+// BranchContamination holds the result of a branch contamination check.
+type BranchContamination struct {
+	Behind int // commits HEAD is behind base (e.g., origin/main)
+	Ahead  int // commits HEAD is ahead of base
+}
+
+// CheckBranchContamination checks whether the current branch has diverged
+// significantly from a base ref (typically origin/main). Returns the number
+// of commits behind and ahead, letting callers decide severity thresholds.
+// (GH#2220)
+func (g *Git) CheckBranchContamination(baseRef string) (BranchContamination, error) {
+	var result BranchContamination
+
+	behind, err := g.CountCommitsBehind(baseRef)
+	if err != nil {
+		return result, fmt.Errorf("counting commits behind %s: %w", baseRef, err)
+	}
+	result.Behind = behind
+
+	ahead, err := g.CommitsAhead(baseRef, "HEAD")
+	if err != nil {
+		return result, fmt.Errorf("counting commits ahead of %s: %w", baseRef, err)
+	}
+	result.Ahead = ahead
+
+	return result, nil
+}
+
 // StashCount returns the number of stashes belonging to the current branch.
 // Git stashes are stored in the main repo (.git/refs/stash) and shared across
 // all worktrees. Counting all stashes is incorrect for worktree-based polecats:
@@ -1287,6 +1400,55 @@ func (s *UncommittedWorkStatus) CleanExcludingBeads() bool {
 // isBeadsPath returns true if the path is a .beads/ file.
 func isBeadsPath(path string) bool {
 	return strings.Contains(path, ".beads/") || strings.Contains(path, ".beads\\")
+}
+
+// isGasTownRuntimePath returns true if the path is a Gas Town or Cursor runtime
+// artifact that should not block gt done. These paths are managed by the toolchain,
+// not by the developer, and are normally gitignored via EnsureGitignorePatterns.
+func isGasTownRuntimePath(path string) bool {
+	prefixes := []string{
+		".beads/", ".beads\\",
+		".claude/", ".claude\\",
+		".runtime/", ".runtime\\",
+		".logs/", ".logs\\",
+		"__pycache__/", "__pycache__\\",
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(path, prefix) || strings.Contains(path, "/"+prefix) {
+			return true
+		}
+	}
+	// Also match bare directory entries from git status (e.g. ".claude/")
+	bare := strings.TrimSuffix(strings.TrimSuffix(path, "/"), "\\")
+	for _, name := range []string{".beads", ".claude", ".runtime", ".logs", "__pycache__"} {
+		if bare == name {
+			return true
+		}
+	}
+	return false
+}
+
+// CleanExcludingRuntime returns true if the only uncommitted changes are Gas Town
+// runtime artifacts (.beads/, .claude/, .runtime/, .logs/, __pycache__/).
+// Used by gt done to avoid blocking completion on toolchain-managed files.
+func (s *UncommittedWorkStatus) CleanExcludingRuntime() bool {
+	if s.StashCount > 0 || s.UnpushedCommits > 0 {
+		return false
+	}
+
+	for _, f := range s.ModifiedFiles {
+		if !isGasTownRuntimePath(f) {
+			return false
+		}
+	}
+
+	for _, f := range s.UntrackedFiles {
+		if !isGasTownRuntimePath(f) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // String returns a human-readable summary of uncommitted work.

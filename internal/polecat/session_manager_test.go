@@ -1,11 +1,13 @@
 package polecat
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +26,10 @@ func setupTestRegistryForSession(t *testing.T) {
 	session.SetDefaultRegistry(reg)
 	t.Cleanup(func() { session.SetDefaultRegistry(old) })
 }
+
+// testSessionCounter provides unique session names across -count=N runs
+// to prevent "duplicate session" races with tmux's async cleanup.
+var testSessionCounter atomic.Int64
 
 func requireTmux(t *testing.T) {
 	t.Helper()
@@ -435,9 +441,11 @@ func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
 	requireTmux(t)
 
 	tm := tmux.NewTmux()
-	sessionName := "gt-test-nudge-verify-" + t.Name()
+	// Use a unique session name per invocation to avoid "duplicate session" races
+	// with tmux's async cleanup when running with -count=N. (Fixes gt-eo8d)
+	sessionName := fmt.Sprintf("gt-test-nudge-%d", testSessionCounter.Add(1))
 
-	// Kill any orphaned session from a previous interrupted test run.
+	// Clean up any stale session from a previous crashed test run
 	_ = tm.KillSession(sessionName)
 
 	// Create a tmux session with a shell
@@ -559,5 +567,55 @@ func TestValidateSessionName(t *testing.T) {
 				t.Errorf("validateSessionName() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestPolecatSlot(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigPath := tmpDir
+	polecatsDir := filepath.Join(rigPath, "polecats")
+	if err := os.MkdirAll(polecatsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{
+		Name:     "testrig",
+		Path:     rigPath,
+		Polecats: []string{},
+	}
+	sm := NewSessionManager(tmux.NewTmux(), r)
+
+	// No polecats — should return 0
+	if slot := sm.polecatSlot("alpha"); slot != 0 {
+		t.Errorf("empty dir: got slot %d, want 0", slot)
+	}
+
+	// Create some polecat dirs (sorted: alpha, beta, gamma)
+	for _, name := range []string{"alpha", "beta", "gamma"} {
+		if err := os.MkdirAll(filepath.Join(polecatsDir, name), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		want int
+	}{
+		{"alpha", 0},
+		{"beta", 1},
+		{"gamma", 2},
+	}
+	for _, tt := range tests {
+		if slot := sm.polecatSlot(tt.name); slot != tt.want {
+			t.Errorf("polecatSlot(%q) = %d, want %d", tt.name, slot, tt.want)
+		}
+	}
+
+	// Hidden dirs should be skipped
+	if err := os.MkdirAll(filepath.Join(polecatsDir, ".hidden"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if slot := sm.polecatSlot("beta"); slot != 1 {
+		t.Errorf("with hidden dir: polecatSlot(beta) = %d, want 1", slot)
 	}
 }

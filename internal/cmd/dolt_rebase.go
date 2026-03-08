@@ -37,6 +37,12 @@ Algorithm (based on Dolt's DOLT_REBASE):
   7. Cleans up temporary branches
   8. Runs GC to reclaim space
 
+WARNING: DOLT_REBASE is NOT safe with concurrent writes. If agents are
+actively committing to this database, the rebase may fail with a graph-change
+error. The Compactor Dog (daemon) has automatic retry logic for this case.
+For manual use, re-run the command if it fails due to concurrent writes.
+Flatten mode (gt dolt flatten) is safe with concurrent writes.
+
 Use --keep-recent to control how many recent commits to preserve.
 Use --dry-run to see the plan without executing it.
 
@@ -334,6 +340,7 @@ func rebaseCleanup(db *sql.DB, baseBranch, workBranch string) {
 }
 
 // rebaseAbortAndCleanup aborts an in-progress rebase then cleans up branches.
+//nolint:unparam // baseBranch always "compact-base" — API kept flexible for future callers
 func rebaseAbortAndCleanup(db *sql.DB, baseBranch, workBranch string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -344,6 +351,7 @@ func rebaseAbortAndCleanup(db *sql.DB, baseBranch, workBranch string) {
 }
 
 // rebaseCleanupAll cleans up both branches after a failed rebase.
+//nolint:unparam // baseBranch always "compact-base" — API kept flexible for future callers
 func rebaseCleanupAll(db *sql.DB, baseBranch, workBranch string) {
 	rebaseCleanup(db, baseBranch, workBranch)
 }

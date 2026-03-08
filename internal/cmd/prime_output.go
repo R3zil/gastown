@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/checkpoint"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -33,17 +34,17 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 	var roleName string
 	switch ctx.Role {
 	case RoleMayor:
-		roleName = "mayor"
+		roleName = constants.RoleMayor
 	case RoleDeacon:
-		roleName = "deacon"
+		roleName = constants.RoleDeacon
 	case RoleWitness:
-		roleName = "witness"
+		roleName = constants.RoleWitness
 	case RoleRefinery:
-		roleName = "refinery"
+		roleName = constants.RoleRefinery
 	case RolePolecat:
-		roleName = "polecat"
+		roleName = constants.RolePolecat
 	case RoleCrew:
-		roleName = "crew"
+		roleName = constants.RoleCrew
 	case RoleBoot:
 		roleName = "boot"
 	case RoleDog:
@@ -211,6 +212,9 @@ func outputCrewContext(ctx RoleContext) {
 	fmt.Println("- User-managed (not Witness-monitored)")
 	fmt.Println("- Long-lived identity across sessions")
 	fmt.Println()
+	fmt.Println("**Identity**: You are the AI agent. The human sending you messages is the")
+	fmt.Println("**Overseer** — the only non-agent role in Gas Town. Do not confuse your identity with theirs.")
+	fmt.Println()
 	fmt.Println("## Key Commands")
 	fmt.Println("- `" + cli.Name() + " mail inbox` - Check your inbox")
 	fmt.Println("- `bd ready` - Available issues")
@@ -274,6 +278,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 	case RoleMayor:
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
 		fmt.Printf("| Dispatch work to polecat | `%s sling <bead> <rig>` | ~~gt polecat spawn~~ (not a command) |\n", c)
 		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
 		fmt.Printf("| Kill stuck polecat | `%s polecat nuke <rig>/<name> --force` | ~~gt polecat kill~~ (not a command) |\n", c)
@@ -284,6 +289,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 	case RoleCrew:
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
 		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
 		fmt.Printf("| Dispatch work to polecat | `%s sling <bead> <rig>` | ~~gt polecat spawn~~ (not a command) |\n", c)
 		fmt.Printf("| Stop my session | `%s crew stop %s` | ~~gt rig stop~~ (stops rig agents, not crew) |\n", c, ctx.Polecat)
@@ -294,6 +300,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
 		fmt.Printf("| Signal work complete | `%s done` | ~~bd close <root-issue>~~ (Refinery closes it) |\n", c)
+		fmt.Println("| Close a sub-issue | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
 		fmt.Printf("| Message another agent | `%s nudge <target> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c)
 		fmt.Println("| Check workflow steps | `bd mol current` | ~~bd ready~~ (excludes molecule steps) |")
 		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
@@ -302,6 +309,7 @@ func outputCommandQuickReference(ctx RoleContext) {
 	case RoleWitness:
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
+		fmt.Println("| Close/complete a bead | `bd close <id>` | ~~bd complete~~ (not a command), ~~bd update --status done~~ (invalid status) |")
 		fmt.Printf("| Message a polecat | `%s nudge %s/<name> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c, ctx.Rig)
 		fmt.Printf("| Kill stuck polecat | `%s polecat nuke %s/<name> --force` | ~~gt polecat kill~~ (not a command) |\n", c, ctx.Rig)
 		fmt.Printf("| View polecat output | `%s peek %s/<name> 50` | |\n", c, ctx.Rig)

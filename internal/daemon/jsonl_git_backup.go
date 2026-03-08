@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/constants"
 )
 
 const (
@@ -23,7 +25,7 @@ const (
 	gitPushTimeout                = 120 * time.Second
 	gitCmdTimeout                 = 30 * time.Second
 	maxConsecutivePushFailures    = 3
-	defaultSpikeThreshold         = 0.20 // 20% delta triggers halt
+	defaultSpikeThreshold         = 0.50 // 50% delta triggers halt (was 20%, too sensitive for bulk ops)
 )
 
 // testPollutionPatterns matches issue IDs or titles that indicate test data leaked
@@ -47,6 +49,7 @@ var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 // Kept separate from Sprintf to avoid %% confusion.
 // The query selects only durable work product (bugs, features, tasks, epics, chores).
 const scrubWhereClause = ` WHERE (ephemeral IS NULL OR ephemeral != 1)` +
+	` AND status != 'tombstone'` +
 	` AND issue_type NOT IN ('message', 'event', 'agent', 'convoy', 'molecule', 'role', 'merge-request', 'rig')` +
 	` AND id NOT LIKE '%-wisp-%'` +
 	` AND id NOT LIKE '%-cv-%'` +
@@ -80,7 +83,7 @@ func (d *Daemon) syncJsonlGitBackup() {
 	}
 
 	// Pour molecule for observability (nil-safe — all methods are no-ops on nil).
-	mol := d.pourDogMolecule("mol-dog-jsonl", nil)
+	mol := d.pourDogMolecule(constants.MolDogJSONL, nil)
 	defer mol.close()
 
 	config := d.patrolConfig.Patrols.JsonlGitBackup
@@ -165,6 +168,8 @@ func (d *Daemon) syncJsonlGitBackup() {
 		d.escalate("jsonl_git_backup", fmt.Sprintf("post-scrub verification found %d suspicious records — review JSONL exports", remaining))
 	}
 
+	mol.closeStep("verify")
+
 	// Phase D: Spike detection — compare current counts to previous commit.
 	threshold := spikeThreshold(config)
 	spikes := d.verifyExportCounts(gitRepo, databases, counts, threshold)
@@ -244,14 +249,6 @@ func (d *Daemon) exportDatabaseToJsonl(db, gitRepo, dataDir string, scrub bool) 
 		return 0, fmt.Errorf("issues: %w", err)
 	}
 	total += n
-
-	// Also write legacy flat file for backward compatibility.
-	legacyPath := filepath.Join(gitRepo, db+".jsonl")
-	newIssuesPath := filepath.Join(dbDir, "issues.jsonl")
-	// Copy instead of symlink for git compatibility.
-	if data, err := os.ReadFile(newIssuesPath); err == nil {
-		_ = os.WriteFile(legacyPath, data, 0644)
-	}
 
 	// 2. Export supplemental tables (no scrub, full export).
 	for _, table := range supplementalTables {
@@ -357,13 +354,44 @@ func (d *Daemon) commitAndPushJsonlBackup(gitRepo string, databases []string, co
 		return fmt.Errorf("git commit: %w", err)
 	}
 
-	// Push — use longer timeout since push involves network I/O.
-	if err := d.runGitCmd(gitRepo, gitPushTimeout, "push", "origin", "main"); err != nil {
-		return fmt.Errorf("git push: %w", err)
+	// Push — only if a remote is configured. Skip gracefully if not.
+	if d.hasGitRemote(gitRepo, "origin") {
+		// Detect current branch name for push (master vs main).
+		branch := d.currentGitBranch(gitRepo)
+		if branch == "" {
+			branch = "main" // fallback
+		}
+		if err := d.runGitCmd(gitRepo, gitPushTimeout, "push", "origin", branch); err != nil {
+			return fmt.Errorf("git push: %w", err)
+		}
+		d.logger.Printf("jsonl_git_backup: committed and pushed: %s", msg)
+	} else {
+		d.logger.Printf("jsonl_git_backup: committed (no remote configured, skipping push): %s", msg)
 	}
-
-	d.logger.Printf("jsonl_git_backup: committed and pushed: %s", msg)
 	return nil
+}
+
+// hasGitRemote checks if the named remote exists in the git repo.
+func (d *Daemon) hasGitRemote(gitRepo, name string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "remote", "get-url", name)
+	return cmd.Run() == nil
+}
+
+// currentGitBranch returns the current branch name, or empty string on error.
+func (d *Daemon) currentGitBranch(gitRepo string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "rev-parse", "--abbrev-ref", "HEAD")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(stdout.String())
 }
 
 // runGitCmd runs a git command in the specified directory with the given timeout.
@@ -498,7 +526,14 @@ type spikeInfo struct {
 // verifyExportCounts compares current export line counts against the previous
 // commit for each database. Returns a list of anomalies that exceed the spike
 // threshold. On first export (no baseline), verification is skipped.
+//
+// Asymmetric thresholds: drops (possible data loss) use the configured threshold;
+// increases (new issues filed) use 2x the threshold since growth is normal.
+// Small absolute changes (<20 records) are always allowed to avoid false alarms
+// on small databases.
 func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts map[string]int, threshold float64) []spikeInfo {
+	const minAbsoluteDelta = 20 // ignore changes smaller than this many records
+
 	var spikes []spikeInfo
 
 	for _, db := range databases {
@@ -519,14 +554,32 @@ func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts m
 			continue
 		}
 
-		delta := math.Abs(float64(currentCount-prevCount)) / float64(prevCount)
-		if delta > threshold {
+		absDelta := currentCount - prevCount
+		if absDelta < 0 {
+			absDelta = -absDelta
+		}
+		// Small absolute changes are always fine — avoids false alarms on
+		// small databases where a few issues cause large percentage swings.
+		if absDelta < minAbsoluteDelta {
+			continue
+		}
+
+		fractionalDelta := math.Abs(float64(currentCount-prevCount)) / float64(prevCount)
+
+		// Asymmetric: increases are less suspicious than drops.
+		// New issues being filed is normal growth; losing issues suggests data loss.
+		effectiveThreshold := threshold
+		if currentCount > prevCount {
+			effectiveThreshold = threshold * 2 // 2x tolerance for growth
+		}
+
+		if fractionalDelta > effectiveThreshold {
 			spike := spikeInfo{
 				DB:       db,
 				File:     relPath,
 				Previous: prevCount,
 				Current:  currentCount,
-				Delta:    delta,
+				Delta:    fractionalDelta,
 			}
 			spikes = append(spikes, spike)
 
@@ -535,7 +588,7 @@ func (d *Daemon) verifyExportCounts(gitRepo string, databases []string, counts m
 				direction = "drop"
 			}
 			d.logger.Printf("jsonl_git_backup: SPIKE DETECTED: %s: %s from %d to %d (%.1f%% %s, threshold %.1f%%)",
-				db, direction, prevCount, currentCount, delta*100, direction, threshold*100)
+				db, direction, prevCount, currentCount, fractionalDelta*100, direction, effectiveThreshold*100)
 		}
 	}
 	return spikes
@@ -610,9 +663,6 @@ func (d *Daemon) applyPollutionFilter(gitRepo string, databases []string) int {
 				d.logger.Printf("jsonl_git_backup: %s: error writing filtered file: %v", db, err)
 				continue
 			}
-			// Also update legacy flat file.
-			legacyPath := filepath.Join(gitRepo, db+".jsonl")
-			_ = os.WriteFile(legacyPath, filtered, 0644)
 			totalRemoved += removed
 		}
 	}

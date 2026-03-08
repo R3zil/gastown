@@ -291,7 +291,7 @@ func (c *CheckMisclassifiedWisps) findMisclassifiedWispsJSONL(path string, rigNa
 // Uses --allow-stale to survive DB/JSONL drift (consistent with all other bd invocations).
 // Returns an error if the probe fails, so callers can track and surface failures.
 func isIssueStillOpen(workDir, id string) (bool, error) {
-	cmd := exec.Command("bd", "--allow-stale", "show", id, "--json")
+	cmd := exec.Command("bd", beads.MaybePrependAllowStale([]string{"show", id, "--json"})...)
 	cmd.Dir = workDir
 	output, err := cmd.Output()
 	if err != nil {
@@ -398,7 +398,9 @@ func (c *CheckMisclassifiedWisps) Fix(ctx *CheckContext) error {
 
 	for rigName, batch := range rigBatches {
 		var workDir string
-		if rigName == "town" {
+		if rigName == "town" || rigName == "hq" {
+			// Both "town" (JSONL path) and "hq" (Dolt path) refer to
+			// town-level beads which live at the town root, not townRoot/hq.
 			workDir = ctx.TownRoot
 		} else {
 			workDir = filepath.Join(ctx.TownRoot, rigName)

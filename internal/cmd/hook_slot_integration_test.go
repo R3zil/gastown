@@ -86,9 +86,9 @@ func setupHookTestTown(t *testing.T) (townRoot, polecatDir, rigPrefix string) {
 // initBeadsDB initializes the beads database by running bd init on the test server.
 func initBeadsDB(t *testing.T, dir string) {
 	t.Helper()
-	testutil.RequireDoltServer(t)
+	testutil.RequireDoltContainer(t)
 
-	cmd := exec.Command("bd", "init", "--server-port", testutil.DoltTestPort())
+	cmd := exec.Command("bd", "init", "--server-port", testutil.DoltContainerPort())
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bd init failed: %v\n%s", err, output)
@@ -114,7 +114,7 @@ func TestHookSlot_BasicHook(t *testing.T) {
 	// Create a test bead
 	issue, err := b.Create(beads.CreateOptions{
 		Title:    "Test task for hooking",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 2,
 	})
 	if err != nil {
@@ -170,7 +170,7 @@ func TestHookSlot_Singleton(t *testing.T) {
 	// Create and hook first bead
 	issue1, err := b.Create(beads.CreateOptions{
 		Title:    "First task",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 2,
 	})
 	if err != nil {
@@ -187,7 +187,7 @@ func TestHookSlot_Singleton(t *testing.T) {
 	// Create second bead
 	issue2, err := b.Create(beads.CreateOptions{
 		Title:    "Second task",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 2,
 	})
 	if err != nil {
@@ -243,7 +243,7 @@ func TestHookSlot_Unhook(t *testing.T) {
 	// Create and hook a bead
 	issue, err := b.Create(beads.CreateOptions{
 		Title:    "Task to unhook",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 2,
 	})
 	if err != nil {
@@ -306,7 +306,7 @@ func TestHookSlot_DifferentAgents(t *testing.T) {
 	// Create and hook bead to first agent
 	issue1, err := b.Create(beads.CreateOptions{
 		Title:    "Toast's task",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 2,
 	})
 	if err != nil {
@@ -323,7 +323,7 @@ func TestHookSlot_DifferentAgents(t *testing.T) {
 	// Create and hook bead to second agent
 	issue2, err := b.Create(beads.CreateOptions{
 		Title:    "Nux's task",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 2,
 	})
 	if err != nil {
@@ -391,7 +391,7 @@ func TestHookSlot_HookPersistence(t *testing.T) {
 	b1 := beads.New(rigDir)
 	issue, err := b1.Create(beads.CreateOptions{
 		Title:    "Persistent task",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 2,
 	})
 	if err != nil {
@@ -445,7 +445,7 @@ func TestHookSlot_StatusTransitions(t *testing.T) {
 	// Create a bead
 	issue, err := b.Create(beads.CreateOptions{
 		Title:    "Status transition test",
-		Type:     "task",
+		Label:    "gt:task",
 		Priority: 2,
 	})
 	if err != nil {

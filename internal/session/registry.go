@@ -119,12 +119,17 @@ func SetDefaultRegistry(r *PrefixRegistry) {
 func InitRegistry(townRoot string) error {
 	var errs []error
 
-	// Use the default tmux socket so all sessions are visible via prefix+s
-	// from any terminal. Multi-town isolation (which would need per-town
-	// sockets) already requires containers/VMs due to singleton mayor/deacon
-	// session names, so a dedicated socket provides no real benefit while
-	// causing cross-socket bugs and split session visibility.
-	tmux.SetDefaultSocket("default")
+	// Determine the tmux socket name from GT_TMUX_SOCKET env var:
+	//   unset / "default" / "auto" → per-town socket derived from town dir name
+	//                                 (prevents split-brain when env var is lost
+	//                                 across daemon restarts or respawned processes)
+	//   any other value            → use that name as-is
+	socket := os.Getenv("GT_TMUX_SOCKET")
+	switch socket {
+	case "", "default", "auto":
+		socket = sanitizeTownName(filepath.Base(townRoot))
+	}
+	tmux.SetDefaultSocket(socket)
 
 	r, err := BuildPrefixRegistryFromTown(townRoot)
 	if err != nil {

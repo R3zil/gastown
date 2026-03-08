@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -338,7 +339,7 @@ func TestDispatchWave1_AllDispatched(t *testing.T) {
 		"task-c": {ID: "task-c", Type: "task", Rig: "beads"},
 	}}
 
-	waves, err := computeWaves(dag)
+	waves, _, err := computeWaves(dag)
 	if err != nil {
 		t.Fatalf("computeWaves: %v", err)
 	}
@@ -395,7 +396,7 @@ func TestDispatchWave1_ContinuesOnFailure(t *testing.T) {
 		"task-c": {ID: "task-c", Type: "task", Rig: "beads"},
 	}}
 
-	waves, err := computeWaves(dag)
+	waves, _, err := computeWaves(dag)
 	if err != nil {
 		t.Fatalf("computeWaves: %v", err)
 	}
@@ -459,7 +460,7 @@ func TestRenderLaunchOutput_ConvoyIDAndMonitor(t *testing.T) {
 		"gt-task-1": {ID: "gt-task-1", Title: "Task One", Type: "task", Rig: "gastown"},
 	}}
 
-	waves, err := computeWaves(dag)
+	waves, _, err := computeWaves(dag)
 	if err != nil {
 		t.Fatalf("computeWaves: %v", err)
 	}
@@ -485,7 +486,7 @@ func TestRenderLaunchOutput_DispatchedTasksWithRig(t *testing.T) {
 		"gt-task-2": {ID: "gt-task-2", Title: "Task Two", Type: "task", Rig: "beads"},
 	}}
 
-	waves, err := computeWaves(dag)
+	waves, _, err := computeWaves(dag)
 	if err != nil {
 		t.Fatalf("computeWaves: %v", err)
 	}
@@ -518,7 +519,7 @@ func TestRenderLaunchOutput_TUIHint(t *testing.T) {
 		"gt-task-1": {ID: "gt-task-1", Title: "Task One", Type: "task", Rig: "gastown"},
 	}}
 
-	waves, err := computeWaves(dag)
+	waves, _, err := computeWaves(dag)
 	if err != nil {
 		t.Fatalf("computeWaves: %v", err)
 	}
@@ -542,7 +543,7 @@ func TestRenderLaunchOutput_DaemonExplanation(t *testing.T) {
 	}}
 	dag.Nodes["gt-task-1"].Blocks = []string{"gt-task-2"}
 
-	waves, err := computeWaves(dag)
+	waves, _, err := computeWaves(dag)
 	if err != nil {
 		t.Fatalf("computeWaves: %v", err)
 	}
@@ -569,7 +570,7 @@ func TestRenderLaunchOutput_Snapshot(t *testing.T) {
 		"gt-task-3": {ID: "gt-task-3", Title: "Task Three", Type: "task", Rig: "beads", BlockedBy: []string{"gt-task-1"}},
 	}}
 
-	waves, err := computeWaves(dag)
+	waves, _, err := computeWaves(dag)
 	if err != nil {
 		t.Fatalf("computeWaves: %v", err)
 	}
@@ -679,7 +680,7 @@ func TestDispatchWave1_EndToEnd(t *testing.T) {
 	}
 
 	dag := buildConvoyDAG(beads, deps)
-	waves, err := computeWaves(dag)
+	waves, _, err := computeWaves(dag)
 	if err != nil {
 		t.Fatalf("computeWaves: %v", err)
 	}
@@ -710,5 +711,82 @@ func TestDispatchWave1_EndToEnd(t *testing.T) {
 		if id == "hq-task-b" {
 			t.Errorf("hq-task-b should NOT be dispatched in Wave 1")
 		}
+	}
+}
+
+// GH-2373 regression:
+// collectConvoyBeads must handle tracked deps returned as id-only external refs
+// (external:<rig>:<id>) and resolve them into raw bead IDs for lookup.
+func TestCollectConvoyBeads_ExternalTrackedIDs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows — shell stubs")
+	}
+
+	townRoot := t.TempDir()
+	townBeads := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeads, 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	bdScript := `#!/bin/sh
+case "$*" in
+  "show hq-cv-ext --json")
+    echo '[{"id":"hq-cv-ext","title":"Ext convoy","status":"staged_ready","issue_type":"convoy"}]'
+    ;;
+  "dep list hq-cv-ext --direction=down --type=tracks --json")
+    echo '[{"id":"external:ghostty:ghostty-1i4.3"},{"id":"external:ghostty:ghostty-1i4.4"}]'
+    ;;
+  "dep list hq-cv-ext --json")
+    echo '[{"id":"external:ghostty:ghostty-1i4.3"},{"id":"external:ghostty:ghostty-1i4.4"}]'
+    ;;
+  "show ghostty-1i4.3 --json")
+    echo '[{"id":"ghostty-1i4.3","title":"Task 1","status":"open","issue_type":"task"}]'
+    ;;
+  "show ghostty-1i4.4 --json")
+    echo '[{"id":"ghostty-1i4.4","title":"Task 2","status":"open","issue_type":"task"}]'
+    ;;
+  "dep list ghostty-1i4.3 --json"|"dep list ghostty-1i4.4 --json")
+    echo '[]'
+    ;;
+  *)
+    echo "unexpected bd args: $*" >&2
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+":"+origPath)
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("chdir townRoot: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	beads, deps, err := collectConvoyBeads("hq-cv-ext")
+	if err != nil {
+		t.Fatalf("collectConvoyBeads: %v", err)
+	}
+	if len(beads) != 2 {
+		t.Fatalf("expected 2 tracked beads, got %d", len(beads))
+	}
+	ids := []string{beads[0].ID, beads[1].ID}
+	sort.Strings(ids)
+	if ids[0] != "ghostty-1i4.3" || ids[1] != "ghostty-1i4.4" {
+		t.Fatalf("unexpected bead IDs: %v", ids)
+	}
+	if len(deps) != 0 {
+		t.Fatalf("expected no deps for tracked beads, got %d", len(deps))
 	}
 }

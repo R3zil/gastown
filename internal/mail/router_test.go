@@ -3,16 +3,21 @@ package mail
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/testutil"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestDetectTownRoot(t *testing.T) {
@@ -278,6 +283,104 @@ func TestResolveBeadsDir(t *testing.T) {
 	want2 := "/work/dir/.beads"
 	if filepath.ToSlash(got2) != want2 {
 		t.Errorf("resolveBeadsDir without townRoot = %q, want %q", got2, want2)
+	}
+}
+
+func TestSendFromCrewWorkspace_AvoidsEphemeralPrefixMismatch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a bash bd stub")
+	}
+
+	tmpDir := t.TempDir()
+	townRoot := filepath.Join(tmpDir, "town")
+	senderDir := filepath.Join(townRoot, "barnaby", "crew", "tom")
+	recipientDir := filepath.Join(townRoot, "barnaby", "crew", "troy")
+	mayorDir := filepath.Join(townRoot, "mayor")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	for _, dir := range []string{senderDir, recipientDir, mayorDir, townBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townBeadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("write beads.db: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	// Stub bd to reproduce the old behavior where --id msg-* with --ephemeral
+	// would fail prefix validation before ephemeral handling.
+	// The fix: sendToSingle no longer passes --id to bd create.
+	binDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	bdStub := filepath.Join(binDir, "bd")
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "config" || "${1:-}" == "init" ]]; then
+  exit 0
+fi
+
+if [[ "${1:-}" == "list" ]]; then
+  echo "[]"
+  exit 0
+fi
+
+if [[ "${1:-}" == "mol" && "${2:-}" == "wisp" && "${3:-}" == "list" ]]; then
+  echo "[]"
+  exit 0
+fi
+
+if [[ "${1:-}" == "create" ]]; then
+  has_ephemeral=false
+  msg_id=""
+  i=1
+  while [[ $i -le $# ]]; do
+    arg="${!i}"
+    if [[ "$arg" == "--ephemeral" ]]; then
+      has_ephemeral=true
+    elif [[ "$arg" == "--id" ]]; then
+      ((i++))
+      msg_id="${!i:-}"
+    elif [[ "$arg" == --id=* ]]; then
+      msg_id="${arg#--id=}"
+    fi
+    ((i++))
+  done
+
+  if [[ "$has_ephemeral" == "true" && "$msg_id" == msg-* ]]; then
+    echo "prefix mismatch: database uses 'hq-' (allowed: hq,hq-cv) but ID '$msg_id' doesn't match any allowed prefix" >&2
+    exit 1
+  fi
+
+  echo "hq-testmail-1"
+  exit 0
+fi
+
+echo "unsupported bd args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(bdStub, []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := NewRouter(senderDir)
+	msg := &Message{
+		From:           "barnaby/crew/tom",
+		To:             "barnaby/troy",
+		Subject:        "Test message",
+		Body:           "Hello",
+		Wisp:           true,
+		SuppressNotify: true,
+	}
+
+	if err := r.Send(msg); err != nil {
+		t.Fatalf("send from crew workspace should succeed without prefix mismatch: %v", err)
 	}
 }
 
@@ -1004,10 +1107,10 @@ func TestValidateRecipient(t *testing.T) {
 		t.Skipf("bd CLI not functional, skipping test: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
 
-	// Start an ephemeral Dolt server to prevent bd init from creating
+	// Start an ephemeral Dolt container to prevent bd init from creating
 	// databases on the production server (port 3307).
-	testutil.RequireDoltServer(t)
-	doltPort, _ := strconv.Atoi(testutil.DoltTestPort())
+	testutil.RequireDoltContainer(t)
+	doltPort, _ := strconv.Atoi(testutil.DoltContainerPort())
 
 	// Create isolated beads environment for testing
 	tmpDir := t.TempDir()
@@ -1373,5 +1476,117 @@ func TestValidateRecipientFilesystemFallback(t *testing.T) {
 				t.Errorf("validateRecipient(%q) unexpected error: %v", tt.identity, err)
 			}
 		})
+	}
+}
+
+// requireNotifyTestSocket returns a per-test tmux socket and skips if tmux
+// is unavailable. The socket server is killed on test cleanup.
+func requireNotifyTestSocket(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	// Use test name for unique socket per test to prevent cleanup interference.
+	// Sanitize: tmux socket names cannot contain slashes or dots.
+	safe := strings.NewReplacer("/", "-", ".", "-").Replace(t.Name())
+	socket := fmt.Sprintf("gt-test-%s-%d", safe, os.Getpid())
+	// Pre-kill any stale server on this socket (e.g., from a crashed prior run).
+	_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-L", socket, "kill-server").Run()
+	})
+	return socket
+}
+
+// createNotifyTestSession creates a tmux session on the given socket and waits
+// for it to be ready.
+func createNotifyTestSession(t *testing.T, socket, sessionName, command string) {
+	t.Helper()
+	args := []string{"-L", socket, "new-session", "-d", "-s", sessionName, command}
+	out, err := exec.Command("tmux", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to create test session %q: %v\n%s", sessionName, err, out)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if exec.Command("tmux", "-L", socket, "has-session", "-t", sessionName).Run() == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("session %q never appeared on socket %q", sessionName, socket)
+}
+
+// TestNotifyRecipient_IdleAgent verifies that an idle agent (prompt visible)
+// receives a direct nudge instead of a queued one.
+func TestNotifyRecipient_IdleAgent(t *testing.T) {
+	socket := requireNotifyTestSocket(t)
+	sessionName := "gt-crew-idletest"
+
+	// Create a session that displays the Claude Code prompt prefix, simulating idle.
+	// "printf" prints the prompt, then "cat" blocks keeping the session alive.
+	createNotifyTestSession(t, socket, sessionName, `sh -c 'printf "❯ \n" && cat'`)
+
+	// Wait briefly for printf output to appear in the pane.
+	time.Sleep(500 * time.Millisecond)
+
+	townRoot := t.TempDir()
+	r := &Router{
+		workDir:           t.TempDir(),
+		townRoot:          townRoot,
+		tmux:              tmux.NewTmuxWithSocket(socket),
+		IdleNotifyTimeout: 3 * time.Second,
+	}
+
+	msg := &Message{
+		From:    "gastown/crew/sender",
+		To:      "gastown/crew/idletest",
+		Subject: "test idle delivery",
+	}
+
+	err := r.notifyRecipient(msg)
+	if err != nil {
+		t.Fatalf("notifyRecipient returned error: %v", err)
+	}
+
+	// Verify no nudge was queued — delivery should have been direct.
+	pending, _ := nudge.Pending(townRoot, sessionName)
+	if pending != 0 {
+		t.Errorf("expected 0 queued nudges for idle agent, got %d", pending)
+	}
+}
+
+// TestNotifyRecipient_BusyAgent verifies that a busy agent (no prompt visible)
+// gets a queued nudge instead of an immediate one.
+func TestNotifyRecipient_BusyAgent(t *testing.T) {
+	socket := requireNotifyTestSocket(t)
+	sessionName := "gt-crew-busytest"
+
+	// Create a session running sleep — no prompt visible, simulating busy agent.
+	createNotifyTestSession(t, socket, sessionName, "sleep 300")
+
+	townRoot := t.TempDir()
+	r := &Router{
+		workDir:           t.TempDir(),
+		townRoot:          townRoot,
+		tmux:              tmux.NewTmuxWithSocket(socket),
+		IdleNotifyTimeout: 1 * time.Second, // short timeout for test speed
+	}
+
+	msg := &Message{
+		From:    "gastown/crew/sender",
+		To:      "gastown/crew/busytest",
+		Subject: "test busy delivery",
+	}
+
+	err := r.notifyRecipient(msg)
+	if err != nil {
+		t.Fatalf("notifyRecipient returned error: %v", err)
+	}
+
+	// Verify the nudge was queued since the agent was busy.
+	pending, _ := nudge.Pending(townRoot, sessionName)
+	if pending != 1 {
+		t.Errorf("expected 1 queued nudge for busy agent, got %d", pending)
 	}
 }

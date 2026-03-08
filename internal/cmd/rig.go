@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,6 +25,7 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/suggest"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/wisp"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -297,6 +299,7 @@ var (
 	rigAddLocalRepo    string
 	rigAddBranch       string
 	rigAddPushURL      string
+	rigAddUpstreamURL  string
 	rigAddAdopt        bool
 	rigAddAdoptURL     string
 	rigAddAdoptForce   bool
@@ -356,6 +359,7 @@ func init() {
 	rigAddCmd.Flags().StringVar(&rigAddLocalRepo, "local-repo", "", "Local repo path to share git objects (optional)")
 	rigAddCmd.Flags().StringVar(&rigAddBranch, "branch", "", "Default branch name (default: auto-detected from remote)")
 	rigAddCmd.Flags().StringVar(&rigAddPushURL, "push-url", "", "Push URL for read-only upstreams (push to fork)")
+	rigAddCmd.Flags().StringVar(&rigAddUpstreamURL, "upstream-url", "", "Upstream repository URL (for fork workflows)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdopt, "adopt", false, "Adopt an existing directory instead of creating new")
 	rigAddCmd.Flags().StringVar(&rigAddAdoptURL, "url", "", "Git remote URL for --adopt (default: auto-detected from origin)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdoptForce, "force", false, "With --adopt, register even if git remote cannot be detected")
@@ -522,6 +526,12 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid push URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddPushURL)
 	}
 
+	// Validate upstream URL if provided
+	rigAddUpstreamURL = strings.TrimSpace(rigAddUpstreamURL)
+	if rigAddUpstreamURL != "" && !isGitRemoteURL(rigAddUpstreamURL) {
+		return fmt.Errorf("invalid upstream URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddUpstreamURL)
+	}
+
 	startTime := time.Now()
 
 	// Add the rig
@@ -529,6 +539,7 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		Name:          name,
 		GitURL:        gitURL,
 		PushURL:       rigAddPushURL,
+		UpstreamURL:   rigAddUpstreamURL,
 		BeadsPrefix:   rigAddPrefix,
 		LocalRepo:     rigAddLocalRepo,
 		DefaultBranch: rigAddBranch,
@@ -581,6 +592,12 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 	if err := syncRigHooks(townRoot, name); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to sync hooks for new rig: %v\n", err)
 	}
+
+	// Refresh tmux cycle bindings on all running sessions so the new rig's
+	// prefix is recognized by C-b n/p. Without this, existing sessions have
+	// a stale grep pattern that doesn't include the new prefix.
+	// See: https://github.com/steveyegge/gastown/issues/2299
+	refreshCycleBindingsOnExistingSessions()
 
 	elapsed := time.Since(startTime)
 
@@ -680,12 +697,13 @@ func runRigList(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
 	type rigInfo struct {
-		Name     string `json:"name"`
-		Status   string `json:"status"`
-		Witness  string `json:"witness"`
-		Refinery string `json:"refinery"`
-		Polecats int    `json:"polecats"`
-		Crew     int    `json:"crew"`
+		Name        string `json:"name"`
+		BeadsPrefix string `json:"beads_prefix"`
+		Status      string `json:"status"`
+		Witness     string `json:"witness"`
+		Refinery    string `json:"refinery"`
+		Polecats    int    `json:"polecats"`
+		Crew        int    `json:"crew"`
 		// sorting fields (not exported to JSON)
 		sortPrio int
 	}
@@ -693,16 +711,18 @@ func runRigList(cmd *cobra.Command, args []string) error {
 	var rigs []rigInfo
 
 	for name := range rigsConfig.Rigs {
+		prefix := session.PrefixFor(name)
+
 		r, err := mgr.GetRig(name)
 		if err != nil {
-			rigs = append(rigs, rigInfo{Name: name, Status: "error", sortPrio: 99})
+			rigs = append(rigs, rigInfo{Name: name, BeadsPrefix: prefix, Status: "error", sortPrio: 99})
 			continue
 		}
 
 		opState, _ := getRigOperationalState(townRoot, name)
 
-		witnessSession := session.WitnessSessionName(session.PrefixFor(name))
-		refinerySession := session.RefinerySessionName(session.PrefixFor(name))
+		witnessSession := session.WitnessSessionName(prefix)
+		refinerySession := session.RefinerySessionName(prefix)
 		witnessRunning, _ := t.HasSession(witnessSession)
 		refineryRunning, _ := t.HasSession(refinerySession)
 
@@ -717,13 +737,14 @@ func runRigList(cmd *cobra.Command, args []string) error {
 
 		summary := r.Summary()
 		rigs = append(rigs, rigInfo{
-			Name:     name,
-			Status:   strings.ToLower(opState),
-			Witness:  witnessStatus,
-			Refinery: refineryStatus,
-			Polecats: summary.PolecatCount,
-			Crew:     summary.CrewCount,
-			sortPrio: rigStatePriority(witnessRunning, refineryRunning, opState),
+			Name:        name,
+			BeadsPrefix: prefix,
+			Status:      strings.ToLower(opState),
+			Witness:     witnessStatus,
+			Refinery:    refineryStatus,
+			Polecats:    summary.PolecatCount,
+			Crew:        summary.CrewCount,
+			sortPrio:    rigStatePriority(witnessRunning, refineryRunning, opState),
 		})
 	}
 
@@ -842,6 +863,23 @@ func runRigRemove(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := mgr.RemoveRig(name); err != nil {
+		if errors.Is(err, rig.ErrRigNotFound) {
+			rigPath := filepath.Join(townRoot, name)
+			if info, statErr := os.Stat(rigPath); statErr == nil && info.IsDir() {
+				fmt.Printf("%s Rig %q is not registered but directory exists at %s\n\n",
+					style.Warning.Render("!"), name, rigPath)
+				fmt.Printf("This is an inconsistent state. To fix it, either:\n")
+				fmt.Printf("  Adopt the directory:  %s\n",
+					style.Dim.Render(fmt.Sprintf("gt rig add %s --adopt", name)))
+				fmt.Printf("  Delete the directory: %s\n",
+					style.Dim.Render(fmt.Sprintf("rm -rf %s", rigPath)))
+				return fmt.Errorf("rig %q not in registry but directory exists", name)
+			}
+			// Directory doesn't exist either — suggest similar rig names
+			suggestions := suggest.FindSimilar(name, mgr.ListRigNames(), 3)
+			return fmt.Errorf("removing rig: %s",
+				suggest.FormatSuggestion("rig", name, suggestions, ""))
+		}
 		return fmt.Errorf("removing rig: %w", err)
 	}
 
@@ -869,6 +907,22 @@ func runRigRemove(cmd *cobra.Command, args []string) error {
 	fmt.Printf("To delete: %s\n", style.Dim.Render(fmt.Sprintf("rm -rf %s", filepath.Join(townRoot, name))))
 
 	return nil
+}
+
+// refreshCycleBindingsOnExistingSessions forces a refresh of the tmux C-b n/p
+// cycle bindings on any existing session. This is needed after gt rig add so
+// the new rig's prefix is included in the grep pattern.
+// Non-fatal: failure only means existing sessions need a restart to pick up the
+// new prefix.
+func refreshCycleBindingsOnExistingSessions() {
+	t := tmux.NewTmux()
+	sessions, err := t.ListSessions()
+	if err != nil || len(sessions) == 0 {
+		return
+	}
+	// Refresh bindings using any existing session as context.
+	// SetCycleBindings' stale-pattern check will detect the mismatch and re-bind.
+	_ = t.SetCycleBindings(sessions[0])
 }
 
 func runRigAdopt(_ *cobra.Command, args []string) error {
@@ -907,11 +961,18 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid push URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddPushURL)
 	}
 
+	// Validate --upstream-url if provided
+	rigAddUpstreamURL = strings.TrimSpace(rigAddUpstreamURL)
+	if rigAddUpstreamURL != "" && !isGitRemoteURL(rigAddUpstreamURL) {
+		return fmt.Errorf("invalid upstream URL %q: expected a remote URL (e.g. https://, git@host:, ssh://, s3://)", rigAddUpstreamURL)
+	}
+
 	// Register the existing rig
 	result, err := mgr.RegisterRig(rig.RegisterRigOptions{
 		Name:        name,
 		GitURL:      rigAddAdoptURL,
 		PushURL:     rigAddPushURL,
+		UpstreamURL: rigAddUpstreamURL,
 		BeadsPrefix: rigAddPrefix,
 		Force:       rigAddAdoptForce,
 	})

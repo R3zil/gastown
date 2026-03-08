@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -337,11 +338,17 @@ func detectRole(cwd, townRoot string) RoleInfo {
 func parseRoleString(s string) (Role, string, string) {
 	s = strings.TrimSpace(s)
 
+	// Normalize consecutive slashes (e.g. "gamestore//refinery" → "gamestore/refinery")
+	for strings.Contains(s, "//") {
+		s = strings.ReplaceAll(s, "//", "/")
+	}
+	s = strings.TrimSuffix(s, "/")
+
 	// Simple roles
 	switch s {
-	case "mayor":
+	case constants.RoleMayor:
 		return RoleMayor, "", ""
-	case "deacon":
+	case constants.RoleDeacon:
 		return RoleDeacon, "", ""
 	case "boot":
 		return RoleBoot, "", ""
@@ -365,16 +372,16 @@ func parseRoleString(s string) (Role, string, string) {
 			return RoleBoot, "", ""
 		}
 		return Role(s), "", ""
-	case "witness":
+	case constants.RoleWitness:
 		return RoleWitness, rig, ""
-	case "refinery":
+	case constants.RoleRefinery:
 		return RoleRefinery, rig, ""
 	case "polecats":
 		if len(parts) >= 3 {
 			return RolePolecat, rig, parts[2]
 		}
 		return RolePolecat, rig, ""
-	case "crew":
+	case constants.RoleCrew:
 		if len(parts) >= 3 {
 			return RoleCrew, rig, parts[2]
 		}
@@ -738,6 +745,9 @@ func runRoleDef(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  consecutive_failures = %d\n", def.Health.ConsecutiveFailures)
 	fmt.Printf("  kill_cooldown        = %q\n", def.Health.KillCooldown.String())
 	fmt.Printf("  stuck_threshold      = %q\n", def.Health.StuckThreshold.String())
+	if def.Health.HungSessionThreshold.Duration != 0 {
+		fmt.Printf("  hung_session_threshold = %q\n", def.Health.HungSessionThreshold.String())
+	}
 	fmt.Println()
 
 	// Prompts

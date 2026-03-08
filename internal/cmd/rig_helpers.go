@@ -10,6 +10,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/wisp"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -95,22 +96,72 @@ func hasRigBeadLabel(townRoot, rigName, label string) bool {
 
 // IsRigParkedOrDocked checks if a rig is parked or docked by any mechanism
 // (wisp ephemeral state or persistent bead labels). Returns (blocked, reason).
-// This is the single entry point for sling/dispatch to check rig availability.
+// This is the single entry point for all dispatch paths (sling, convoy launch,
+// convoy stage) to check rig availability.
+//
+// Parked vs docked asymmetry: parked state is checked in both the wisp layer
+// (ephemeral, set by "gt rig park") and bead labels (persistent fallback for
+// when wisp state is lost during cleanup). Docked state is bead-label only
+// because "gt rig dock" never writes to wisp — it persists exclusively via
+// the rig identity bead's status:docked label.
 func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
-	if IsRigParked(townRoot, rigName) {
+	// Check wisp layer first (fast, local) — only relevant for parked state
+	wispCfg := wisp.NewConfig(townRoot, rigName)
+	if wispCfg.GetString(RigStatusKey) == RigStatusParked {
 		return true, "parked"
 	}
 
-	// Check docked via bead label (persistent)
+	// Single bead lookup for both parked and docked labels
 	rigPath := filepath.Join(townRoot, rigName)
 	rigCfg, err := rig.LoadRigConfig(rigPath)
 	if err != nil || rigCfg.Beads == nil {
 		return false, ""
 	}
 
-	if IsRigDocked(townRoot, rigName, rigCfg.Beads.Prefix) {
-		return true, "docked"
+	beadsPath := filepath.Join(rigPath, "mayor", "rig")
+	if _, err := os.Stat(beadsPath); err != nil {
+		beadsPath = rigPath
+	}
+
+	bd := beads.New(beadsPath)
+	rigBeadID := beads.RigBeadIDWithPrefix(rigCfg.Beads.Prefix, rigName)
+	rigBead, err := bd.Show(rigBeadID)
+	if err != nil {
+		return false, ""
+	}
+
+	for _, l := range rigBead.Labels {
+		if l == "status:parked" {
+			return true, "parked"
+		}
+		if l == RigDockedLabel {
+			return true, "docked"
+		}
 	}
 
 	return false, ""
+}
+
+// getAllRigs discovers all rigs in the current Gas Town workspace.
+// Returns the list of rigs, the town root path, and any error.
+func getAllRigs() ([]*rig.Rig, string, error) {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return nil, "", fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
+	if err != nil {
+		rigsConfig = &config.RigsConfig{Rigs: make(map[string]config.RigEntry)}
+	}
+
+	g := git.NewGit(townRoot)
+	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
+	rigs, err := rigMgr.DiscoverRigs()
+	if err != nil {
+		return nil, "", err
+	}
+
+	return rigs, townRoot, nil
 }

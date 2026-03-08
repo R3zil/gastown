@@ -114,7 +114,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  1. Add this rig to a town: %s\n",
 		style.Dim.Render("gt rig add <name> <git-url>"))
 	fmt.Printf("  2. Create a polecat: %s\n",
-		style.Dim.Render("gt polecat add <name>"))
+		style.Dim.Render("gt polecat identity add <rig> <name>"))
 
 	return nil
 }
@@ -139,7 +139,9 @@ func updateGitExclude(repoPath string) error {
 		return nil // Already configured
 	}
 
-	// Append agent dirs
+	// Append agent dirs with leading '/' to anchor at repo root.
+	// Without the anchor, patterns like 'refinery/' match at any depth
+	// and would hide source code directories like 'internal/refinery/'.
 	additions := "\n# Gas Town agent directories\n"
 	for _, dir := range rig.AgentDirs {
 		// Get first component (e.g., "polecats" from "polecats")
@@ -148,7 +150,7 @@ func updateGitExclude(repoPath string) error {
 		if base == "." {
 			base = dir
 		}
-		additions += base + "/\n"
+		additions += "/" + base + "/\n"
 	}
 
 	// Write back

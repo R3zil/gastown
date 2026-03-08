@@ -266,6 +266,58 @@ Stages 1-3 are automated today. Stages 4-6 are being shipped via Dog automation
 
 See [dolt-storage.md](dolt-storage.md) for full details.
 
+## Deployment Artifacts
+
+Gas Town and Beads are distributed through multiple channels. Tag pushes (`v*`)
+trigger GitHub Actions release workflows that build and publish everything.
+
+### Gas Town (`gt`)
+
+| Channel | Artifact | Trigger |
+|---------|----------|---------|
+| **GitHub Releases** | Platform binaries (darwin/linux/windows, amd64/arm64) + checksums | GoReleaser on tag push |
+| **Homebrew** | `brew install steveyegge/gastown/gt` — formula auto-updated on release | `update-homebrew` job pushes to `steveyegge/homebrew-gastown` |
+| **npm** | `npx @gastown/gt` — wrapper that downloads the correct binary | OIDC trusted publishing (no token) |
+| **Local build** | `go build -o $(go env GOPATH)/bin/gt ./cmd/gt` | Manual |
+
+### Beads (`bd`)
+
+| Channel | Artifact | Trigger |
+|---------|----------|---------|
+| **GitHub Releases** | Platform binaries + checksums | GoReleaser on tag push |
+| **Homebrew** | `brew install steveyegge/beads/bd` | `update-homebrew` job |
+| **npm** | `npx @beads/bd` — wrapper that downloads the correct binary | OIDC trusted publishing (no token) |
+| **PyPI** | `beads-mcp` — MCP server integration | `publish-pypi` job with `PYPI_API_TOKEN` secret |
+| **Local build** | `go build -o $(go env GOPATH)/bin/bd ./cmd/bd` | Manual |
+
+### npm Authentication
+
+Both repos use **OIDC trusted publishing** — no `NPM_TOKEN` secret needed.
+Authentication is handled by GitHub's OIDC provider. The workflow needs:
+
+```yaml
+permissions:
+  id-token: write  # Required for npm trusted publishing
+```
+
+Configure on npmjs.com: Package Settings → Trusted Publishers → link to the
+GitHub repo and `release.yml` workflow file.
+
+### What the binary embeds
+
+The Go binary is the primary distribution vehicle. It embeds:
+- **Role templates** — Agent priming context, served by `gt prime`
+- **Formula definitions** — Workflow molecules, served by `bd mol`
+- **Doctor checks** — Health diagnostics, including migration checks
+- **Default configs** — `daemon.json` lifecycle defaults, operational thresholds
+
+This means upgrading the binary automatically propagates most fixes. Files that
+are NOT embedded (and require `gt doctor` or `gt upgrade` to update):
+- Town-root `CLAUDE.md` (created at `gt install` time)
+- `daemon.json` patrol entries (created at install, extended by `EnsureLifecycleDefaults`)
+- Claude Code hooks (`.claude/settings.json` managed sections)
+- Dolt schema (migrations run on first `bd` command after upgrade)
+
 ## See Also
 
 - [dolt-storage.md](dolt-storage.md) - Dolt storage architecture

@@ -1,5 +1,7 @@
 # Binaries
 /gt
+/gt-proxy-server
+/gt-proxy-client
 *.exe
 
 # Build
@@ -47,6 +49,8 @@ state.json
 
 # Clone-specific CLAUDE.md (regenerated locally per clone)
 CLAUDE.md
+# But keep the embedded template for gt doctor version checks
+!internal/templates/townroot/claude.md
 
 # Formulas: source of truth is internal/formula/formulas/ (embedded in binary).
 # .beads/formulas/ is provisioned at runtime by gt install / gt doctor fix.
@@ -66,3 +70,6 @@ result
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Gas Town (added by gt)
+__pycache__/

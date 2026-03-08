@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -100,15 +101,59 @@ func (dm *dogMol) failStep(stepSlug, reason string) {
 	}
 }
 
-// close closes the root molecule wisp.
+// close closes all remaining open child step wisps, then closes the root molecule wisp.
+// This prevents orphan step wisps from accumulating when callers forget to
+// explicitly close individual steps (the root cause of gt-3o59).
 func (dm *dogMol) close() {
 	if dm.rootID == "" {
 		return
 	}
 
+	// Close any step wisps that were never explicitly closed/failed.
+	dm.closeRemainingSteps()
+
 	_, err := dm.runBd("close", dm.rootID)
 	if err != nil {
 		dm.logger.Printf("dog_molecule: close root %s failed (non-fatal): %v", dm.rootID, err)
+	}
+}
+
+// closeRemainingSteps queries all children of the root wisp and closes any that
+// are still open. This is the backstop that prevents step wisp leaks regardless
+// of whether individual callers remembered to close each step.
+func (dm *dogMol) closeRemainingSteps() {
+	if dm.rootID == "" {
+		return
+	}
+
+	out, err := dm.runBd("show", dm.rootID, "--children", "--json")
+	if err != nil {
+		dm.logger.Printf("dog_molecule: closeRemainingSteps: list children of %s failed: %v", dm.rootID, err)
+		return
+	}
+
+	children, parseErr := parseChildrenJSON(out)
+	if parseErr != nil {
+		dm.logger.Printf("dog_molecule: closeRemainingSteps: parse children JSON for %s failed: %v", dm.rootID, parseErr)
+		return
+	}
+
+	closed := 0
+	for _, child := range children {
+		if child.ID == "" || child.Status == "" {
+			continue
+		}
+		// Close any child that is still open/hooked/in_progress.
+		if child.Status == "open" || child.Status == "hooked" || child.Status == "in_progress" {
+			if _, err := dm.runBd("close", child.ID); err != nil {
+				dm.logger.Printf("dog_molecule: closeRemainingSteps: close %s failed: %v", child.ID, err)
+			} else {
+				closed++
+			}
+		}
+	}
+	if closed > 0 {
+		dm.logger.Printf("dog_molecule: closeRemainingSteps: closed %d orphan step wisp(s) under %s", closed, dm.rootID)
 	}
 }
 
@@ -122,58 +167,91 @@ func (dm *dogMol) discoverSteps() {
 
 	// Use bd show to get children. The mol wisp command creates child wisps
 	// whose titles include the step ID from the formula.
-	out, err := dm.runBd("show", dm.rootID, "--children", "--format=jsonl")
+	out, err := dm.runBd("show", dm.rootID, "--children", "--json")
 	if err != nil {
 		dm.logger.Printf("dog_molecule: discover steps for %s failed: %v", dm.rootID, err)
 		return
 	}
 
-	// Parse children output. Each line has an issue with title containing the step slug.
-	// Format from bd show --children --format=jsonl: {"id":"...","title":"step: Scan databases...","status":"open"}
-	// We extract step slugs by matching known formula step patterns.
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
-			continue
-		}
-		// Simple parsing: look for id and title fields.
-		id := extractJSONField(line, "id")
-		title := extractJSONField(line, "title")
-		if id == "" || title == "" {
+	children, parseErr := parseChildrenJSON(out)
+	if parseErr != nil {
+		dm.logger.Printf("dog_molecule: discover steps: parse children JSON for %s failed: %v", dm.rootID, parseErr)
+		return
+	}
+
+	// Map known step slugs from each child's title. The wisp title typically starts
+	// with the step title from the formula.
+	for _, child := range children {
+		if child.ID == "" || child.Title == "" {
 			continue
 		}
 
-		// Map known step slugs from the title. The wisp title typically starts
-		// with the step title from the formula.
-		titleLower := strings.ToLower(title)
+		titleLower := strings.ToLower(child.Title)
 		switch {
 		case strings.Contains(titleLower, "scan"):
-			dm.stepIDs["scan"] = id
+			dm.stepIDs["scan"] = child.ID
 		case strings.Contains(titleLower, "reap"):
-			dm.stepIDs["reap"] = id
+			dm.stepIDs["reap"] = child.ID
 		case strings.Contains(titleLower, "purge"):
-			dm.stepIDs["purge"] = id
+			dm.stepIDs["purge"] = child.ID
 		case strings.Contains(titleLower, "report"):
-			dm.stepIDs["report"] = id
+			dm.stepIDs["report"] = child.ID
 		case strings.Contains(titleLower, "export"):
-			dm.stepIDs["export"] = id
+			dm.stepIDs["export"] = child.ID
 		case strings.Contains(titleLower, "push"):
-			dm.stepIDs["push"] = id
+			dm.stepIDs["push"] = child.ID
 		case strings.Contains(titleLower, "diagnos"):
-			dm.stepIDs["diagnose"] = id
+			dm.stepIDs["diagnose"] = child.ID
 		case strings.Contains(titleLower, "backup"):
-			dm.stepIDs["backup"] = id
+			dm.stepIDs["backup"] = child.ID
 		case strings.Contains(titleLower, "probe"):
-			dm.stepIDs["probe"] = id
+			dm.stepIDs["probe"] = child.ID
 		case strings.Contains(titleLower, "inspect"):
-			dm.stepIDs["inspect"] = id
+			dm.stepIDs["inspect"] = child.ID
 		case strings.Contains(titleLower, "clean"):
-			dm.stepIDs["clean"] = id
+			dm.stepIDs["clean"] = child.ID
 		case strings.Contains(titleLower, "verif"):
-			dm.stepIDs["verify"] = id
+			dm.stepIDs["verify"] = child.ID
 		case strings.Contains(titleLower, "compact"):
-			dm.stepIDs["compact"] = id
+			dm.stepIDs["compact"] = child.ID
+		case strings.Contains(titleLower, "auto-close") || strings.Contains(titleLower, "auto close"):
+			dm.stepIDs["auto-close"] = child.ID
+		case strings.Contains(titleLower, "sync"):
+			dm.stepIDs["sync"] = child.ID
+		case strings.Contains(titleLower, "offsite"):
+			dm.stepIDs["offsite"] = child.ID
 		}
 	}
+}
+
+// childInfo holds fields from child wisp JSON used by discoverSteps and
+// closeRemainingSteps.
+type childInfo struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Status string `json:"status"`
+}
+
+// parseChildrenJSON parses the output of `bd show <id> --children --json`.
+// bd returns a map keyed by parent ID: {"hq-wisp-abc": [{...}, ...]}.
+// For forward compatibility, a bare array is also accepted.
+func parseChildrenJSON(raw string) ([]childInfo, error) {
+	data := []byte(raw)
+
+	var arr []childInfo
+	if err := json.Unmarshal(data, &arr); err == nil {
+		return arr, nil
+	}
+
+	var wrapped map[string][]childInfo
+	if err := json.Unmarshal(data, &wrapped); err == nil {
+		for _, children := range wrapped {
+			return children, nil
+		}
+		return nil, nil
+	}
+
+	return nil, fmt.Errorf("unrecognized JSON shape: %.200s", raw)
 }
 
 // knownSteps returns the list of known step slugs for debugging.
@@ -261,23 +339,4 @@ func stripANSI(s string) string {
 	return result.String()
 }
 
-// extractJSONField does a simple extraction of a string field from a JSON line.
-// This avoids importing encoding/json for a simple parse operation.
-func extractJSONField(line, field string) string {
-	key := fmt.Sprintf(`"%s":"`, field)
-	idx := strings.Index(line, key)
-	if idx < 0 {
-		// Try with space after colon.
-		key = fmt.Sprintf(`"%s": "`, field)
-		idx = strings.Index(line, key)
-		if idx < 0 {
-			return ""
-		}
-	}
-	start := idx + len(key)
-	end := strings.Index(line[start:], `"`)
-	if end < 0 {
-		return ""
-	}
-	return line[start : start+end]
-}
+

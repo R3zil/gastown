@@ -19,14 +19,21 @@ import (
 const (
 	defaultStrandedScanInterval = 30 * time.Second
 	eventPollInterval           = 5 * time.Second
+
+	// convoyGracePeriod is how long after creation a convoy is immune from
+	// auto-close. This prevents a race where the daemon's stranded scan
+	// fires before the sling's bd dep add is visible in Dolt. See GH#2303.
+	convoyGracePeriod = 5 * time.Minute
 )
 
 // strandedConvoyInfo matches the JSON output of `gt convoy stranded --json`.
 type strandedConvoyInfo struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	ReadyCount  int      `json:"ready_count"`
-	ReadyIssues []string `json:"ready_issues"`
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	TrackedCount int       `json:"tracked_count"`
+	ReadyCount   int       `json:"ready_count"`
+	ReadyIssues  []string  `json:"ready_issues"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // ConvoyManager monitors beads events for issue closes and periodically scans for stranded convoys.
@@ -66,6 +73,16 @@ type ConvoyManager struct {
 
 	// started guards against double-call of Start() which would spawn duplicate goroutines.
 	started atomic.Bool
+
+	// recoveryMode is set true when an event-poll failure is detected (indicating
+	// Dolt is down). While set, runStrandedScan uses a shorter 5s interval so it
+	// retries quickly once Dolt comes back. Cleared after the first successful scan.
+	recoveryMode atomic.Bool
+
+	// scanMu serializes calls to scan() from runStrandedScan, runStartupSweep,
+	// and the Dolt recovery callback. Without this, concurrent scans can spawn
+	// duplicate convoy checks for the same stranded convoy.
+	scanMu sync.Mutex
 
 	// lastEventIDs tracks per-store high-water marks for event polling.
 	// Key matches stores map keys ("hq", "gastown", etc.).
@@ -122,6 +139,9 @@ func (m *ConvoyManager) Start() error {
 	m.wg.Add(2)
 	go m.runEventPoll()
 	go m.runStrandedScan()
+	// Run a one-shot sweep to catch convoys that completed during any previous
+	// outage or while the daemon was stopped.
+	go m.runStartupSweep()
 	return nil
 }
 
@@ -223,6 +243,9 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	events, err := store.GetAllEventsSince(m.ctx, highWater)
 	if err != nil {
 		m.logger("Convoy: event poll error (%s): %v", name, err)
+		// Signal recovery mode so the stranded scan shortens its interval and
+		// retries quickly once Dolt comes back.
+		m.recoveryMode.Store(true)
 		return
 	}
 
@@ -284,6 +307,9 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 }
 
 // runStrandedScan is the periodic stranded convoy scan loop.
+// During recovery mode (after Dolt poll errors) the interval shrinks to 5s
+// so a successful scan fires promptly once Dolt comes back. Recovery mode is
+// cleared after the first successful scan.
 func (m *ConvoyManager) runStrandedScan() {
 	defer m.wg.Done()
 
@@ -298,18 +324,31 @@ func (m *ConvoyManager) runStrandedScan() {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
+			// While in recovery mode, shorten the next tick so we retry quickly
+			// after a Dolt outage without waiting the full scan interval.
+			if m.recoveryMode.Load() {
+				ticker.Reset(5 * time.Second)
+			} else {
+				ticker.Reset(m.scanInterval)
+			}
 			m.scan()
 		}
 	}
 }
 
 // scan runs one stranded scan cycle: find stranded convoys, feed or close each.
+// Serialized by scanMu to prevent concurrent scans from spawning duplicate checks.
 func (m *ConvoyManager) scan() {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
+
 	stranded, err := m.findStranded()
 	if err != nil {
 		m.logger("Convoy: stranded scan failed: %s", util.FirstLine(err.Error()))
 		return
 	}
+	// Successful scan: clear recovery mode so the ticker returns to normal interval.
+	m.recoveryMode.Store(false)
 
 	for _, c := range stranded {
 		select {
@@ -320,8 +359,18 @@ func (m *ConvoyManager) scan() {
 
 		if c.ReadyCount > 0 {
 			m.feedFirstReady(c)
-		} else {
+		} else if c.TrackedCount == 0 {
+			// Empty convoy — but skip if it was just created (GH#2303).
+			// The sling's bd dep add may not be visible in Dolt yet.
+			if !c.CreatedAt.IsZero() && time.Since(c.CreatedAt) < convoyGracePeriod {
+				m.logger("Convoy %s: empty but within grace period (created %s ago) — skipping", c.ID, time.Since(c.CreatedAt).Round(time.Second))
+				continue
+			}
 			m.closeEmptyConvoy(c.ID)
+		} else {
+			// Tracked issues exist but none are ready. This requires agent
+			// judgment (the deacon decides what to do). Log for visibility.
+			m.logger("Convoy %s: %d tracked issues, 0 ready — needs agent review", c.ID, c.TrackedCount)
 		}
 	}
 }
@@ -341,7 +390,9 @@ func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
 
 	var stranded []strandedConvoyInfo
 	if err := json.Unmarshal(stdout.Bytes(), &stranded); err != nil {
-		return nil, fmt.Errorf("parsing stranded JSON: %w", err)
+		// Include first line of raw output for debugging (e.g., non-JSON warnings on stdout)
+		raw := util.FirstLine(stdout.String())
+		return nil, fmt.Errorf("parsing stranded JSON: %w (raw: %q)", err, raw)
 	}
 
 	return stranded, nil
@@ -406,4 +457,21 @@ func (m *ConvoyManager) closeEmptyConvoy(convoyID string) {
 	if err := cmd.Run(); err != nil {
 		m.logger("Convoy %s: check failed: %s", convoyID, util.FirstLine(stderr.String()))
 	}
+}
+
+// runStartupSweep runs one convoy check pass after a brief delay to catch
+// convoys that completed while the daemon was stopped or Dolt was unavailable.
+// It waits 10 seconds so Dolt has time to stabilize before the first query.
+// This goroutine is not tracked in wg because it is short-lived (exits after
+// a single scan) and does not need to participate in the Stop() shutdown.
+func (m *ConvoyManager) runStartupSweep() {
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-m.ctx.Done():
+		return
+	case <-timer.C:
+	}
+	m.logger("Convoy: running startup sweep for stranded convoys")
+	m.scan()
 }

@@ -94,7 +94,7 @@ Git-backed issue tracking system that stores work state as structured data.
 - **Claude Code CLI** (default runtime) - [claude.ai/code](https://claude.ai/code)
 - **Codex CLI** (optional runtime) - [developers.openai.com/codex/cli](https://developers.openai.com/codex/cli)
 
-### Setup
+### Setup (Docker-Compose below)
 
 ```bash
 # Install Gas Town
@@ -122,6 +122,26 @@ gt crew add yourname --rig myproject
 cd myproject/crew/yourname
 
 # Start the Mayor session (your main interface)
+gt mayor attach
+```
+
+### Docker Compose
+
+```bash
+export GIT_USER="<your name>"
+export GIT_EMAIL="<your email>"
+export FOLDER="/Users/you/code"
+export DASHBOARD_PORT=8080  # optional, host port for the web dashboard
+
+docker compose build              # only needed on first run or after code changes
+docker compose up -d
+
+docker compose exec gastown zsh   # or bash
+
+gt up
+
+gh auth login                     # if you want gh to work
+
 gt mayor attach
 ```
 
@@ -344,7 +364,7 @@ gt feed                     # Real-time activity feed (TUI)
 gt feed --problems          # Start in problems view (stuck agent detection)
 ```
 
-**Built-in agent presets**: `claude`, `gemini`, `codex`, `cursor`, `auggie`, `amp`
+**Built-in agent presets**: `claude`, `gemini`, `codex`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`, `pi`, `omp`
 
 ### Convoy (Work Tracking)
 

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,9 @@ exit 0
 // Regression test for gt-d61:
 // even when Deacon is in crash-loop state, stale-heartbeat fallback still kills session.
 func TestCheckDeaconHeartbeat_RespectsCrashLoopGuard(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows — fake tmux requires bash")
+	}
 	townRoot := t.TempDir()
 	fakeBinDir := t.TempDir()
 	tmuxLog := filepath.Join(t.TempDir(), "tmux.log")

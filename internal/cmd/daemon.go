@@ -106,6 +106,24 @@ Examples:
 	RunE: runDaemonEnableSupervisor,
 }
 
+var daemonRotateLogsCmd = &cobra.Command{
+	Use:   "rotate-logs",
+	Short: "Rotate daemon log files",
+	Long: `Rotate all daemon-managed log files.
+
+Uses copytruncate for Dolt server logs (safe for processes with open fds).
+daemon.log uses automatic lumberjack rotation and is skipped.
+
+By default, only rotates logs exceeding 100MB. Use --force to rotate all.
+
+Examples:
+  gt daemon rotate-logs           # Rotate logs > 100MB
+  gt daemon rotate-logs --force   # Rotate all logs regardless of size`,
+	RunE: runDaemonRotateLogs,
+}
+
+var daemonRotateLogsForce bool
+
 var daemonClearBackoffCmd = &cobra.Command{
 	Use:   "clear-backoff <agent>",
 	Short: "Clear crash loop backoff for an agent",
@@ -136,9 +154,11 @@ func init() {
 	daemonCmd.AddCommand(daemonRunCmd)
 	daemonCmd.AddCommand(daemonEnableSupervisorCmd)
 	daemonCmd.AddCommand(daemonClearBackoffCmd)
+	daemonCmd.AddCommand(daemonRotateLogsCmd)
 
 	daemonLogsCmd.Flags().IntVarP(&daemonLogLines, "lines", "n", 50, "Number of lines to show")
 	daemonLogsCmd.Flags().BoolVarP(&daemonLogFollow, "follow", "f", false, "Follow log output")
+	daemonRotateLogsCmd.Flags().BoolVar(&daemonRotateLogsForce, "force", false, "Rotate all logs regardless of size")
 
 	rootCmd.AddCommand(daemonCmd)
 }
@@ -382,6 +402,36 @@ func runDaemonClearBackoff(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("%s Cleared backoff for %s (daemon not running, will take effect on next start)\n",
 			style.Bold.Render("✓"), agentID)
+	}
+
+	return nil
+}
+
+func runDaemonRotateLogs(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	var result *daemon.RotateLogsResult
+	if daemonRotateLogsForce {
+		result = daemon.ForceRotateLogs(townRoot)
+	} else {
+		result = daemon.RotateLogs(townRoot)
+	}
+
+	for _, path := range result.Rotated {
+		fmt.Printf("%s Rotated %s\n", style.Bold.Render("✓"), path)
+	}
+	for _, path := range result.Skipped {
+		fmt.Printf("  %s %s (below threshold)\n", style.Dim.Render("·"), path)
+	}
+	for _, err := range result.Errors {
+		fmt.Printf("  %s %v\n", style.Warning.Render("⚠"), err)
+	}
+
+	if len(result.Rotated) == 0 && len(result.Errors) == 0 {
+		fmt.Printf("%s No logs needed rotation\n", style.Bold.Render("✓"))
 	}
 
 	return nil
