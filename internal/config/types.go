@@ -842,6 +842,13 @@ func (rc *RuntimeConfig) BuildCommandWithPrompt(prompt string) string {
 		return base + " -i " + quoteForShell(p)
 	}
 
+	// Gemini requires -i (--prompt-interactive) to auto-execute the prompt
+	// while staying in interactive mode. Positional args populate the input
+	// field but don't execute, and -p runs headless (exits after completion).
+	if resolved.Command == "gemini" {
+		return base + " -i " + quoteForShell(p)
+	}
+
 	// Quote the prompt for shell safety (positional arg for claude and others)
 	return base + " " + quoteForShell(p)
 }
@@ -857,7 +864,14 @@ func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 	}
 
 	if p != "" && resolved.PromptMode != "none" {
-		args = append(args, p)
+		switch resolved.Command {
+		case "opencode":
+			args = append(args, "--prompt", p)
+		case "copilot", "gemini":
+			args = append(args, "-i", p)
+		default:
+			args = append(args, p)
+		}
 	}
 
 	return args
